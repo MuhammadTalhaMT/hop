@@ -7,3 +7,6 @@ pub use remap::RemapTable;
 
 pub mod held;
 pub use held::HeldKeys;
+
+pub mod control;
+pub use control::{Action, Control, Focus};
