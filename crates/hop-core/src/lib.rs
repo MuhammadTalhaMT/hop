@@ -16,3 +16,6 @@ pub use transport::{Transport, TransportError};
 
 pub mod liveness;
 pub use liveness::Liveness;
+
+pub mod backoff;
+pub use backoff::Backoff;
