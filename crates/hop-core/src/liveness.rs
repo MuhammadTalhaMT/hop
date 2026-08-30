@@ -105,4 +105,21 @@ mod tests {
         }
         assert!(l.is_dead(start + Duration::from_secs(5)));
     }
+
+    #[test]
+    fn heartbeat_is_due_exactly_at_the_interval() {
+        // The interval is inclusive: at exactly one interval a heartbeat is
+        // due, so a peer never waits longer than the configured period.
+        let (l, start) = setup();
+        assert!(l.should_send_heartbeat(start + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn exactly_at_the_timeout_is_not_yet_dead() {
+        // The timeout is exclusive: a peer heard from exactly at the limit
+        // is still alive, and only silence BEYOND it counts as death.
+        let (l, start) = setup();
+        assert!(!l.is_dead(start + Duration::from_secs(3)));
+        assert!(l.is_dead(start + Duration::from_millis(3001)));
+    }
 }
