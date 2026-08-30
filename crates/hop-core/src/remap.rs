@@ -64,10 +64,16 @@ mod tests {
 
     #[test]
     fn mapping_is_not_applied_twice() {
-        // Cmd maps to Ctrl. Ctrl must not then map onward to anything else,
-        // or chained rules would silently rewrite each other.
-        let table = RemapTable::mac_to_windows_defaults();
-        let once = table.apply(Usage::LEFT_GUI);
-        assert_eq!(table.apply(once), once);
+        // Deliberately chain two rules so A's output (C) is also a rule's
+        // input (C -> V): mac_to_windows_defaults() has no such overlap, so
+        // a test built on it cannot tell chaining apart from a single
+        // lookup. A hypothetical fixpoint-looping apply would turn A into
+        // V here; the real, non-chaining apply must stop at C. Remap rules
+        // must never silently rewrite each other.
+        let mut table = RemapTable::new();
+        table.insert(Usage::A, Usage::C);
+        table.insert(Usage::C, Usage::V);
+        assert_eq!(table.apply(Usage::A), Usage::C);
+        assert_ne!(table.apply(Usage::A), Usage::V);
     }
 }
