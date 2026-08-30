@@ -1,6 +1,6 @@
 use crate::{decode, encode, Message};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 
 const SEQ_LEN: usize = 8;
 const NONCE_LEN: usize = 24;
@@ -53,8 +53,7 @@ pub fn seal(key: &SharedKey, seq: u64, message: &Message) -> Result<Vec<u8>, Cry
     getrandom::fill(&mut nonce_bytes).map_err(|_| CryptoError::Random)?;
     let nonce: XNonce = nonce_bytes.into();
 
-    let key_arr: Key = (*key.as_bytes()).into();
-    let cipher = XChaCha20Poly1305::new(&key_arr);
+    let cipher = XChaCha20Poly1305::new(key.as_bytes().into());
     let aad = seq.to_be_bytes();
     let ciphertext = cipher
         .encrypt(
@@ -88,8 +87,7 @@ pub fn open(key: &SharedKey, frame: &[u8]) -> Result<(u64, Message), CryptoError
     nonce_arr.copy_from_slice(nonce_bytes);
     let nonce: XNonce = nonce_arr.into();
 
-    let key_arr: Key = (*key.as_bytes()).into();
-    let cipher = XChaCha20Poly1305::new(&key_arr);
+    let cipher = XChaCha20Poly1305::new(key.as_bytes().into());
     let plaintext = cipher
         .decrypt(
             &nonce,
@@ -150,7 +148,9 @@ mod tests {
     #[test]
     fn rejects_short_frame() {
         let key = SharedKey::generate();
+        assert!(open(&key, &[]).is_err());
         assert!(open(&key, &[0u8; 8]).is_err());
+        assert!(open(&key, &[0u8; MIN_FRAME - 1]).is_err());
     }
 
     #[test]
@@ -158,9 +158,26 @@ mod tests {
         let key = SharedKey::generate();
         let a = seal(&key, 1, &sample()).unwrap();
         let b = seal(&key, 1, &sample()).unwrap();
+        // Compare the nonce field itself (bytes 8..32), not the whole
+        // frame: comparing whole frames would still pass on a fixed-nonce
+        // implementation that varied some other byte.
         assert_ne!(
-            a, b,
-            "identical plaintexts must not produce identical frames"
+            a[SEQ_LEN..SEQ_LEN + NONCE_LEN],
+            b[SEQ_LEN..SEQ_LEN + NONCE_LEN],
+            "identical plaintexts must not produce identical nonces"
+        );
+    }
+
+    #[test]
+    fn ciphertext_does_not_contain_the_plaintext() {
+        let key = SharedKey::generate();
+        let plaintext = encode(&sample()).expect("encode");
+        let sealed = seal(&key, 1, &sample()).unwrap();
+        assert!(
+            !sealed
+                .windows(plaintext.len())
+                .any(|window| window == plaintext.as_slice()),
+            "the encoded plaintext must not appear verbatim in the sealed frame"
         );
     }
 }

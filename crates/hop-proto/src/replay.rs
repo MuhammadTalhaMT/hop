@@ -19,6 +19,14 @@ impl ReplayWindow {
         Self::default()
     }
 
+    /// Must only be called with a sequence number that has already been
+    /// authenticated by [`crate::open`] (i.e. its AEAD tag has already
+    /// verified). Checking the window before authentication would let an
+    /// attacker forge a single frame carrying `seq = u64::MAX`, without
+    /// ever knowing the key, to pin `highest` at the maximum and
+    /// permanently reject every genuine frame afterward — a one-packet
+    /// denial of service. Callers must authenticate first, then call
+    /// `accept`, never the other way around.
     pub fn accept(&mut self, seq: u64) -> bool {
         if !self.started {
             self.started = true;
@@ -28,7 +36,14 @@ impl ReplayWindow {
 
         if seq > self.highest {
             let shift = seq - self.highest;
-            self.seen = if shift >= WINDOW {
+            // `>` and not `>=`: age == WINDOW is still inside the accept
+            // region on the past-side check below (`age > WINDOW` rejects,
+            // so age == WINDOW is accepted and representable at bit
+            // WINDOW - 1). A jump of exactly WINDOW must therefore still
+            // record the old highest at that bit instead of zeroing the
+            // mask, or a replay of the old highest right after the jump
+            // would wrongly be accepted. Do not "simplify" this to `>=`.
+            self.seen = if shift > WINDOW {
                 0
             } else {
                 // Record that the old highest was seen, then shift.
@@ -98,5 +113,33 @@ mod tests {
         assert!(w.accept(1));
         assert!(w.accept(u64::from(u32::MAX)));
         assert!(!w.accept(1));
+    }
+
+    #[test]
+    fn refuses_replay_at_the_forward_jump_boundary() {
+        // A jump of exactly WINDOW leaves the previous highest at the oldest
+        // still-accepted age. Forgetting it there would let one captured
+        // frame replay after 63 dropped frames, which is the whole attack
+        // this type exists to stop.
+        let mut w = ReplayWindow::new();
+        assert!(w.accept(100));
+        assert!(w.accept(164));
+        assert!(!w.accept(100), "replay at shift == WINDOW must be refused");
+    }
+
+    #[test]
+    fn window_edge_accepts_once_then_refuses() {
+        let mut w = ReplayWindow::new();
+        assert!(w.accept(200));
+        assert!(w.accept(263));
+        assert!(w.accept(201), "age 62 is inside the window");
+        assert!(!w.accept(201));
+    }
+
+    #[test]
+    fn refuses_just_outside_the_window() {
+        let mut w = ReplayWindow::new();
+        assert!(w.accept(500));
+        assert!(!w.accept(435), "age 65 is outside the window");
     }
 }
