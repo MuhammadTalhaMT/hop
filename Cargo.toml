@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/hop-proto", "crates/hop-core"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/talha/hop"
+
+[workspace.dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+postcard = { version = "1.1.3", features = ["use-std"] }
+chacha20poly1305 = "0.11.0"
+getrandom = "0.4.3"
+thiserror = "2.0.20"
+tracing = "0.1.44"
+tokio = { version = "1.53.1", features = ["net", "io-util", "rt", "macros", "time", "sync"] }
