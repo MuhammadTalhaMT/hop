@@ -24,7 +24,7 @@ impl ReplayWindow {
     /// verified). Checking the window before authentication would let an
     /// attacker forge a single frame carrying `seq = u64::MAX`, without
     /// ever knowing the key, to pin `highest` at the maximum and
-    /// permanently reject every genuine frame afterward — a one-packet
+    /// permanently reject every genuine frame afterward, a one-packet
     /// denial of service. Callers must authenticate first, then call
     /// `accept`, never the other way around.
     pub fn accept(&mut self, seq: u64) -> bool {
