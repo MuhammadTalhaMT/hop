@@ -17,6 +17,7 @@ pub enum Action {
     Forward(Usage, bool),
     /// Tell the peer to release every key it believes is held.
     ReleaseAll,
+    /// Nothing for the caller to do.
     None,
 }
 
@@ -73,6 +74,10 @@ impl Control {
         self.focus = Focus::Local;
         let had_keys = !self.held.is_empty();
         self.held.drain_release();
+        // `was_remote` is a deliberate belt-and-braces guard, not load
+        // bearing logic: held is only ever non-empty while focus is
+        // Remote, so had_keys alone already implies was_remote. Keep both
+        // checks rather than simplifying this to had_keys.
         if was_remote && had_keys {
             Action::ReleaseAll
         } else {
@@ -161,5 +166,48 @@ mod tests {
         c.on_key(Usage::A, false);
         // Nothing is held, so returning focus needs no release sweep.
         assert_eq!(c.on_release_requested(), Action::None);
+    }
+
+    #[test]
+    fn returning_focus_clears_held_keys_for_the_next_session() {
+        let mut c = Control::new();
+        c.on_edge_crossed();
+        c.on_key(Usage::LEFT_GUI, true);
+        assert_eq!(c.on_release_requested(), Action::ReleaseAll);
+
+        // A fresh remote session with nothing pressed must have nothing to
+        // release. If the previous session's keys were not drained, this
+        // returns ReleaseAll instead.
+        c.on_edge_crossed();
+        assert_eq!(c.on_disconnected(), Action::None);
+    }
+
+    #[test]
+    fn edge_crossing_while_already_remote_keeps_held_keys() {
+        // A repeated edge crossing must not forget what is already held.
+        // Forgetting here would leave a modifier stuck down on the peer
+        // after the next disconnect.
+        let mut c = Control::new();
+        c.on_edge_crossed();
+        c.on_key(Usage::LEFT_GUI, true);
+        c.on_edge_crossed();
+        assert_eq!(c.focus(), Focus::Remote);
+        assert_eq!(c.on_disconnected(), Action::ReleaseAll);
+    }
+
+    #[test]
+    fn default_starts_local() {
+        assert_eq!(Control::default().focus(), Focus::Local);
+    }
+
+    #[test]
+    fn keys_pressed_while_local_are_not_tracked() {
+        // Local input never reaches the peer, so it must not be recorded as
+        // held; otherwise returning focus would release keys the peer never
+        // saw pressed.
+        let mut c = Control::new();
+        c.on_key(Usage::LEFT_GUI, true);
+        c.on_edge_crossed();
+        assert_eq!(c.on_disconnected(), Action::None);
     }
 }
