@@ -22,3 +22,6 @@ pub use backoff::Backoff;
 
 pub mod device;
 pub use device::{Capturer, DeviceError, FakeCapturer, FakeInjector, Injector, InputEvent};
+
+pub mod session;
+pub use session::{event_to_message, message_to_event, pump_client, pump_server};
