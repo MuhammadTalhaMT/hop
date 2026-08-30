@@ -19,3 +19,6 @@ pub use liveness::Liveness;
 
 pub mod backoff;
 pub use backoff::Backoff;
+
+pub mod device;
+pub use device::{Capturer, DeviceError, FakeCapturer, FakeInjector, Injector, InputEvent};
