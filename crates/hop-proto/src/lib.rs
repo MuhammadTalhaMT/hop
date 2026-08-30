@@ -10,3 +10,6 @@ pub use message::{decode, encode, encode_raw, Button, CodecError, Message, PROTO
 
 pub mod crypto;
 pub use crypto::{open, seal, CryptoError, SharedKey};
+
+pub mod replay;
+pub use replay::ReplayWindow;
