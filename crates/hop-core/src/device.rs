@@ -40,6 +40,26 @@ pub trait Capturer {
 /// The Windows implementation lives in Plan B.
 pub trait Injector {
     fn inject(&mut self, event: &InputEvent) -> Result<(), DeviceError>;
+
+    /// Called after a `Mouse` motion event has just been injected, so an
+    /// injector that can see where the real cursor actually landed gets a
+    /// chance to say focus should return to the peer. The default answer
+    /// is `false`: only a platform that tracks a real, visible cursor
+    /// (Windows, via `GetCursorPos`) can ever say otherwise.
+    ///
+    /// This is CRITICAL 2's fix from the whole-branch review:
+    /// `Message::Release` was defined and handled by the server, but
+    /// nothing ever sent it, so focus could only come home through the
+    /// panic hotkey or a dead link. Living here, rather than in
+    /// `hop-core`'s connection loop, is what keeps that loop platform
+    /// agnostic: it just asks after every motion inject and sends
+    /// `Message::Release` when told to (see `crate::supervisor`), and the
+    /// answer to "has the cursor reached the return edge" stays entirely
+    /// on the Windows client where the knowledge of the real cursor
+    /// position actually lives.
+    fn reached_return_edge(&mut self) -> bool {
+        false
+    }
 }
 
 /// Replays a fixed script of events. Lets the whole input path be tested

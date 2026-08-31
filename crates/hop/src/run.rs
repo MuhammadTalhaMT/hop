@@ -289,11 +289,28 @@ async fn run_client(config: Config, key: SharedKey) -> Result<(), RunError> {
         role: "client",
         field: "server",
     })?;
+    // `Config::load` already requires `input.return_edge` to be present
+    // and one of the four edge names for role = "client" (see
+    // CRITICAL 2 in the whole-branch review), so a `None` here means
+    // that validation was bypassed, not that the user forgot to set it.
+    let return_edge = config
+        .input
+        .return_edge
+        .as_deref()
+        .and_then(hop_platform::windows::ReturnEdge::parse)
+        .ok_or(RunError::MissingRoleField {
+            role: "client",
+            field: "input.return_edge",
+        })?;
 
-    let mut injector = hop_platform::windows::WindowsInjector::new();
+    let mut injector = hop_platform::windows::WindowsInjector::new(Some(return_edge));
     let mut supervisor = hop_core::ClientSupervisor::new(server.clone(), key, id);
 
-    tracing::info!(server = %server, "starting hop client; reconnecting forever on any link loss");
+    tracing::info!(
+        server = %server,
+        ?return_edge,
+        "starting hop client; reconnecting forever on any link loss"
+    );
     supervisor.run(&mut injector).await
 }
 
@@ -561,7 +578,15 @@ async fn handle_client(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicU32;
+    // Explicit, not just inherited from `use super::*`: the top-level
+    // `Ordering` import a few lines up is `#[cfg(target_os = "macos")]`,
+    // so this module needs its own unconditional import to compile its
+    // `temp_path` helper below on every target, Windows included. This
+    // was the exact gap that made `cargo check --workspace --target
+    // x86_64-pc-windows-msvc` pass locally while CI's Windows test job
+    // failed to compile: plain `check` never compiles `#[cfg(test)]`
+    // code, only `--all-targets` does.
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);

@@ -12,10 +12,11 @@
 
 use crate::{
     client_handshake, message_to_event, Backoff, HeldKeys, Injector, InputEvent, Liveness,
-    TransportError,
+    TransportError, TransportWriter,
 };
 use hop_proto::{Message, SharedKey};
 use std::time::{Duration, Instant};
+use tokio::io::AsyncWrite;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
@@ -89,8 +90,9 @@ impl Default for ReconnectPolicy {
     }
 }
 
-/// Apply one already-received message: update `held` and inject the
-/// corresponding event.
+/// Apply one already-received message: update `held`, inject the
+/// corresponding event, and, for a motion event that lands the cursor on
+/// the return edge, ask the server to take focus back.
 ///
 /// Deliberately mirrors [`crate::pump_client`]'s per-message handling
 /// rather than calling it, because `pump_client` owns its own `recv()`
@@ -98,8 +100,20 @@ impl Default for ReconnectPolicy {
 /// comment): racing it inside `tokio::select!` against a heartbeat timer
 /// would desynchronize the connection. The supervisor instead gives
 /// `recv` its own task (see `run_connection`) and applies each message
-/// here, in the task that owns `injector` and `held`.
-fn apply_message<I: Injector>(message: Message, injector: &mut I, held: &mut HeldKeys) {
+/// here, in the task that owns `injector`, `held`, and `writer`.
+///
+/// The return-edge check (CRITICAL 2) only ever runs after a `Mouse`
+/// event actually injects: `Injector::reached_return_edge` is asked
+/// nowhere else, since only motion can move the real cursor onto the
+/// edge that hands focus back. See that method's doc comment for why
+/// this function, not the injector itself, is what turns a `true` answer
+/// into a sent `Message::Release`: only this function has the writer.
+async fn apply_message<I: Injector, W: AsyncWrite + Unpin>(
+    message: Message,
+    injector: &mut I,
+    held: &mut HeldKeys,
+    writer: &mut TransportWriter<W>,
+) -> Result<(), TransportError> {
     match message {
         Message::ReleaseAllKeys => {
             for usage in held.drain_release() {
@@ -121,12 +135,23 @@ fn apply_message<I: Injector>(message: Message, injector: &mut I, held: &mut Hel
         }
         other => {
             if let Some(event) = message_to_event(&other) {
-                if let Err(error) = injector.inject(&event) {
-                    tracing::warn!(?event, %error, "injector rejected event");
+                let is_motion = matches!(event, InputEvent::Mouse { .. });
+                match injector.inject(&event) {
+                    Ok(()) if is_motion && injector.reached_return_edge() => {
+                        tracing::info!(
+                            "cursor reached the return edge; asking the server to take focus back"
+                        );
+                        writer.send(&Message::Release).await?;
+                    }
+                    Ok(()) => {}
+                    Err(error) => {
+                        tracing::warn!(?event, %error, "injector rejected event");
+                    }
                 }
             }
         }
     }
+    Ok(())
 }
 
 /// Supervises one client's connection to a `hop` server: connect,
@@ -268,7 +293,10 @@ impl ClientSupervisor {
                                     "first frame authenticated under the derived session; connection confirmed"
                                 );
                             }
-                            apply_message(message, injector, held);
+                            if let Err(error) = apply_message(message, injector, held, &mut writer).await {
+                                tracing::warn!(%error, "failed to send release; disconnecting");
+                                break;
+                            }
                         }
                         Some(Err(error)) => {
                             tracing::warn!(%error, "transport error; disconnecting");
@@ -323,10 +351,30 @@ impl ClientSupervisor {
 mod tests {
     use super::*;
     use crate::device::FakeInjector;
-    use hop_proto::{SessionId, SharedKey, Usage};
+    use crate::transport::split;
+    use hop_proto::{Direction, Message, SessionId, SharedKey, Usage};
     use std::sync::{Arc, Mutex};
     use tokio::io::duplex;
     use tokio::net::TcpListener;
+
+    /// An `Injector` wrapping `FakeInjector`, with `reached_return_edge`'s
+    /// answer controlled by the test rather than by a real cursor. Lets
+    /// CRITICAL 2's wiring (`apply_message` sending `Message::Release`
+    /// when told to) be exercised with no Windows API involved.
+    struct ReturnEdgeInjector {
+        inner: FakeInjector,
+        reached: bool,
+    }
+
+    impl Injector for ReturnEdgeInjector {
+        fn inject(&mut self, event: &InputEvent) -> Result<(), crate::device::DeviceError> {
+            self.inner.inject(event)
+        }
+
+        fn reached_return_edge(&mut self) -> bool {
+            self.reached
+        }
+    }
 
     #[tokio::test]
     async fn a_dead_connection_releases_held_keys_locally() {
@@ -382,6 +430,122 @@ mod tests {
             self.0.lock().unwrap().push(*event);
             Ok(())
         }
+    }
+
+    // "cursor at the return edge produces a Release; cursor elsewhere does
+    // not" (CRITICAL 2 in the whole-branch review), exercised through the
+    // real `apply_message` the supervisor calls, with a fake standing in
+    // for the real Windows cursor.
+    #[tokio::test]
+    async fn cursor_at_the_return_edge_sends_a_release() {
+        let (client_io, server_io) = duplex(4096);
+        let key = SharedKey::from_bytes([1u8; 32]);
+        let (_client_reader, mut client_writer) = split(
+            client_io,
+            key.clone(),
+            SessionId::ZERO,
+            Direction::ClientToServer,
+        );
+        let (mut server_reader, _server_writer) =
+            split(server_io, key, SessionId::ZERO, Direction::ServerToClient);
+
+        let mut injector = ReturnEdgeInjector {
+            inner: FakeInjector::new(),
+            reached: true,
+        };
+        let mut held = HeldKeys::new();
+
+        apply_message(
+            Message::MouseMove { dx: 1, dy: 1 },
+            &mut injector,
+            &mut held,
+            &mut client_writer,
+        )
+        .await
+        .expect("apply_message should succeed");
+
+        let received = tokio::time::timeout(Duration::from_secs(2), server_reader.recv())
+            .await
+            .expect("recv must not hang")
+            .expect("a Release frame must arrive");
+        assert_eq!(received, Message::Release);
+    }
+
+    #[tokio::test]
+    async fn cursor_elsewhere_sends_no_release() {
+        let (client_io, server_io) = duplex(4096);
+        let key = SharedKey::from_bytes([1u8; 32]);
+        let (_client_reader, mut client_writer) = split(
+            client_io,
+            key.clone(),
+            SessionId::ZERO,
+            Direction::ClientToServer,
+        );
+        let (mut server_reader, _server_writer) =
+            split(server_io, key, SessionId::ZERO, Direction::ServerToClient);
+
+        let mut injector = ReturnEdgeInjector {
+            inner: FakeInjector::new(),
+            reached: false,
+        };
+        let mut held = HeldKeys::new();
+
+        apply_message(
+            Message::MouseMove { dx: 1, dy: 1 },
+            &mut injector,
+            &mut held,
+            &mut client_writer,
+        )
+        .await
+        .expect("apply_message should succeed");
+
+        let result = tokio::time::timeout(Duration::from_millis(100), server_reader.recv()).await;
+        assert!(
+            result.is_err(),
+            "no message should have been sent, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_motion_events_are_checked_against_the_return_edge() {
+        // A key press must never trigger a release just because the
+        // injector's `reached_return_edge` happens to answer true: only
+        // motion can actually move the cursor onto the edge, so only
+        // motion is allowed to ask.
+        let (client_io, server_io) = duplex(4096);
+        let key = SharedKey::from_bytes([1u8; 32]);
+        let (_client_reader, mut client_writer) = split(
+            client_io,
+            key.clone(),
+            SessionId::ZERO,
+            Direction::ClientToServer,
+        );
+        let (mut server_reader, _server_writer) =
+            split(server_io, key, SessionId::ZERO, Direction::ServerToClient);
+
+        let mut injector = ReturnEdgeInjector {
+            inner: FakeInjector::new(),
+            reached: true,
+        };
+        let mut held = HeldKeys::new();
+
+        apply_message(
+            Message::Key {
+                usage: Usage::A,
+                pressed: true,
+            },
+            &mut injector,
+            &mut held,
+            &mut client_writer,
+        )
+        .await
+        .expect("apply_message should succeed");
+
+        let result = tokio::time::timeout(Duration::from_millis(100), server_reader.recv()).await;
+        assert!(
+            result.is_err(),
+            "no message should have been sent, got {result:?}"
+        );
     }
 
     #[tokio::test]

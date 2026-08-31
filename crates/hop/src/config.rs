@@ -62,6 +62,13 @@ pub struct SecurityConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InputConfig {
     pub panic_hotkey: Option<String>,
+    /// Client only: which edge of this machine's virtual screen hands
+    /// focus back to the server, the mirror image of the server's own
+    /// `[layout]` edge. Required for `role = "client"`: it is the only
+    /// automatic way focus ever returns (see CRITICAL 2 in the
+    /// whole-branch review that added it), short of the panic hotkey,
+    /// which lives only on the server.
+    pub return_edge: Option<String>,
 }
 
 /// A fully validated `hop` configuration, covering both the server and
@@ -152,6 +159,16 @@ pub enum ConfigError {
         "[layout] edge '{edge}' names peer '{peer}', which is not defined in [[peers]]; add a [[peers]] entry with id = \"{peer}\" or fix the typo"
     )]
     LayoutUnknownPeer { edge: String, peer: String },
+
+    #[error(
+        "role = \"client\" requires '[input] return_edge'; add return_edge = \"top\", \"bottom\", \"left\", or \"right\" naming the edge of this machine's screen that hands focus back to the server (the mirror image of the server's own [layout] edge). Without it the only way focus ever returns is the panic hotkey, which lives on the server, not here"
+    )]
+    ClientMissingReturnEdge,
+
+    #[error(
+        "[input] return_edge has unknown value '{value}'; expected one of \"top\", \"bottom\", \"left\", \"right\""
+    )]
+    UnknownReturnEdge { value: String },
 }
 
 /// The raw shape of the TOML file, before validation. Every field is
@@ -204,6 +221,7 @@ struct RawSecurity {
 #[serde(deny_unknown_fields)]
 struct RawInput {
     panic_hotkey: Option<String>,
+    return_edge: Option<String>,
 }
 
 impl Config {
@@ -273,8 +291,12 @@ impl Config {
             key_file: PathBuf::from(key_file),
         };
 
-        let input = InputConfig {
-            panic_hotkey: raw.input.and_then(|i| i.panic_hotkey),
+        let input = match raw.input {
+            Some(raw_input) => InputConfig {
+                panic_hotkey: raw_input.panic_hotkey,
+                return_edge: raw_input.return_edge,
+            },
+            None => InputConfig::default(),
         };
 
         let config = Config {
@@ -317,6 +339,15 @@ impl Config {
                 }
                 if config.server.is_none() {
                     return Err(ConfigError::ClientMissingServer);
+                }
+                match config.input.return_edge.as_deref() {
+                    None => return Err(ConfigError::ClientMissingReturnEdge),
+                    Some("top" | "bottom" | "left" | "right") => {}
+                    Some(other) => {
+                        return Err(ConfigError::UnknownReturnEdge {
+                            value: other.to_string(),
+                        })
+                    }
                 }
             }
         }
@@ -420,6 +451,9 @@ enabled = true
 
 [security]
 key_file = "%APPDATA%\\hop\\key"
+
+[input]
+return_edge = "bottom"
 "#;
 
     #[test]
@@ -468,6 +502,7 @@ key_file = "%APPDATA%\\hop\\key"
             PathBuf::from("%APPDATA%\\hop\\key")
         );
         assert!(config.peers.is_empty());
+        assert_eq!(config.input.return_edge.as_deref(), Some("bottom"));
     }
 
     #[test]
@@ -752,6 +787,64 @@ key_file = "%APPDATA%\\hop\\key"
         assert!(matches!(err, ConfigError::ClientMissingServer));
         let message = err.to_string();
         assert!(message.contains("server"), "got: {message}");
+    }
+
+    #[test]
+    fn client_missing_return_edge_is_an_error() {
+        // Without an automatic return path, focus can only ever come
+        // home through the panic hotkey, which lives on the server, not
+        // the client; see CRITICAL 2 in the whole-branch review.
+        let path = write_config(
+            r#"
+role = "client"
+id = "pc"
+server = "talhas-mac"
+
+[security]
+key_file = "%APPDATA%\\hop\\key"
+"#,
+        );
+        let err =
+            Config::load(&path).expect_err("client with no [input] return_edge should be rejected");
+        fs::remove_file(&path).ok();
+
+        assert!(matches!(err, ConfigError::ClientMissingReturnEdge));
+        let message = err.to_string();
+        assert!(message.contains("return_edge"), "got: {message}");
+    }
+
+    #[test]
+    fn client_unknown_return_edge_is_an_error() {
+        let path = write_config(
+            r#"
+role = "client"
+id = "pc"
+server = "talhas-mac"
+
+[security]
+key_file = "%APPDATA%\\hop\\key"
+
+[input]
+return_edge = "diagonal"
+"#,
+        );
+        let err = Config::load(&path).expect_err("an unknown return_edge value should be rejected");
+        fs::remove_file(&path).ok();
+
+        match err {
+            ConfigError::UnknownReturnEdge { value } => assert_eq!(value, "diagonal"),
+            other => panic!("expected UnknownReturnEdge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_role_does_not_require_a_return_edge() {
+        // return_edge only makes sense on the client; a server config
+        // (which SERVER_CONFIG never sets it in) must still load.
+        let path = write_config(SERVER_CONFIG);
+        let config = Config::load(&path).expect("server config should not require return_edge");
+        fs::remove_file(&path).ok();
+        assert_eq!(config.input.return_edge, None);
     }
 
     #[test]

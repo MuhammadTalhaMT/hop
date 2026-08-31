@@ -2,6 +2,11 @@
 
 pub mod keymap;
 
+// Pure decision logic with no `windows-sys` calls, so, like `keymap`, it
+// is built and tested on every host rather than gated to Windows.
+pub mod return_edge;
+pub use return_edge::ReturnEdge;
+
 // `inject` calls into `windows-sys` (`SendInput`, `GetLastError`), which is
 // only present as a dependency on Windows (see `hop-platform`'s
 // `Cargo.toml`). Gating the declaration here, rather than gating items

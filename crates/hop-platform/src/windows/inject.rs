@@ -10,16 +10,21 @@
 
 use hop_core::{DeviceError, Injector, InputEvent};
 use hop_proto::{Button, Usage};
-use windows_sys::Win32::Foundation::GetLastError;
+use std::time::{Duration, Instant};
+use windows_sys::Win32::Foundation::{GetLastError, POINT};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
     KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
     MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
     MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::WHEEL_DELTA;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetCursorPos, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, WHEEL_DELTA,
+};
 
 use crate::windows::keymap::usage_to_scancode;
+use crate::windows::return_edge::{should_release, CursorSource, ReturnEdge};
 
 /// Builds the `INPUT` for a key down or up, or `None` if `usage` has no
 /// scancode mapping. `KEYEVENTF_SCANCODE` is always set so the PC's own
@@ -151,13 +156,79 @@ fn send_inputs(inputs: &[INPUT]) -> Result<(), DeviceError> {
     Ok(())
 }
 
+/// Reads the real cursor position and the Windows virtual screen bounds
+/// via the Win32 API. The only real `CursorSource`; the trait exists
+/// separately (see `crate::windows::return_edge`) so the decision that
+/// consumes it is testable without a live Windows desktop.
+struct WindowsCursorSource;
+
+impl CursorSource for WindowsCursorSource {
+    fn cursor_position(&self) -> Option<(i32, i32)> {
+        let mut point = POINT { x: 0, y: 0 };
+        // SAFETY: `point` is a valid, live `POINT` on this stack frame;
+        // `GetCursorPos` writes into it through the pointer we pass and
+        // does not retain that pointer past the call. A zero return means
+        // the query failed (documented as rare, for example no desktop is
+        // attached to the current session), which is why the result is
+        // checked below rather than assumed.
+        let ok = unsafe { GetCursorPos(&mut point) };
+        if ok == 0 {
+            return None;
+        }
+        Some((point.x, point.y))
+    }
+
+    fn virtual_screen(&self) -> (i32, i32, i32, i32) {
+        // SAFETY: `GetSystemMetrics` takes a plain integer index and
+        // returns a plain integer; it has no pointer arguments and is
+        // documented as safe to call at any time.
+        unsafe {
+            (
+                GetSystemMetrics(SM_XVIRTUALSCREEN),
+                GetSystemMetrics(SM_YVIRTUALSCREEN),
+                GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                GetSystemMetrics(SM_CYVIRTUALSCREEN),
+            )
+        }
+    }
+}
+
+/// How long `WindowsInjector` ignores its own return-edge check after it
+/// has just answered yes and sent a `Message::Release`.
+///
+/// The server (see hop's run.rs) returns focus to Local within one poll
+/// tick (15 ms) of receiving that message and stops sending new motion
+/// almost immediately after, but a handful of `MouseMove` messages that
+/// were already in flight can still land here in the meantime; without
+/// this window each of them would independently see the cursor still
+/// sitting at the edge and ask again. The window is short and clears
+/// itself on its own rather than waiting for an explicit "focus is back"
+/// signal from the server, because there isn't always one: a crossing
+/// that held no keys down returns `Action::None`, not `ReleaseAll` (see
+/// `hop_core::Control::return_focus`), so nothing would ever arrive to
+/// clear a flag that depended on it. Self-clearing is what guarantees
+/// this can never get permanently stuck: even in the worst case it has
+/// long since cleared itself before a human crosses back and needs it to
+/// ask again.
+const RELEASE_SUPPRESS_WINDOW: Duration = Duration::from_millis(500);
+
 /// Replays events on the local PC via `SendInput`.
 #[derive(Debug, Default)]
-pub struct WindowsInjector;
+pub struct WindowsInjector {
+    /// The edge of this PC's virtual screen whose crossing hands focus
+    /// back to the server; `None` leaves the automatic return path
+    /// disabled, matching this project's behavior before CRITICAL 2 was
+    /// fixed (only the panic hotkey or a dead link bring focus home).
+    return_edge: Option<ReturnEdge>,
+    suppress_release_until: Option<Instant>,
+}
 
 impl WindowsInjector {
-    pub fn new() -> Self {
-        Self
+    pub fn new(return_edge: Option<ReturnEdge>) -> Self {
+        Self {
+            return_edge,
+            suppress_release_until: None,
+        }
     }
 }
 
@@ -182,6 +253,24 @@ impl Injector for WindowsInjector {
                     Ok(())
                 }
             },
+        }
+    }
+
+    fn reached_return_edge(&mut self) -> bool {
+        let Some(edge) = self.return_edge else {
+            return false;
+        };
+        if let Some(until) = self.suppress_release_until {
+            if Instant::now() < until {
+                return false;
+            }
+            self.suppress_release_until = None;
+        }
+        if should_release(edge, &WindowsCursorSource) {
+            self.suppress_release_until = Some(Instant::now() + RELEASE_SUPPRESS_WINDOW);
+            true
+        } else {
+            false
         }
     }
 }
