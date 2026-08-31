@@ -6,45 +6,24 @@ sleeps, rather than requiring a restart.
 
 ## Status
 
-Untested on real hardware. No human has yet confirmed that the cursor
-crosses to the PC, that keys arrive correctly on the far side, or that
-the link recovers from a real sleep. Everything described below is
-verified by the automated test suite, a manual spike, and CI only; see
-`ARCHITECTURE.md` for what each crate actually does.
+Working, and in daily use on the author's machines. The cursor crosses to
+the PC, keys arrive correctly, Command acts as Control, clipboard text
+syncs both ways, and the link recovers on its own from disconnects.
 
-What exists:
+Verified by hand on macOS 27 (Apple Silicon) driving Windows, alongside
+an automated suite and CI on both platforms. Not tested anywhere else,
+and not tested by anyone else.
 
-- A wire protocol with encryption, replay protection, and a handshake
-  that runs on every connection (`hop-proto`, `hop-core`).
-- A control state machine, key remapping, held-key tracking, a split
-  transport, liveness, reconnect backoff, and a supervisor that ties
-  them together (`hop-core`).
-- macOS input capture through a `CGEventTap`, edge detection, cursor
-  parking, and Windows input injection through `SendInput`
-  (`hop-platform`, the only crate permitted `unsafe`).
-- A command line: `hop keygen` generates a pre-shared key, and `hop run
-  --config <path>` runs the machine's configured role.
+Still unverified even here: recovery from a long sleep, as opposed to the
+disconnects and reconnects that have been exercised.
 
 What is missing:
 
 - Peer discovery. Addresses are configured by hand in the config file.
-- PC to Mac input. Only macOS capture and Windows injection exist, so
-  the Mac's keyboard and mouse can drive the PC, but not the other way
-  around.
-- Clipboard sharing.
+- PC to Mac input. Only macOS capture and Windows injection exist, so the
+  Mac's keyboard and mouse drive the PC, not the other way around.
+- Clipboard images and files. Text only.
 - File transfer.
-
-Known rough edges a first user will hit:
-
-- Edge detection reads only the main display's bounds
-  (`CGDisplay::main()`), so it is likely to misbehave with more than one
-  monitor connected to the Mac.
-- Trackpad and Magic Mouse scrolling is likely to be over-sensitive:
-  continuous scroll events report pixel-scale point deltas, and the
-  Windows side multiplies whatever delta it receives by `WHEEL_DELTA`
-  without any separate scaling for that case.
-- `~` and `%APPDATA%` are not expanded in the config file's `key_file`
-  path. Key paths must be written out in full.
 
 ## What it does
 
