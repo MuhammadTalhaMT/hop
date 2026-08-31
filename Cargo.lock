@@ -438,7 +438,6 @@ dependencies = [
  "getrandom",
  "postcard",
  "serde",
- "sha2",
  "thiserror",
 ]
 
