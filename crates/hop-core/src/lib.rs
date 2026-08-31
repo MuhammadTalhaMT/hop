@@ -35,3 +35,6 @@ pub use handshake::{client_handshake, derive_session, server_handshake, Handshak
 
 pub mod supervisor;
 pub use supervisor::{release_everything, ClientSupervisor, ReconnectPolicy};
+
+pub mod clipboard;
+pub use clipboard::{Clipboard, ClipboardSync, MAX_CLIPBOARD_BYTES};

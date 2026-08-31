@@ -11,8 +11,8 @@
 //! logs every transition.
 
 use crate::{
-    client_handshake, message_to_event, Backoff, HeldKeys, Injector, InputEvent, Liveness,
-    TransportError, TransportWriter,
+    client_handshake, message_to_event, Backoff, Clipboard, ClipboardSync, HeldKeys, Injector,
+    InputEvent, Liveness, TransportError, TransportWriter,
 };
 use hop_proto::{Message, SharedKey};
 use std::time::{Duration, Instant};
@@ -108,13 +108,21 @@ impl Default for ReconnectPolicy {
 /// edge that hands focus back. See that method's doc comment for why
 /// this function, not the injector itself, is what turns a `true` answer
 /// into a sent `Message::Release`: only this function has the writer.
-async fn apply_message<I: Injector, W: AsyncWrite + Unpin>(
+async fn apply_message<I: Injector, C: Clipboard, W: AsyncWrite + Unpin>(
     message: Message,
     injector: &mut I,
     held: &mut HeldKeys,
+    clipboard: &mut C,
+    clipboard_sync: &mut ClipboardSync,
     writer: &mut TransportWriter<W>,
 ) -> Result<(), TransportError> {
     match message {
+        Message::ClipboardText(text) => {
+            // Length only. The contents are the user's clipboard and must
+            // never reach a log.
+            tracing::debug!(bytes = text.len(), "applying the peer's clipboard");
+            clipboard_sync.apply_remote(clipboard, &text);
+        }
         Message::ReleaseAllKeys => {
             for usage in held.drain_release() {
                 let event = InputEvent::Key {
@@ -191,9 +199,14 @@ impl ClientSupervisor {
     /// healthy, and on any disconnect release this machine's own held keys
     /// and try again. An unattended machine must reconnect after an outage
     /// of any length, so this never returns.
-    pub async fn run<I: Injector>(&mut self, injector: &mut I) -> ! {
+    pub async fn run<I: Injector, C: Clipboard>(
+        &mut self,
+        injector: &mut I,
+        clipboard: &mut C,
+    ) -> ! {
         let mut policy = ReconnectPolicy::new();
         let mut held = HeldKeys::new();
+        let mut clipboard_sync = ClipboardSync::new();
 
         loop {
             tracing::info!(addr = %self.addr, "connecting");
@@ -207,8 +220,15 @@ impl ClientSupervisor {
                     if let Err(error) = stream.set_nodelay(true) {
                         tracing::debug!(%error, "failed to set TCP_NODELAY on the connected socket");
                     }
-                    self.run_connection(stream, injector, &mut held, &mut policy)
-                        .await;
+                    self.run_connection(
+                        stream,
+                        injector,
+                        &mut held,
+                        clipboard,
+                        &mut clipboard_sync,
+                        &mut policy,
+                    )
+                    .await;
                 }
                 Err(error) => {
                     tracing::warn!(%error, addr = %self.addr, "connect failed");
@@ -230,11 +250,13 @@ impl ClientSupervisor {
     /// Run a single connection attempt to completion: handshake, pump
     /// input, and return once the link is gone for any reason. Never
     /// itself sleeps or retries; that is `run`'s job.
-    async fn run_connection<I: Injector>(
+    async fn run_connection<I: Injector, C: Clipboard>(
         &self,
         stream: TcpStream,
         injector: &mut I,
         held: &mut HeldKeys,
+        clipboard: &mut C,
+        clipboard_sync: &mut ClipboardSync,
         policy: &mut ReconnectPolicy,
     ) {
         let (reader, mut writer, session) =
@@ -301,7 +323,16 @@ impl ClientSupervisor {
                                     "first frame authenticated under the derived session; connection confirmed"
                                 );
                             }
-                            if let Err(error) = apply_message(message, injector, held, &mut writer).await {
+                            if let Err(error) = apply_message(
+                                message,
+                                injector,
+                                held,
+                                clipboard,
+                                clipboard_sync,
+                                &mut writer,
+                            )
+                            .await
+                            {
                                 tracing::warn!(%error, "failed to send release; disconnecting");
                                 break;
                             }
@@ -317,6 +348,17 @@ impl ClientSupervisor {
                     }
                 }
                 _ = ticker.tick() => {
+                    // Neither platform can notify us that the clipboard
+                    // changed, so noticing a copy means polling a counter.
+                    // Riding the existing tick keeps it off the input path.
+                    if let Some(text) = clipboard_sync.poll_local_change(clipboard) {
+                        tracing::debug!(bytes = text.len(), "forwarding a local copy to the peer");
+                        if let Err(error) = writer.send(&Message::ClipboardText(text)).await {
+                            tracing::warn!(%error, "failed to send clipboard; disconnecting");
+                            break;
+                        }
+                    }
+
                     let now = Instant::now();
                     if liveness.is_dead(now) {
                         tracing::warn!(
@@ -462,11 +504,16 @@ mod tests {
             reached: true,
         };
         let mut held = HeldKeys::new();
+        let mut clipboard_sync = ClipboardSync::new();
+
+        let mut clipboard = crate::clipboard::FakeClipboard::new();
 
         apply_message(
             Message::MouseMove { dx: 1, dy: 1 },
             &mut injector,
             &mut held,
+            &mut clipboard,
+            &mut clipboard_sync,
             &mut client_writer,
         )
         .await
@@ -497,11 +544,16 @@ mod tests {
             reached: false,
         };
         let mut held = HeldKeys::new();
+        let mut clipboard_sync = ClipboardSync::new();
+
+        let mut clipboard = crate::clipboard::FakeClipboard::new();
 
         apply_message(
             Message::MouseMove { dx: 1, dy: 1 },
             &mut injector,
             &mut held,
+            &mut clipboard,
+            &mut clipboard_sync,
             &mut client_writer,
         )
         .await
@@ -536,6 +588,9 @@ mod tests {
             reached: true,
         };
         let mut held = HeldKeys::new();
+        let mut clipboard_sync = ClipboardSync::new();
+
+        let mut clipboard = crate::clipboard::FakeClipboard::new();
 
         apply_message(
             Message::Key {
@@ -544,6 +599,8 @@ mod tests {
             },
             &mut injector,
             &mut held,
+            &mut clipboard,
+            &mut clipboard_sync,
             &mut client_writer,
         )
         .await
@@ -668,7 +725,8 @@ mod tests {
             .with_liveness(Duration::from_millis(20), Duration::from_millis(60));
 
         let handle = tokio::spawn(async move {
-            supervisor.run(&mut injector).await;
+            let mut clipboard = crate::clipboard::FakeClipboard::new();
+            supervisor.run(&mut injector, &mut clipboard).await;
         });
 
         // Long enough for connect, handshake, the key press, and the

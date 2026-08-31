@@ -42,6 +42,15 @@ pub enum Message {
     Heartbeat,
     /// The client is handing control back to the server.
     Release,
+    /// The sender's clipboard now holds this text. Sent when either side
+    /// notices its own clipboard changed, so a copy on one machine can be
+    /// pasted on the other.
+    ///
+    /// Text only. Images and files are deliberately not carried: they are
+    /// unbounded in size where text realistically is not, and the frame
+    /// cap in `hop-core`'s transport is what keeps a peer from making us
+    /// allocate arbitrarily.
+    ClipboardText(String),
     /// A variant this build does not understand. Decoding produces this
     /// instead of failing, so a newer peer can add message types without
     /// breaking an older one.
@@ -61,6 +70,7 @@ const TAG_KEY: u16 = 5;
 const TAG_RELEASE_ALL_KEYS: u16 = 6;
 const TAG_HEARTBEAT: u16 = 7;
 const TAG_RELEASE: u16 = 8;
+const TAG_CLIPBOARD_TEXT: u16 = 9;
 
 #[derive(Serialize, Deserialize)]
 struct Frame {
@@ -106,6 +116,7 @@ pub fn encode(message: &Message) -> Result<Vec<u8>, CodecError> {
         Message::ReleaseAllKeys => encode_raw(TAG_RELEASE_ALL_KEYS, &()),
         Message::Heartbeat => encode_raw(TAG_HEARTBEAT, &()),
         Message::Release => encode_raw(TAG_RELEASE, &()),
+        Message::ClipboardText(text) => encode_raw(TAG_CLIPBOARD_TEXT, text),
         Message::Unknown => Err(CodecError::UnknownNotEncodable),
     }
 }
@@ -141,6 +152,10 @@ pub fn decode(bytes: &[u8]) -> Result<Message, CodecError> {
         TAG_RELEASE_ALL_KEYS => Message::ReleaseAllKeys,
         TAG_HEARTBEAT => Message::Heartbeat,
         TAG_RELEASE => Message::Release,
+        TAG_CLIPBOARD_TEXT => {
+            let text: String = postcard::from_bytes(&frame.body)?;
+            Message::ClipboardText(text)
+        }
         _ => Message::Unknown,
     };
     Ok(message)
@@ -150,6 +165,32 @@ pub fn decode(bytes: &[u8]) -> Result<Message, CodecError> {
 mod tests {
     use super::*;
     use crate::Usage;
+
+    #[test]
+    fn clipboard_text_round_trips_including_awkward_content() {
+        // Clipboard text is arbitrary user data: newlines, unicode, emoji
+        // and an empty copy all have to survive the wire unchanged.
+        for text in [
+            "hello",
+            "",
+            "line one\nline two\r\nline three",
+            "unicode: caf\u{e9} \u{4f60}\u{597d} \u{1f600}",
+            "  leading and trailing whitespace  ",
+        ] {
+            let original = Message::ClipboardText(text.to_string());
+            let decoded = decode(&encode(&original).expect("encode")).expect("decode");
+            assert_eq!(original, decoded, "clipboard text did not round trip");
+        }
+    }
+
+    #[test]
+    fn a_peer_that_does_not_know_clipboard_ignores_it() {
+        // Clipboard was added after the first release, so an older peer
+        // must treat the new tag as Unknown rather than erroring out and
+        // dropping the connection.
+        let future = encode_raw(9999, &"some clipboard text").expect("encode");
+        assert_eq!(decode(&future).expect("decode"), Message::Unknown);
+    }
 
     #[test]
     fn round_trips_every_variant() {

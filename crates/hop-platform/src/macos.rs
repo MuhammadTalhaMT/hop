@@ -1,6 +1,7 @@
 //! macOS implementation of hop's capture and injection traits.
 
 pub mod capture;
+pub mod clipboard;
 pub mod cursor;
 pub mod keymap;
 

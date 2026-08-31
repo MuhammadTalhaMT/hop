@@ -311,7 +311,8 @@ async fn run_client(config: Config, key: SharedKey) -> Result<(), RunError> {
         ?return_edge,
         "starting hop client; reconnecting forever on any link loss"
     );
-    supervisor.run(&mut injector).await
+    let mut clipboard = hop_platform::windows::clipboard::WindowsClipboard;
+    supervisor.run(&mut injector, &mut clipboard).await
 }
 
 /// Wraps a capturer, passing every event through unchanged, while watching
@@ -570,6 +571,11 @@ async fn handle_client(
     // cadence and a 3s death timeout is negligible, and it still redrains
     // the capturer itself in case a `notify` wakeup was ever missed.
     let mut poll_ticker = tokio::time::interval(Duration::from_millis(250));
+    // Neither platform can notify us that the clipboard changed, so
+    // noticing a copy means polling a counter. Riding the existing tick
+    // keeps it off the input path entirely.
+    let mut clipboard = hop_platform::macos::clipboard::MacClipboard;
+    let mut clipboard_sync = hop_core::ClipboardSync::new();
 
     'connection: loop {
         tokio::select! {
@@ -577,14 +583,23 @@ async fn handle_client(
                 match received {
                     Some(Ok(message)) => {
                         liveness.record_activity(Instant::now());
-                        if let hop_proto::Message::Release = message {
-                            if control.on_release_requested() == Action::ReleaseAll
-                                && send_release_all(&mut writer).await.is_err()
-                            {
-                                tracing::warn!("failed to send release-all; disconnecting");
-                                break 'connection;
+                        match message {
+                            hop_proto::Message::Release => {
+                                if control.on_release_requested() == Action::ReleaseAll
+                                    && send_release_all(&mut writer).await.is_err()
+                                {
+                                    tracing::warn!("failed to send release-all; disconnecting");
+                                    break 'connection;
+                                }
+                                remote_flag.store(control.focus() == hop_core::Focus::Remote, Ordering::Relaxed);
                             }
-                            remote_flag.store(control.focus() == hop_core::Focus::Remote, Ordering::Relaxed);
+                            hop_proto::Message::ClipboardText(text) => {
+                                // Length only. The contents are the user's
+                                // clipboard and must never reach a log.
+                                tracing::debug!(bytes = text.len(), "applying the peer's clipboard");
+                                clipboard_sync.apply_remote(&mut clipboard, &text);
+                            }
+                            _ => {}
                         }
                     }
                     Some(Err(error)) => {
@@ -603,6 +618,14 @@ async fn handle_client(
                 }
             }
             _ = poll_ticker.tick() => {
+                if let Some(text) = clipboard_sync.poll_local_change(&clipboard) {
+                    tracing::debug!(bytes = text.len(), "forwarding a local copy to the peer");
+                    if let Err(error) = writer.send(&hop_proto::Message::ClipboardText(text)).await {
+                        tracing::warn!(%error, "failed to send clipboard; disconnecting");
+                        break 'connection;
+                    }
+                }
+
                 let now = Instant::now();
                 if liveness.is_dead(now) {
                     tracing::warn!(timeout = ?death_timeout, "no activity from the client within the timeout; disconnecting");

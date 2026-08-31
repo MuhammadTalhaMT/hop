@@ -12,6 +12,9 @@ pub use return_edge::ReturnEdge;
 // `Cargo.toml`). Gating the declaration here, rather than gating items
 // inside the file, keeps the whole module off the build on any other host.
 #[cfg(target_os = "windows")]
+pub mod clipboard;
+
+#[cfg(target_os = "windows")]
 pub mod inject;
 
 #[cfg(target_os = "windows")]
