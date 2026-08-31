@@ -234,12 +234,16 @@ impl CursorPark {
 
     /// Warps the real cursor back to the parked point. A no-op if nothing
     /// is currently parked.
-    fn hold(&self) {
-        let origin = lock_recovering(&self.origin, "cursor_park_origin");
-        if let Some((x, y)) = *origin {
-            cursor::warp_cursor(x, y);
-        }
-    }
+    /// Deliberately does nothing while parked.
+    ///
+    /// `enter_parked_state` has already disassociated the mouse, so the
+    /// cursor is frozen where `park` left it and hardware movement cannot
+    /// drag it anywhere. Warping it back on every motion event, which this
+    /// used to do, was therefore redundant, and the warps fought macOS's
+    /// own cursor position bookkeeping: on re-association it re-synced the
+    /// cursor to where it believed the hardware was, landing it in the
+    /// middle of the screen instead of at the edge the user left through.
+    fn hold(&self) {}
 
     /// Gives the cursor back: warps it to the parked point one last time,
     /// makes it visible again, reassociates hardware mouse movement with
@@ -251,11 +255,12 @@ impl CursorPark {
     fn restore(&self) {
         let mut origin = lock_recovering(&self.origin, "cursor_park_origin");
         if let Some((x, y)) = origin.take() {
-            // Re-associate and clear suppression BEFORE the warp, so the
-            // warp itself cannot swallow the first moments of the user's
-            // own mouse movement as focus comes home.
-            cursor::leave_parked_state();
+            // Put the cursor back at the edge it left through BEFORE
+            // re-associating. Warping afterwards loses the race with
+            // macOS's own re-sync, which drops the cursor wherever it
+            // thinks the hardware is, typically mid-screen.
             cursor::warp_cursor(x, y);
+            cursor::leave_parked_state();
             cursor::show_cursor();
         }
     }
