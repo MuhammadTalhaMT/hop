@@ -18,8 +18,6 @@
 //! does not need hardware to get right. See Task 13 for the human
 //! verification the hardware-touching calls actually get.
 
-use std::ffi::c_void;
-
 use core_graphics::display::CGDisplay;
 use core_graphics::event::CGEvent;
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
@@ -200,34 +198,6 @@ pub fn show_cursor() {
     let _ = CGDisplay::main().show_cursor();
 }
 
-/// Opaque pointer type matching `CGEventSourceRef` from
-/// `<CoreGraphics/CGEventSource.h>`. `core-graphics`'s own
-/// `event_source::CGEventSource` wraps the same underlying pointer, but
-/// only exposes it through the `foreign_types` crate's `ForeignType`
-/// trait, which is not a dependency of this crate; adding it solely to
-/// reach one pointer accessor would violate this project's "no new
-/// dependencies" rule. This type is only ever passed straight from
-/// `CGEventSourceCreate`'s return value into
-/// `CGEventSourceSetLocalEventsSuppressionInterval` and then released; it
-/// is never dereferenced, so an opaque `c_void` pointer is exactly as
-/// much type as this file needs for it.
-type CGEventSourceRef = *const c_void;
-
-// `CGEventSourceCreate` and `CGEventSourceSetLocalEventsSuppressionInterval`
-// are declared here rather than used from `core-graphics` because the
-// crate exposes event source creation only through its safe
-// `CGEventSource::new`, which (see `CGEventSourceRef` above) offers no way
-// to get the raw pointer back out, and does not expose
-// `CGEventSourceSetLocalEventsSuppressionInterval` at all. Both are part
-// of the same public `<CoreGraphics/CGEventSource.h>` API `CGEventSource`
-// itself already binds against, so declaring their C signatures directly
-// is the same kind of bridging `capture.rs` already does for
-// `CGEventTapEnable`/`CGEventTapIsEnabled`.
-unsafe extern "C" {
-    fn CGEventSourceCreate(state_id: CGEventSourceStateID) -> CGEventSourceRef;
-    fn CGEventSourceSetLocalEventsSuppressionInterval(source: CGEventSourceRef, seconds: f64);
-}
-
 /// Sets how long, in seconds, local hardware input is suppressed after a
 /// programmatic cursor warp; see `DEFAULT_LOCAL_EVENTS_SUPPRESSION_INTERVAL`
 /// above for why this needs to be overridden while focus is parked on the
@@ -235,25 +205,41 @@ unsafe extern "C" {
 /// (undocumented but possible, the same caveat `cursor_position` above
 /// already lives with), this silently does nothing rather than panicking
 /// on the input path.
+/// Permit every event class during a suppression window.
+/// `kCGEventFilterMaskPermitAllEvents` is the OR of the local mouse,
+/// local keyboard and system-defined permit bits.
+const PERMIT_ALL_EVENTS: u32 = 1 | 2 | 4;
+/// `kCGEventSupressionStateSupressionInterval`. Apple's own spelling of
+/// "suppression" is missing a letter here; kept so the constant is
+/// greppable against the system headers.
+const SUPPRESSION_STATE_INTERVAL: u32 = 0;
+
+unsafe extern "C" {
+    fn CGSetLocalEventsSuppressionInterval(seconds: f64) -> i32;
+    fn CGSetLocalEventsFilterDuringSupressionState(filter: u32, state: u32) -> i32;
+}
+
+/// Stop macOS ignoring the user's own mouse for a quarter second after a
+/// warp.
+///
+/// This must use the process-wide `CGSetLocalEventsSuppressionInterval`,
+/// not `CGEventSourceSetLocalEventsSuppressionInterval`. An earlier
+/// version of this function created an event source, set the interval on
+/// it, and released it immediately, which sets a property on a throwaway
+/// object and does nothing at all to the system. The symptom was a cursor
+/// that visibly hesitated for about a second every time focus came back
+/// from the peer.
+///
+/// Both calls are deprecated by Apple and have no supported replacement
+/// for this purpose. They still work, and every tool in this space uses
+/// them for exactly this.
 fn set_local_events_suppression_interval(seconds: f64) {
-    // SAFETY: `CGEventSourceCreate` follows Core Foundation's "create
-    // rule": a non-null return is a new, owned reference this call alone
-    // is responsible for releasing, and a null return means creation
-    // failed and there is nothing to release. The null check below
-    // handles the second case; `CFRelease` at the end handles the first
-    // on every path out of this function, so no reference ever leaks.
-    // `source`, between creation and release, is a valid pointer for the
-    // one call to `CGEventSourceSetLocalEventsSuppressionInterval`, which
-    // Apple documents as safe to call from any thread and which does
-    // nothing but write a property on the source object it is given, no
-    // different in kind from `CGEventTapEnable` elsewhere in this crate.
+    // SAFETY: both take plain scalars by value, return a status code, and
+    // touch no memory this crate owns. There is nothing to keep alive
+    // across the call and nothing to release afterwards.
     unsafe {
-        let source = CGEventSourceCreate(CGEventSourceStateID::HIDSystemState);
-        if source.is_null() {
-            return;
-        }
-        CGEventSourceSetLocalEventsSuppressionInterval(source, seconds);
-        core_foundation::base::CFRelease(source);
+        CGSetLocalEventsSuppressionInterval(seconds);
+        CGSetLocalEventsFilterDuringSupressionState(PERMIT_ALL_EVENTS, SUPPRESSION_STATE_INTERVAL);
     }
 }
 
