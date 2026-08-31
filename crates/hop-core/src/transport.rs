@@ -1,4 +1,4 @@
-use hop_proto::{open, seal, Message, ReplayWindow, SharedKey};
+use hop_proto::{open, seal, Message, ReplayWindow, SessionId, SharedKey};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Refuse absurd frames rather than allocating whatever a peer claims.
@@ -31,15 +31,17 @@ pub enum TransportError {
 pub struct Transport<S> {
     stream: S,
     key: SharedKey,
+    session: SessionId,
     send_seq: u64,
     replay: ReplayWindow,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Transport<S> {
-    pub fn new(stream: S, key: SharedKey) -> Self {
+    pub fn new(stream: S, key: SharedKey, session: SessionId) -> Self {
         Self {
             stream,
             key,
+            session,
             send_seq: 0,
             replay: ReplayWindow::new(),
         }
@@ -61,7 +63,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Transport<S> {
         // wrapping u64 takes roughly 5.8e8 years. The counter is 64 bit
         // specifically so this never matters.
         self.send_seq = self.send_seq.wrapping_add(1);
-        let frame = seal(&self.key, self.send_seq, message).map_err(|_| TransportError::Crypto)?;
+        let frame = seal(&self.key, self.session, self.send_seq, message)
+            .map_err(|_| TransportError::Crypto)?;
         if frame.len() > MAX_FRAME {
             return Err(TransportError::FrameTooLarge);
         }
@@ -114,7 +117,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Transport<S> {
             Err(e) => return Err(TransportError::Io(e)),
         }
 
-        let (seq, message) = open(&self.key, &frame).map_err(|_| TransportError::Crypto)?;
+        let (seq, message) =
+            open(&self.key, self.session, &frame).map_err(|_| TransportError::Crypto)?;
         if !self.replay.accept(seq) {
             return Err(TransportError::Replay);
         }
@@ -125,7 +129,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Transport<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hop_proto::{Message, SharedKey, Usage};
+    use hop_proto::{Message, SessionId, SharedKey, Usage};
     use tokio::io::duplex;
     use tokio::io::AsyncWriteExt;
 
@@ -133,11 +137,15 @@ mod tests {
         SharedKey::from_bytes([7u8; 32])
     }
 
+    fn session() -> SessionId {
+        SessionId([3u8; 32])
+    }
+
     #[tokio::test]
     async fn sends_and_receives_a_message() {
         let (a, b) = duplex(4096);
-        let mut client = Transport::new(a, key());
-        let mut server = Transport::new(b, key());
+        let mut client = Transport::new(a, key(), session());
+        let mut server = Transport::new(b, key(), session());
 
         let sent = Message::Key {
             usage: Usage::C,
@@ -150,8 +158,8 @@ mod tests {
     #[tokio::test]
     async fn preserves_order_across_many_messages() {
         let (a, b) = duplex(65536);
-        let mut client = Transport::new(a, key());
-        let mut server = Transport::new(b, key());
+        let mut client = Transport::new(a, key(), session());
+        let mut server = Transport::new(b, key(), session());
 
         for i in 0..50 {
             client
@@ -170,8 +178,24 @@ mod tests {
     #[tokio::test]
     async fn rejects_a_peer_with_the_wrong_key() {
         let (a, b) = duplex(4096);
-        let mut client = Transport::new(a, SharedKey::from_bytes([1u8; 32]));
-        let mut server = Transport::new(b, SharedKey::from_bytes([2u8; 32]));
+        let mut client = Transport::new(a, SharedKey::from_bytes([1u8; 32]), session());
+        let mut server = Transport::new(b, SharedKey::from_bytes([2u8; 32]), session());
+
+        client.send(&Message::Heartbeat).await.unwrap();
+        assert!(matches!(server.recv().await, Err(TransportError::Crypto)));
+    }
+
+    #[tokio::test]
+    async fn a_frame_sealed_under_one_session_is_refused_on_another() {
+        // This is the attack CRITICAL 1 fixes: an attacker who records a
+        // typing session and later becomes the client's server (rogue mDNS
+        // response, ARP spoofing) can no longer replay the recording into a
+        // fresh session, because a fresh `Transport` for a different
+        // session rejects frames sealed under the earlier one even though
+        // the shared key and every AEAD tag would otherwise be valid.
+        let (a, b) = duplex(4096);
+        let mut client = Transport::new(a, key(), SessionId([1u8; 32]));
+        let mut server = Transport::new(b, key(), SessionId([2u8; 32]));
 
         client.send(&Message::Heartbeat).await.unwrap();
         assert!(matches!(server.recv().await, Err(TransportError::Crypto)));
@@ -180,8 +204,8 @@ mod tests {
     #[tokio::test]
     async fn reports_closure_when_the_peer_goes_away() {
         let (a, b) = duplex(4096);
-        let client = Transport::new(a, key());
-        let mut server = Transport::new(b, key());
+        let client = Transport::new(a, key(), session());
+        let mut server = Transport::new(b, key(), session());
         drop(client);
         assert!(matches!(server.recv().await, Err(TransportError::Closed)));
     }
@@ -191,10 +215,10 @@ mod tests {
         // Capturing a frame and sending it twice must not deliver it twice,
         // or an attacker could re-inject a captured keystroke.
         let (mut a, b) = duplex(4096);
-        let mut receiver = Transport::new(b, key());
+        let mut receiver = Transport::new(b, key(), session());
 
         // Build one frame by hand so it can be sent twice verbatim.
-        let frame = hop_proto::seal(&key(), 1, &Message::Heartbeat).unwrap();
+        let frame = hop_proto::seal(&key(), session(), 1, &Message::Heartbeat).unwrap();
         let len = u32::try_from(frame.len()).unwrap();
         for _ in 0..2 {
             a.write_all(&len.to_be_bytes()).await.unwrap();
@@ -210,7 +234,7 @@ mod tests {
     async fn refuses_an_oversized_declared_length() {
         // A peer claiming a huge frame must be refused before we allocate.
         let (mut a, b) = duplex(4096);
-        let mut receiver = Transport::new(b, key());
+        let mut receiver = Transport::new(b, key(), session());
         a.write_all(&u32::MAX.to_be_bytes()).await.unwrap();
         a.flush().await.unwrap();
         assert!(matches!(
@@ -225,7 +249,7 @@ mod tests {
         // frame authenticates. Otherwise one forged frame claiming a huge
         // seq pins the window and permanently rejects genuine traffic.
         let (mut a, b) = duplex(4096);
-        let mut receiver = Transport::new(b, key());
+        let mut receiver = Transport::new(b, key(), session());
 
         let mut forged = Vec::new();
         forged.extend_from_slice(&u64::MAX.to_be_bytes());
@@ -237,7 +261,7 @@ mod tests {
         assert!(matches!(receiver.recv().await, Err(TransportError::Crypto)));
 
         // A genuine frame must still be accepted afterwards.
-        let real = hop_proto::seal(&key(), 1, &Message::Heartbeat).unwrap();
+        let real = hop_proto::seal(&key(), session(), 1, &Message::Heartbeat).unwrap();
         let len = u32::try_from(real.len()).unwrap();
         a.write_all(&len.to_be_bytes()).await.unwrap();
         a.write_all(&real).await.unwrap();
@@ -251,9 +275,9 @@ mod tests {
         // limiting, not a graceful shutdown, so it must not be conflated
         // with `Closed`.
         let (mut a, b) = duplex(4096);
-        let mut receiver = Transport::new(b, key());
+        let mut receiver = Transport::new(b, key(), session());
 
-        let frame = hop_proto::seal(&key(), 1, &Message::Heartbeat).unwrap();
+        let frame = hop_proto::seal(&key(), session(), 1, &Message::Heartbeat).unwrap();
         let len = u32::try_from(frame.len()).unwrap();
         a.write_all(&len.to_be_bytes()).await.unwrap();
         a.write_all(&frame[..frame.len() - 1]).await.unwrap();
@@ -272,7 +296,7 @@ mod tests {
         // arriving (a clean close between frames) is different from a
         // partial frame arriving (a truncation).
         let (a, b) = duplex(4096);
-        let mut receiver = Transport::new(b, key());
+        let mut receiver = Transport::new(b, key(), session());
         drop(a);
         assert!(matches!(receiver.recv().await, Err(TransportError::Closed)));
     }
@@ -286,6 +310,7 @@ mod tests {
                 version: 1,
                 capabilities: 0,
                 peer_id: "a-fairly-realistic-machine-identifier-1234".into(),
+                nonce: [0u8; 32],
             },
             Message::MouseMove { dx: -3, dy: 7 },
             Message::MouseButton {
@@ -302,7 +327,7 @@ mod tests {
             Message::Release,
         ];
         for message in cases {
-            let frame = hop_proto::seal(&key(), 1, &message).unwrap();
+            let frame = hop_proto::seal(&key(), session(), 1, &message).unwrap();
             assert!(
                 frame.len() < MAX_FRAME,
                 "{message:?} sealed to {} bytes, which is not under MAX_FRAME",

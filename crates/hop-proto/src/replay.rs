@@ -5,7 +5,20 @@ const WINDOW: u64 = 64;
 /// Accepts each sequence number exactly once. Tolerates mild reordering
 /// (within `WINDOW`) because the network may legitimately deliver frames
 /// out of order, but refuses anything already seen or older than the
-/// window, which is what defeats a capture-and-replay attack.
+/// window, which is what defeats a capture-and-replay attack within a
+/// single session.
+///
+/// A fresh `ReplayWindow` is created every time a `Transport` is
+/// constructed, so its protection resets at the start of each connection
+/// and lasts only for that connection's lifetime. It has nothing to say
+/// about a frame captured during one session and replayed at the start of
+/// a later one, a fresh window accepts sequence numbers starting from
+/// scratch. That gap is what [`crate::SessionId`] closes: binding a frame
+/// to the session it was sealed under means a later session's fresh
+/// window never even sees a valid tag to accept. Until Plan B's handshake
+/// exists, every session uses [`crate::SessionId::ZERO`], so in a running
+/// system this window's per-connection reset is, for now, the only replay
+/// protection actually in effect.
 #[derive(Debug, Default)]
 pub struct ReplayWindow {
     highest: u64,

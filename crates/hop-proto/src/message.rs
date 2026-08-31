@@ -18,6 +18,7 @@ pub enum Message {
         version: u16,
         capabilities: u32,
         peer_id: String,
+        nonce: [u8; 32],
     },
     MouseMove {
         dx: i32,
@@ -91,7 +92,11 @@ pub fn encode(message: &Message) -> Result<Vec<u8>, CodecError> {
             version,
             capabilities,
             peer_id,
-        } => encode_raw(TAG_HANDSHAKE, &(*version, *capabilities, peer_id.clone())),
+            nonce,
+        } => encode_raw(
+            TAG_HANDSHAKE,
+            &(*version, *capabilities, peer_id.clone(), *nonce),
+        ),
         Message::MouseMove { dx, dy } => encode_raw(TAG_MOUSE_MOVE, &(*dx, *dy)),
         Message::MouseButton { button, pressed } => {
             encode_raw(TAG_MOUSE_BUTTON, &(*button, *pressed))
@@ -109,11 +114,12 @@ pub fn decode(bytes: &[u8]) -> Result<Message, CodecError> {
     let frame: Frame = postcard::from_bytes(bytes)?;
     let message = match frame.tag {
         TAG_HANDSHAKE => {
-            let (version, capabilities, peer_id) = postcard::from_bytes(&frame.body)?;
+            let (version, capabilities, peer_id, nonce) = postcard::from_bytes(&frame.body)?;
             Message::Handshake {
                 version,
                 capabilities,
                 peer_id,
+                nonce,
             }
         }
         TAG_MOUSE_MOVE => {
@@ -152,6 +158,7 @@ mod tests {
                 version: PROTOCOL_VERSION,
                 capabilities: 0,
                 peer_id: "pc".into(),
+                nonce: [9u8; 32],
             },
             Message::MouseMove { dx: -3, dy: 7 },
             Message::MouseButton {

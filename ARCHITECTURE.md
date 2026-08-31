@@ -174,3 +174,28 @@ supervisor:
   must be extended with a persistent read buffer first. Wiring `recv`
   directly into a `tokio::select!` against a timeout will eventually
   desynchronize the stream.
+- **The handshake must derive a real `SessionId` before any input is
+  processed.** `hop_proto::crypto::SessionId` now binds every frame to a
+  session, so a frame sealed under one session cannot authenticate under
+  another. But until this plan implements the handshake, both peers
+  construct their `Transport` with `SessionId::ZERO`, which is the same
+  value on every connection, so in a running system this binding
+  currently provides no protection at all: a session recorded against
+  `ZERO` still authenticates against the next connection's `ZERO`. The
+  handshake must derive a fresh, per-session `SessionId` from the nonces
+  both peers exchange in `Message::Handshake`, and it must do so before
+  either side processes any input message, not merely before it sends
+  the first one.
+- **Nothing currently binds direction.** Both the client and the server
+  hold the same `SharedKey`, and `seal`/`open` do not distinguish who
+  sealed a frame. `Transport` today only has a working `send` path on
+  one side and a working `recv` path on the other in practice, but
+  nothing in the types enforces that: once the server also gains a
+  receive path, a frame the server sent could be captured and reflected
+  back at the server itself, and nothing stops a client from sending an
+  input message the server would otherwise only expect to originate
+  server-side. This plan must close that gap, for example by deriving
+  separate directional keys (one for server-to-client, one for
+  client-to-server) from the shared secret, or by including a role byte
+  in the AAD so a frame sealed as "from the server" is rejected if it
+  arrives claiming to be from the client.

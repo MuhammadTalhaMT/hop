@@ -7,6 +7,29 @@ const NONCE_LEN: usize = 24;
 const TAG_LEN: usize = 16;
 const MIN_FRAME: usize = SEQ_LEN + NONCE_LEN + TAG_LEN;
 
+/// Identifies one session between two peers, mixed into every frame's
+/// authenticated data so a frame sealed under one session cannot
+/// authenticate under another.
+///
+/// Until Plan B implements the handshake, both peers use [`SessionId::ZERO`]
+/// for every connection, which means this binding is not yet doing any
+/// work in a running system: a frame recorded on one `ZERO` session still
+/// authenticates on the next `ZERO` session, because they are the same
+/// session as far as the AAD is concerned. The protection this type exists
+/// to provide only becomes real once Plan B's handshake derives a fresh,
+/// per-session `SessionId` from both peers' exchanged nonces (see
+/// `Message::Handshake`'s `nonce` field), and does so before any input
+/// message is processed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionId(pub [u8; 32]);
+
+impl SessionId {
+    /// The placeholder session used until the handshake exists. Every
+    /// connection currently uses this same value, so it provides no
+    /// per-session separation; see the type's doc comment.
+    pub const ZERO: SessionId = SessionId([0u8; 32]);
+}
+
 /// The pre-shared 32 byte secret. Both machines hold the same value.
 #[derive(Clone)]
 pub struct SharedKey([u8; 32]);
@@ -46,7 +69,23 @@ pub enum CryptoError {
     Random,
 }
 
-pub fn seal(key: &SharedKey, seq: u64, message: &Message) -> Result<Vec<u8>, CryptoError> {
+/// Build the associated data a frame is authenticated under: the session
+/// bytes followed by the 8 big-endian sequence bytes. The session is never
+/// transmitted, since both peers already know it; only the sequence bytes
+/// go on the wire in the clear.
+fn associated_data(session: SessionId, seq_bytes: [u8; SEQ_LEN]) -> [u8; 32 + SEQ_LEN] {
+    let mut aad = [0u8; 32 + SEQ_LEN];
+    aad[..32].copy_from_slice(&session.0);
+    aad[32..].copy_from_slice(&seq_bytes);
+    aad
+}
+
+pub fn seal(
+    key: &SharedKey,
+    session: SessionId,
+    seq: u64,
+    message: &Message,
+) -> Result<Vec<u8>, CryptoError> {
     let plaintext = encode(message)?;
 
     let mut nonce_bytes = [0u8; NONCE_LEN];
@@ -54,7 +93,8 @@ pub fn seal(key: &SharedKey, seq: u64, message: &Message) -> Result<Vec<u8>, Cry
     let nonce: XNonce = nonce_bytes.into();
 
     let cipher = XChaCha20Poly1305::new(key.as_bytes().into());
-    let aad = seq.to_be_bytes();
+    let seq_bytes = seq.to_be_bytes();
+    let aad = associated_data(session, seq_bytes);
     let ciphertext = cipher
         .encrypt(
             &nonce,
@@ -66,13 +106,17 @@ pub fn seal(key: &SharedKey, seq: u64, message: &Message) -> Result<Vec<u8>, Cry
         .map_err(|_| CryptoError::Authentication)?;
 
     let mut frame = Vec::with_capacity(SEQ_LEN + NONCE_LEN + ciphertext.len());
-    frame.extend_from_slice(&aad);
+    frame.extend_from_slice(&seq_bytes);
     frame.extend_from_slice(&nonce_bytes);
     frame.extend_from_slice(&ciphertext);
     Ok(frame)
 }
 
-pub fn open(key: &SharedKey, frame: &[u8]) -> Result<(u64, Message), CryptoError> {
+pub fn open(
+    key: &SharedKey,
+    session: SessionId,
+    frame: &[u8],
+) -> Result<(u64, Message), CryptoError> {
     if frame.len() < MIN_FRAME {
         return Err(CryptoError::TooShort);
     }
@@ -88,12 +132,13 @@ pub fn open(key: &SharedKey, frame: &[u8]) -> Result<(u64, Message), CryptoError
     let nonce: XNonce = nonce_arr.into();
 
     let cipher = XChaCha20Poly1305::new(key.as_bytes().into());
+    let aad = associated_data(session, seq_arr);
     let plaintext = cipher
         .decrypt(
             &nonce,
             Payload {
                 msg: ciphertext,
-                aad: &seq_arr,
+                aad: &aad,
             },
         )
         .map_err(|_| CryptoError::Authentication)?;
@@ -113,51 +158,55 @@ mod tests {
         }
     }
 
+    fn session() -> SessionId {
+        SessionId([5u8; 32])
+    }
+
     #[test]
     fn seals_and_opens_round_trip() {
         let key = SharedKey::generate();
-        let sealed = seal(&key, 7, &sample()).expect("seal");
-        let (seq, message) = open(&key, &sealed).expect("open");
+        let sealed = seal(&key, session(), 7, &sample()).expect("seal");
+        let (seq, message) = open(&key, session(), &sealed).expect("open");
         assert_eq!(seq, 7);
         assert_eq!(message, sample());
     }
 
     #[test]
     fn rejects_wrong_key() {
-        let sealed = seal(&SharedKey::generate(), 1, &sample()).unwrap();
-        assert!(open(&SharedKey::generate(), &sealed).is_err());
+        let sealed = seal(&SharedKey::generate(), session(), 1, &sample()).unwrap();
+        assert!(open(&SharedKey::generate(), session(), &sealed).is_err());
     }
 
     #[test]
     fn rejects_tampered_ciphertext() {
         let key = SharedKey::generate();
-        let mut sealed = seal(&key, 1, &sample()).unwrap();
+        let mut sealed = seal(&key, session(), 1, &sample()).unwrap();
         let last = sealed.len() - 1;
         sealed[last] ^= 0x01;
-        assert!(open(&key, &sealed).is_err());
+        assert!(open(&key, session(), &sealed).is_err());
     }
 
     #[test]
     fn rejects_tampered_sequence_number() {
         let key = SharedKey::generate();
-        let mut sealed = seal(&key, 1, &sample()).unwrap();
+        let mut sealed = seal(&key, session(), 1, &sample()).unwrap();
         sealed[0] ^= 0xFF; // seq is authenticated, so this must fail the tag
-        assert!(open(&key, &sealed).is_err());
+        assert!(open(&key, session(), &sealed).is_err());
     }
 
     #[test]
     fn rejects_short_frame() {
         let key = SharedKey::generate();
-        assert!(open(&key, &[]).is_err());
-        assert!(open(&key, &[0u8; 8]).is_err());
-        assert!(open(&key, &[0u8; MIN_FRAME - 1]).is_err());
+        assert!(open(&key, session(), &[]).is_err());
+        assert!(open(&key, session(), &[0u8; 8]).is_err());
+        assert!(open(&key, session(), &[0u8; MIN_FRAME - 1]).is_err());
     }
 
     #[test]
     fn nonces_differ_between_messages() {
         let key = SharedKey::generate();
-        let a = seal(&key, 1, &sample()).unwrap();
-        let b = seal(&key, 1, &sample()).unwrap();
+        let a = seal(&key, session(), 1, &sample()).unwrap();
+        let b = seal(&key, session(), 1, &sample()).unwrap();
         // Compare the nonce field itself (bytes 8..32), not the whole
         // frame: comparing whole frames would still pass on a fixed-nonce
         // implementation that varied some other byte.
@@ -172,12 +221,27 @@ mod tests {
     fn ciphertext_does_not_contain_the_plaintext() {
         let key = SharedKey::generate();
         let plaintext = encode(&sample()).expect("encode");
-        let sealed = seal(&key, 1, &sample()).unwrap();
+        let sealed = seal(&key, session(), 1, &sample()).unwrap();
         assert!(
             !sealed
                 .windows(plaintext.len())
                 .any(|window| window == plaintext.as_slice()),
             "the encoded plaintext must not appear verbatim in the sealed frame"
         );
+    }
+
+    #[test]
+    fn rejects_a_frame_sealed_under_a_different_session() {
+        // A frame recorded on one session (for example a captured typing
+        // session replayed by an attacker who has become the client's
+        // server, via rogue mDNS or ARP spoofing) must not authenticate
+        // under a different session, even with the correct shared key and
+        // a fresh replay window.
+        let key = SharedKey::generate();
+        let sealed = seal(&key, SessionId([1u8; 32]), 1, &sample()).unwrap();
+        assert!(matches!(
+            open(&key, SessionId([2u8; 32]), &sealed),
+            Err(CryptoError::Authentication)
+        ));
     }
 }
