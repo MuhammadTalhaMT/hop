@@ -1,28 +1,11 @@
-name: CI
+name: Release
 
 on:
   push:
-  pull_request:
+    tags:
+      - v*
 
 jobs:
-  test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - name: Format check
-        run: cargo fmt --all -- --check
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Test
-        run: cargo test --workspace
-
   build-windows:
     runs-on: windows-latest
     steps:
@@ -48,3 +31,25 @@ jobs:
         with:
           name: hop-macos
           path: target/release/hop
+
+  create-release:
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: hop-windows
+          path: ./artifacts/windows
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: hop-macos
+          path: ./artifacts/macos
+      - name: Create release and upload files
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            ./artifacts/windows/hop.exe \
+            ./artifacts/macos/hop
