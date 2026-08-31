@@ -11,22 +11,25 @@ const MIN_FRAME: usize = SEQ_LEN + NONCE_LEN + TAG_LEN;
 /// authenticated data so a frame sealed under one session cannot
 /// authenticate under another.
 ///
-/// Until Plan B implements the handshake, both peers use [`SessionId::ZERO`]
-/// for every connection, which means this binding is not yet doing any
-/// work in a running system: a frame recorded on one `ZERO` session still
-/// authenticates on the next `ZERO` session, because they are the same
-/// session as far as the AAD is concerned. The protection this type exists
-/// to provide only becomes real once Plan B's handshake derives a fresh,
-/// per-session `SessionId` from both peers' exchanged nonces (see
-/// `Message::Handshake`'s `nonce` field), and does so before any input
-/// message is processed.
+/// `hop_core::handshake` derives a fresh, per-session `SessionId` from both
+/// peers' exchanged nonces (see `Message::Handshake`'s `nonce` field)
+/// before any input message is processed, which is what makes this
+/// binding real: a frame recorded on one session cannot be replayed into
+/// a later one, since the later session's `SessionId` differs and the
+/// AEAD tag will not authenticate under it.
+///
+/// [`SessionId::ZERO`] is not a real session. It is used only for the
+/// brief window in which the handshake itself runs, before either peer
+/// has anything to derive a real session from; see `hop_core::handshake`'s
+/// module doc comment for why that is safe. It must never be used for
+/// anything other than exchanging the two `Handshake` messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionId(pub [u8; 32]);
 
 impl SessionId {
-    /// The placeholder session used until the handshake exists. Every
-    /// connection currently uses this same value, so it provides no
-    /// per-session separation; see the type's doc comment.
+    /// The placeholder session used only while the handshake itself is in
+    /// flight, before a real session has been derived. See the type's doc
+    /// comment.
     pub const ZERO: SessionId = SessionId([0u8; 32]);
 }
 

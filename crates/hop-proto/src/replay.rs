@@ -15,10 +15,11 @@ const WINDOW: u64 = 64;
 /// a later one, a fresh window accepts sequence numbers starting from
 /// scratch. That gap is what [`crate::SessionId`] closes: binding a frame
 /// to the session it was sealed under means a later session's fresh
-/// window never even sees a valid tag to accept. Until Plan B's handshake
-/// exists, every session uses [`crate::SessionId::ZERO`], so in a running
-/// system this window's per-connection reset is, for now, the only replay
-/// protection actually in effect.
+/// window never even sees a valid tag to accept. `hop_core::handshake`
+/// derives a fresh `SessionId` for every connection before any input
+/// message is processed, so both protections are in effect together in a
+/// running system: the per-connection reset here, and the per-session
+/// binding in the AAD.
 #[derive(Debug, Default)]
 pub struct ReplayWindow {
     highest: u64,

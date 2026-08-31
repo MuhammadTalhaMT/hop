@@ -9,6 +9,8 @@ hop-proto = { path = "../hop-proto" }
 thiserror.workspace = true
 tracing.workspace = true
 tokio.workspace = true
+sha2.workspace = true
+getrandom.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1.53.1", features = ["full"] }

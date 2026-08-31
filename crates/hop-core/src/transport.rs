@@ -99,6 +99,28 @@ pub fn split<S: AsyncRead + AsyncWrite>(
     )
 }
 
+impl<R> TransportReader<R> {
+    /// Reclaim the underlying stream half, discarding this reader's key,
+    /// session, and replay window.
+    ///
+    /// Exists so a caller can run the handshake (see
+    /// `crate::handshake`) over a transport split with `SessionId::ZERO`,
+    /// then reassemble the raw stream (for example with
+    /// `tokio::io::ReadHalf::unsplit`) and call `split` again with the
+    /// session the handshake derived, before any input message flows.
+    pub fn into_inner(self) -> R {
+        self.stream
+    }
+}
+
+impl<W> TransportWriter<W> {
+    /// Reclaim the underlying stream half. See
+    /// [`TransportReader::into_inner`].
+    pub fn into_inner(self) -> W {
+        self.stream
+    }
+}
+
 impl<W: AsyncWrite + Unpin> TransportWriter<W> {
     /// Note for callers: after any `Err(TransportError::Io(_))` here, a
     /// partial frame may already be sitting on the wire (the length prefix
