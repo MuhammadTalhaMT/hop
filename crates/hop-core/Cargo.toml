@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 hop-proto = { path = "../hop-proto" }
-serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio.workspace = true
