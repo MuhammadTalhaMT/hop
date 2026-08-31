@@ -9,8 +9,16 @@ sleep, and network loss is the point of the project, not a nice to have.
 - `cargo test --workspace` must pass before any commit.
 - `cargo clippy --workspace --all-targets -- -D warnings` must be silent.
 - `cargo fmt --all -- --check` must be silent.
-- No `unsafe` in `hop-proto` or `hop-core`; both crates forbid it with
-  `#![forbid(unsafe_code)]`.
+- No `unsafe` in `hop-proto`, `hop-core`, or `hop`; all three crates
+  forbid it with `#![forbid(unsafe_code)]`.
+- `hop-platform` is the only crate in the workspace permitted `unsafe`.
+  It exists specifically to hold the FFI calls into macOS and Windows
+  that the other three crates are forbidden from making. Every `unsafe`
+  block there must carry a comment that is actually true, explaining
+  the specific invariant that makes it sound (for example, why a
+  pointer is valid, or why a call cannot be made from the wrong
+  thread). A justification that restates what the code does, rather
+  than why it is safe, does not satisfy this rule.
 - No panics on any input or network path. Return `Result`. `unwrap` is for
   tests only.
 
