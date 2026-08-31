@@ -129,3 +129,65 @@ where
 {
     transport.send(&Message::ReleaseAllKeys).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hop_proto::{Button, Usage};
+
+    /// `message_to_event` is public API that the platform layer calls, so it
+    /// is tested directly rather than only through `pump_client`, which
+    /// handles some variants itself and would leave the rest uncovered.
+    #[test]
+    fn every_input_variant_maps_to_its_own_event() {
+        assert_eq!(
+            message_to_event(&Message::MouseMove { dx: 3, dy: -4 }),
+            Some(InputEvent::Mouse { dx: 3, dy: -4 })
+        );
+        assert_eq!(
+            message_to_event(&Message::Scroll { dx: 1, dy: -2 }),
+            Some(InputEvent::Scroll { dx: 1, dy: -2 })
+        );
+        assert_eq!(
+            message_to_event(&Message::MouseButton {
+                button: Button::Right,
+                pressed: true
+            }),
+            Some(InputEvent::Button {
+                button: Button::Right,
+                pressed: true
+            })
+        );
+        assert_eq!(
+            message_to_event(&Message::Key {
+                usage: Usage::C,
+                pressed: false
+            }),
+            Some(InputEvent::Key {
+                usage: Usage::C,
+                pressed: false
+            })
+        );
+    }
+
+    #[test]
+    fn control_messages_produce_no_event() {
+        for message in [
+            Message::Heartbeat,
+            Message::Release,
+            Message::ReleaseAllKeys,
+            Message::Unknown,
+        ] {
+            assert_eq!(message_to_event(&message), None, "{message:?}");
+        }
+    }
+
+    #[test]
+    fn edge_crossed_is_local_only_and_never_sent() {
+        // The edge crossing tells the local machine to hand over control.
+        // It is not something the peer needs, so it must not become a
+        // message.
+        let remap = RemapTable::new();
+        assert!(event_to_message(&remap, InputEvent::EdgeCrossed).is_none());
+    }
+}
