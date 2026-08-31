@@ -66,6 +66,28 @@ fn digit(name: &str) -> Option<Usage> {
     }
 }
 
+/// Parse a hotkey combination such as `"LeftCtrl+LeftAlt+Escape"` into the
+/// set of keys that must all be held for it to fire.
+///
+/// Each `+`-separated piece is looked up with [`lookup`]. On the first
+/// unrecognized piece, that exact piece is returned as `Err` rather than
+/// being silently dropped, so a caller can name it in a startup error: the
+/// panic hotkey is the escape hatch back to the local machine, and a typo
+/// in it must fail loudly at load time, not the moment it is needed.
+pub fn parse_combo(raw: &str) -> Result<Vec<Usage>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(String::new());
+    }
+    trimmed
+        .split('+')
+        .map(|piece| {
+            let piece = piece.trim();
+            lookup(piece).ok_or_else(|| piece.to_string())
+        })
+        .collect()
+}
+
 fn arrow(name: &str) -> Option<Usage> {
     Some(match name {
         "Up" => Usage(0x52),
@@ -143,5 +165,40 @@ mod tests {
     fn unknown_names_return_none() {
         assert_eq!(lookup("NotAKey"), None);
         assert_eq!(lookup(""), None);
+    }
+
+    #[test]
+    fn parses_a_three_key_combo() {
+        assert_eq!(
+            parse_combo("LeftCtrl+LeftAlt+Escape"),
+            Ok(vec![Usage::LEFT_CTRL, Usage::LEFT_ALT, Usage::ESCAPE])
+        );
+    }
+
+    #[test]
+    fn parses_a_single_key_combo() {
+        assert_eq!(parse_combo("Escape"), Ok(vec![Usage::ESCAPE]));
+    }
+
+    #[test]
+    fn trims_whitespace_around_pieces() {
+        assert_eq!(
+            parse_combo(" LeftCtrl + LeftAlt + Escape "),
+            Ok(vec![Usage::LEFT_CTRL, Usage::LEFT_ALT, Usage::ESCAPE])
+        );
+    }
+
+    #[test]
+    fn names_the_first_unrecognized_piece() {
+        assert_eq!(
+            parse_combo("LeftCtrl+NotAKey+Escape"),
+            Err("NotAKey".to_string())
+        );
+    }
+
+    #[test]
+    fn empty_string_is_an_error() {
+        assert!(parse_combo("").is_err());
+        assert!(parse_combo("   ").is_err());
     }
 }
