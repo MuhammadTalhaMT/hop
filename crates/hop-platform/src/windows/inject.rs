@@ -225,9 +225,50 @@ pub struct WindowsInjector {
 
 impl WindowsInjector {
     pub fn new(return_edge: Option<ReturnEdge>) -> Self {
-        Self {
+        let injector = Self {
             return_edge,
             suppress_release_until: None,
+        };
+        injector.release_all_modifiers();
+        injector
+    }
+
+    /// Send a key-up for every modifier, unconditionally.
+    ///
+    /// This exists because hop cannot always clean up after itself. If the
+    /// client process dies while a modifier is held down (a crash, a kill,
+    /// or the user restarting it to pick up a new build), the key-down has
+    /// already been delivered to Windows and no key-up ever follows, so
+    /// the modifier stays down system wide. Nothing in the running process
+    /// can fix that after the fact, because the process is gone.
+    ///
+    /// Doing this on startup makes the next run repair it: whatever was
+    /// left stuck is released before any input is injected. Releasing a
+    /// modifier that is not held is a harmless no-op, so this costs
+    /// nothing in the normal case.
+    ///
+    /// A stuck modifier on the far machine is the worst outcome this tool
+    /// can produce (see `CLAUDE.md`), so it is worth being unconditional
+    /// about.
+    pub fn release_all_modifiers(&self) {
+        for usage in [
+            Usage::LEFT_CTRL,
+            Usage::LEFT_SHIFT,
+            Usage::LEFT_ALT,
+            Usage::LEFT_GUI,
+            Usage::RIGHT_CTRL,
+            Usage::RIGHT_SHIFT,
+            Usage::RIGHT_ALT,
+            Usage::RIGHT_GUI,
+        ] {
+            if let Some(input) = key_input(usage, false) {
+                // SAFETY: same contract as every other SendInput call in
+                // this file; a one element array of a fully initialised
+                // INPUT, with cbSize matching the type.
+                unsafe {
+                    SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
+                }
+            }
         }
     }
 }

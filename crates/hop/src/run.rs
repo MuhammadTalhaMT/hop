@@ -312,7 +312,22 @@ async fn run_client(config: Config, key: SharedKey) -> Result<(), RunError> {
         "starting hop client; reconnecting forever on any link loss"
     );
     let mut clipboard = hop_platform::windows::clipboard::WindowsClipboard;
-    supervisor.run(&mut injector, &mut clipboard).await
+
+    // Race the supervisor against Ctrl-C so a deliberate stop releases
+    // whatever is held rather than leaving a modifier down on this
+    // machine with no key-up ever sent. `run` never returns, so the
+    // select resolves only on the signal.
+    tokio::select! {
+        _ = supervisor.run(&mut injector, &mut clipboard) => unreachable!("run never returns"),
+        result = tokio::signal::ctrl_c() => {
+            match result {
+                Ok(()) => tracing::info!("interrupted; releasing any held keys before exiting"),
+                Err(error) => tracing::warn!(%error, "could not listen for Ctrl-C"),
+            }
+            injector.release_all_modifiers();
+            Ok(())
+        }
+    }
 }
 
 /// Wraps a capturer, passing every event through unchanged, while watching
