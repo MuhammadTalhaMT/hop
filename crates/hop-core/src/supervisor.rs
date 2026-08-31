@@ -199,6 +199,14 @@ impl ClientSupervisor {
             tracing::info!(addr = %self.addr, "connecting");
             match TcpStream::connect(&self.addr).await {
                 Ok(stream) => {
+                    // Same reasoning as the server side (see run.rs): Nagle
+                    // buffering is the pathological worst case for a
+                    // continuous stream of small mouse-motion packets, and
+                    // a working-but-laggy link beats no link, so a failure
+                    // to set this is logged rather than fatal.
+                    if let Err(error) = stream.set_nodelay(true) {
+                        tracing::debug!(%error, "failed to set TCP_NODELAY on the connected socket");
+                    }
                     self.run_connection(stream, injector, &mut held, &mut policy)
                         .await;
                 }

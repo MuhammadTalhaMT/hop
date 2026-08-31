@@ -422,6 +422,16 @@ async fn run_server(
         };
         tracing::info!(%peer_addr, "accepted a connection");
 
+        // Nagle's algorithm buffers small outbound writes waiting for the
+        // previous one's ACK, which is the pathological worst case for a
+        // continuous stream of small mouse-motion packets: each can sit in
+        // the kernel for tens of milliseconds. A working-but-laggy link
+        // beats no link at all, so a failure here is logged and the
+        // connection proceeds rather than being torn down over it.
+        if let Err(error) = stream.set_nodelay(true) {
+            tracing::debug!(%error, "failed to set TCP_NODELAY on the accepted socket");
+        }
+
         handle_client(stream, &key, &config.peers, &mut capturer, &panic_combo).await;
 
         tracing::info!("client disconnected; returning to listening");
