@@ -33,8 +33,45 @@ pub fn message_to_event(message: &Message) -> Option<InputEvent> {
     }
 }
 
+/// Coalesces consecutive `InputEvent::Mouse` events in `events` by summing
+/// their deltas into one event; every other event, and the position of
+/// every run of merged moves relative to it, is left exactly where it
+/// was. A batch of many small motion samples drained together becomes one
+/// event on the wire instead of many, with the cursor landing in exactly
+/// the same place, at the cost of fewer, larger frames rather than many
+/// tiny ones.
+///
+/// Never merges across a `Button` or `Key` event (or anything else that
+/// is not `Mouse`): ordering matters there, since a click must land at
+/// the position it was made, not wherever the motion queued behind it
+/// eventually settles. `InputEvent` is `Copy`, so this only ever needs to
+/// read `events`, never fight the borrow checker over it.
+pub fn coalesce_motion(events: Vec<InputEvent>) -> Vec<InputEvent> {
+    let mut out: Vec<InputEvent> = Vec::with_capacity(events.len());
+    for event in events {
+        if let (InputEvent::Mouse { dx, dy }, Some(InputEvent::Mouse { dx: pdx, dy: pdy })) =
+            (event, out.last_mut())
+        {
+            *pdx += dx;
+            *pdy += dy;
+        } else {
+            out.push(event);
+        }
+    }
+    out
+}
+
 /// Drain the capturer, forwarding whatever the control state machine says
 /// belongs to the peer.
+///
+/// The whole queued batch is collected up front and passed through
+/// [`coalesce_motion`] before any per-event processing runs. That merge
+/// can only ever combine two `Mouse` events that had nothing between them
+/// in the raw capture order, and only `EdgeCrossed` or `Key` events can
+/// change what `control.focus()` would answer for either one, so merging
+/// them first cannot change whether either would have been forwarded:
+/// either both were going to be sent (and now go as one smaller frame) or
+/// both were going to be dropped (and the merged event is dropped too).
 pub async fn pump_server<W, C>(
     transport: &mut TransportWriter<W>,
     capturer: &mut C,
@@ -45,7 +82,12 @@ where
     W: AsyncWrite + Unpin,
     C: Capturer,
 {
+    let mut batch = Vec::new();
     while let Some(event) = capturer.poll() {
+        batch.push(event);
+    }
+
+    for event in coalesce_motion(batch) {
         match event {
             InputEvent::EdgeCrossed => {
                 control.on_edge_crossed();
@@ -193,6 +235,58 @@ mod tests {
         ] {
             assert_eq!(message_to_event(&message), None, "{message:?}");
         }
+    }
+
+    #[test]
+    fn coalesce_motion_sums_consecutive_moves() {
+        let events = vec![
+            InputEvent::Mouse { dx: 1, dy: 2 },
+            InputEvent::Mouse { dx: 3, dy: -1 },
+            InputEvent::Mouse { dx: 2, dy: 2 },
+        ];
+        assert_eq!(
+            coalesce_motion(events),
+            vec![InputEvent::Mouse { dx: 6, dy: 3 }]
+        );
+    }
+
+    #[test]
+    fn coalesce_motion_does_not_merge_across_a_button_event() {
+        // A click must land at the position it was made, so a run of
+        // motion on either side of a button press must not merge across
+        // it.
+        let events = vec![
+            InputEvent::Mouse { dx: 1, dy: 1 },
+            InputEvent::Button {
+                button: Button::Left,
+                pressed: true,
+            },
+            InputEvent::Mouse { dx: 2, dy: 2 },
+        ];
+        assert_eq!(
+            coalesce_motion(events.clone()),
+            events,
+            "motion on either side of a button event must be left exactly as it was"
+        );
+    }
+
+    #[test]
+    fn coalesce_motion_does_not_merge_across_a_key_event() {
+        let events = vec![
+            InputEvent::Mouse { dx: 1, dy: 1 },
+            InputEvent::Key {
+                usage: Usage::A,
+                pressed: true,
+            },
+            InputEvent::Mouse { dx: 2, dy: 2 },
+        ];
+        assert_eq!(coalesce_motion(events.clone()), events);
+    }
+
+    #[test]
+    fn coalesce_motion_leaves_a_single_move_unchanged() {
+        let events = vec![InputEvent::Mouse { dx: 5, dy: -5 }];
+        assert_eq!(coalesce_motion(events.clone()), events);
     }
 
     #[test]

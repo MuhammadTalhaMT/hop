@@ -26,7 +26,9 @@ pub use device::{
 };
 
 pub mod session;
-pub use session::{event_to_message, message_to_event, pump_client, pump_server, send_release_all};
+pub use session::{
+    coalesce_motion, event_to_message, message_to_event, pump_client, pump_server, send_release_all,
+};
 
 pub mod handshake;
 pub use handshake::{client_handshake, derive_session, server_handshake, HandshakeError};
