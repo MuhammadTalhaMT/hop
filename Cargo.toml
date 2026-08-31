@@ -5,7 +5,7 @@ members = ["crates/hop-proto", "crates/hop-core", "crates/hop-platform", "crates
 [workspace.package]
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/talha/hop"
+repository = "https://github.com/MuhammadTalhaMT/hop"
 
 [workspace.dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
