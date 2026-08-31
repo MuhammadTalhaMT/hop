@@ -103,6 +103,12 @@ pub enum RunError {
         #[source]
         source: std::io::Error,
     },
+
+    #[cfg(target_os = "macos")]
+    #[error(
+        "role = \"server\" requires a [layout] entry naming the edge input crosses to reach the peer (for example `top = \"pc\"` if the peer's monitor sits above this Mac); with none configured, the cursor could never hand focus over"
+    )]
+    ServerMissingLayoutEdge,
 }
 
 /// `hop keygen`: generate a fresh shared key and write it, base64 encoded,
@@ -328,6 +334,32 @@ impl<'a, C: Capturer> Capturer for HotkeyWatcher<'a, C> {
     }
 }
 
+/// The single screen edge this server watches for a crossing into the
+/// peer, taken from `[layout]` rather than assumed. `[layout]` accepts a
+/// peer id per edge, in principle allowing a future multi-peer routing
+/// where different edges send focus to different machines, but today's
+/// server drives exactly one `MacCapturer` watching exactly one edge
+/// (`MacCapturer::start` is called once, before any peer has connected),
+/// so only the first configured edge in this fixed order is honored. That
+/// matches this project's actual deployment, a single PC whose monitors
+/// sit above the Mac, configured as `top = "pc"`; there is nothing here
+/// that assumes top specifically.
+#[cfg(target_os = "macos")]
+fn configured_edge(layout: &hop::config::Layout) -> Option<hop_platform::macos::Edge> {
+    use hop_platform::macos::Edge;
+    if layout.top.is_some() {
+        Some(Edge::Top)
+    } else if layout.right.is_some() {
+        Some(Edge::Right)
+    } else if layout.bottom.is_some() {
+        Some(Edge::Bottom)
+    } else if layout.left.is_some() {
+        Some(Edge::Left)
+    } else {
+        None
+    }
+}
+
 /// Server role: capture locally, listen for a client, and forward input to
 /// whichever client is connected. A client is expected to come and go (a
 /// sleep, a lock, a network blip), so losing one returns to listening
@@ -342,10 +374,11 @@ async fn run_server(
         role: "server",
         field: "bind",
     })?;
+    let edge = configured_edge(&config.layout).ok_or(RunError::ServerMissingLayoutEdge)?;
 
-    let mut capturer = hop_platform::macos::MacCapturer::start()
+    let mut capturer = hop_platform::macos::MacCapturer::start(edge)
         .map_err(|error| RunError::Capture(error.to_string()))?;
-    tracing::info!("macOS input capture started");
+    tracing::info!(?edge, "macOS input capture started");
 
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
@@ -633,5 +666,42 @@ mod tests {
             }
             other => panic!("expected HotkeyParse, got {other:?}"),
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn configured_edge_reads_top_for_this_projects_real_deployment() {
+        // The PC's monitors sit above the Mac in the deployment this
+        // project actually ships for, so a config with only `top` set
+        // must resolve to `Edge::Top`.
+        let layout = hop::config::Layout {
+            top: Some("pc".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            configured_edge(&layout),
+            Some(hop_platform::macos::Edge::Top)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn configured_edge_is_none_with_no_layout_configured() {
+        let layout = hop::config::Layout::default();
+        assert_eq!(configured_edge(&layout), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn configured_edge_prefers_top_when_more_than_one_edge_is_set() {
+        let layout = hop::config::Layout {
+            top: Some("pc".to_string()),
+            left: Some("laptop".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            configured_edge(&layout),
+            Some(hop_platform::macos::Edge::Top)
+        );
     }
 }

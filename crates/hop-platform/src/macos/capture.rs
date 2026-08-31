@@ -12,6 +12,19 @@
 //! drains that channel without blocking, so the trait's non-blocking
 //! contract holds even though the tap itself lives on a loop that blocks
 //! forever.
+//!
+//! The same callback also owns edge detection and cursor parking. While
+//! focus is local, every mouse-motion event is checked against the
+//! configured `Edge` (see `crossed`, the pure part of that decision); on
+//! a crossing it emits `InputEvent::EdgeCrossed` and flips `remote`
+//! itself rather than waiting for the connection loop to notice, so
+//! suppression starts on the very event that crossed. While focus is
+//! remote, `CursorPark` pins the real cursor to a fixed point and keeps
+//! it hidden on every subsequent motion event, so the user only ever
+//! sees the peer's cursor move. It restores position and visibility the
+//! moment focus comes back to local, whether that happens through this
+//! callback or is only noticed by it, and again on `Drop` so a crash or
+//! early exit can never leave the pointer invisible.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,6 +42,7 @@ use core_graphics::event::{
 };
 use hop_proto::Button;
 
+use crate::macos::cursor;
 use crate::macos::keymap::virtual_key_to_usage;
 use crate::{Capturer, InputEvent};
 
@@ -61,34 +75,152 @@ pub enum CaptureError {
     ThreadExitedEarly,
 }
 
+/// One of the four edges of the screen that hands focus to the peer when
+/// the cursor reaches it. Which edge is active for a given deployment
+/// comes from `[layout]` in the user's config (see `hop::config::Layout`)
+/// and is passed into `MacCapturer::start`, never hardcoded here: this
+/// project's own reference deployment has the PC's monitors mounted above
+/// the Mac, so its config sets `top = "pc"`, but nothing in this type or
+/// `crossed` below assumes that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Edge {
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
+/// How far inside the screen, in points, a parked or restored cursor is
+/// placed away from the edge it crossed. Without this, restoring the
+/// cursor to the exact point it crossed at (which is by definition on the
+/// boundary `crossed` treats as a crossing) would trigger another
+/// crossing on the very next reported motion, bouncing focus straight
+/// back to the peer the instant it returned to local.
+const EDGE_MARGIN: f64 = 12.0;
+
+/// Whether cursor position `(x, y)`, in global display coordinates on a
+/// screen sized `screen_width` by `screen_height`, has reached `edge`.
+/// Pure and side effect free, so it is the part of edge detection that
+/// can actually be unit tested without hardware; see the `tests` module
+/// below.
+///
+/// Global display coordinates on macOS put the origin at the top-left
+/// with y increasing downward, so the top edge is `y <= 0.0` and the
+/// bottom edge is `y >= screen_height - 1.0`; left and right are the same
+/// idea on the x axis.
+fn crossed(edge: Edge, x: f64, y: f64, screen_width: f64, screen_height: f64) -> bool {
+    match edge {
+        Edge::Top => y <= 0.0,
+        Edge::Bottom => y >= screen_height - 1.0,
+        Edge::Left => x <= 0.0,
+        Edge::Right => x >= screen_width - 1.0,
+    }
+}
+
+/// Nudges a point that just crossed `edge` back inside the screen by
+/// `EDGE_MARGIN`, clamping so a screen smaller than the margin still
+/// yields an in-bounds point rather than a negative coordinate.
+fn nudge_inward(edge: Edge, x: f64, y: f64, screen_width: f64, screen_height: f64) -> (f64, f64) {
+    match edge {
+        Edge::Top => (x, EDGE_MARGIN.min(screen_height)),
+        Edge::Bottom => (x, (screen_height - 1.0 - EDGE_MARGIN).max(0.0)),
+        Edge::Left => (EDGE_MARGIN.min(screen_width), y),
+        Edge::Right => ((screen_width - 1.0 - EDGE_MARGIN).max(0.0), y),
+    }
+}
+
+/// Owns the state needed to safely hide and pin the real cursor while
+/// focus is on the peer, and to always be able to give it back.
+///
+/// Deliberately dumb: a single `Option<(f64, f64)>` remembering the point
+/// to warp back to. `Some` means "currently parked"; taking it back to
+/// `None` in `restore` is also the signal that nothing needs undoing,
+/// which is what makes `restore` safe to call unconditionally, both from
+/// the callback (on a focus-to-local transition it only notices after the
+/// fact) and from `MacCapturer`'s `Drop`.
+struct CursorPark {
+    origin: Mutex<Option<(f64, f64)>>,
+}
+
+impl CursorPark {
+    fn new() -> Self {
+        Self {
+            origin: Mutex::new(None),
+        }
+    }
+
+    /// Records `at` as the point to come back to and hides the cursor, but
+    /// only the first time this is called after a crossing: a no-op if
+    /// already parked, so it is safe to call on every remote motion event
+    /// rather than only the first.
+    fn park(&self, at: (f64, f64)) {
+        let mut origin = lock_recovering(&self.origin, "cursor_park_origin");
+        if origin.is_none() {
+            *origin = Some(at);
+            cursor::hide_cursor();
+        }
+    }
+
+    /// Warps the real cursor back to the parked point. A no-op if nothing
+    /// is currently parked.
+    fn hold(&self) {
+        let origin = lock_recovering(&self.origin, "cursor_park_origin");
+        if let Some((x, y)) = *origin {
+            cursor::warp_cursor(x, y);
+        }
+    }
+
+    /// Gives the cursor back: warps it to the parked point one last time,
+    /// makes it visible again, and clears the parked state. Safe to call
+    /// whether or not anything is actually parked, which is what lets
+    /// both the callback and `Drop` call it unconditionally rather than
+    /// tracking their own "did we already restore this" flag.
+    fn restore(&self) {
+        let mut origin = lock_recovering(&self.origin, "cursor_park_origin");
+        if let Some((x, y)) = origin.take() {
+            cursor::warp_cursor(x, y);
+            cursor::show_cursor();
+        }
+    }
+}
+
 /// Captures keyboard and mouse input system wide via a `CGEventTap`.
 ///
 /// The tap and its run loop live on a dedicated background thread; this
 /// struct only holds the receiving end of the channel that thread feeds,
-/// plus the flag that tells it whether to suppress what it sees.
+/// the flag that tells it whether to suppress what it sees, and a handle
+/// to the cursor-parking state so `Drop` can always give the cursor back.
 pub struct MacCapturer {
     events: Receiver<InputEvent>,
     remote: Arc<AtomicBool>,
+    park: Arc<CursorPark>,
 }
 
 impl MacCapturer {
     /// Starts the background capture thread and blocks until the tap is
-    /// either up and enabled, or has failed to start.
-    pub fn start() -> Result<Self, CaptureError> {
+    /// either up and enabled, or has failed to start. `edge` is the
+    /// screen edge that hands focus to the peer, taken from the caller's
+    /// `[layout]` configuration rather than assumed here.
+    pub fn start(edge: Edge) -> Result<Self, CaptureError> {
         let (event_tx, event_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
         let remote = Arc::new(AtomicBool::new(false));
         let remote_for_thread = Arc::clone(&remote);
+        let park = Arc::new(CursorPark::new());
+        let park_for_thread = Arc::clone(&park);
 
         thread::Builder::new()
             .name("hop-capture-tap".into())
-            .spawn(move || run_capture_thread(event_tx, remote_for_thread, ready_tx))
+            .spawn(move || {
+                run_capture_thread(event_tx, remote_for_thread, park_for_thread, edge, ready_tx)
+            })
             .map_err(CaptureError::ThreadSpawnFailed)?;
 
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(Self {
                 events: event_rx,
                 remote,
+                park,
             }),
             Ok(Err(err)) => Err(err),
             Err(_) => Err(CaptureError::ThreadExitedEarly),
@@ -106,6 +238,18 @@ impl MacCapturer {
 impl Capturer for MacCapturer {
     fn poll(&mut self) -> Option<InputEvent> {
         self.events.try_recv().ok()
+    }
+}
+
+impl Drop for MacCapturer {
+    fn drop(&mut self) {
+        // However this capturer is going away, normal shutdown, a
+        // connection loop ending, or an early return somewhere above it,
+        // the user must never be left with an invisible, pinned cursor:
+        // this is the last chance to give it back. `restore` is
+        // idempotent, so calling it here even when nothing is parked is
+        // harmless.
+        self.park.restore();
     }
 }
 
@@ -129,6 +273,24 @@ fn lock_recovering<'a, T>(mutex: &'a Mutex<T>, name: &'static str) -> MutexGuard
     })
 }
 
+/// Everything the tap callback needs beyond the event itself: the channel
+/// events are pushed into, shared flags, and the small pieces of mutable
+/// state a single capture thread owns. Bundled into one struct, moved
+/// whole into the callback closure, so `handle_event` takes a reasonable
+/// number of arguments instead of nine separate ones.
+struct CaptureContext {
+    event_tx: Sender<InputEvent>,
+    remote: Arc<AtomicBool>,
+    held_modifiers: Mutex<HashSet<i64>>,
+    last_seen: Arc<Mutex<Instant>>,
+    tap_port: Arc<Mutex<Option<usize>>>,
+    /// The screen edge that hands focus to the peer.
+    edge: Edge,
+    screen_width: f64,
+    screen_height: f64,
+    park: Arc<CursorPark>,
+}
+
 /// Body of the dedicated capture thread: creates the tap, wires it into a
 /// run loop on this thread, starts the watchdog, and then blocks forever
 /// pumping that run loop. Reports success or failure back through
@@ -136,9 +298,10 @@ fn lock_recovering<'a, T>(mutex: &'a Mutex<T>, name: &'static str) -> MutexGuard
 fn run_capture_thread(
     event_tx: Sender<InputEvent>,
     remote: Arc<AtomicBool>,
+    park: Arc<CursorPark>,
+    edge: Edge,
     ready_tx: Sender<Result<(), CaptureError>>,
 ) {
-    let held_modifiers: Mutex<HashSet<i64>> = Mutex::new(HashSet::new());
     let last_seen = Arc::new(Mutex::new(Instant::now()));
     let last_seen_for_callback = Arc::clone(&last_seen);
 
@@ -153,6 +316,24 @@ fn run_capture_thread(
     // value can never outlive the port it names.
     let tap_port: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
     let tap_port_for_callback = Arc::clone(&tap_port);
+
+    // Read once, up front, rather than on every event: the display's size
+    // does not change often enough to justify a syscall on every mouse
+    // move, and a resolution change mid session is an accepted limitation
+    // here (see Task 13).
+    let (screen_width, screen_height) = cursor::screen_size();
+
+    let ctx = CaptureContext {
+        event_tx,
+        remote,
+        held_modifiers: Mutex::new(HashSet::new()),
+        last_seen: last_seen_for_callback,
+        tap_port: tap_port_for_callback,
+        edge,
+        screen_width,
+        screen_height,
+        park,
+    };
 
     let events_of_interest = vec![
         CGEventType::KeyDown,
@@ -193,15 +374,7 @@ fn run_capture_thread(
             // passes through unsuppressed" rather than corrupting process
             // state or crashing macOS's event dispatch.
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                handle_event(
-                    event_type,
-                    event,
-                    &event_tx,
-                    &remote,
-                    &held_modifiers,
-                    &last_seen_for_callback,
-                    &tap_port_for_callback,
-                )
+                handle_event(event_type, event, &ctx)
             }));
             outcome.unwrap_or_else(|_| {
                 tracing::error!("event tap callback panicked; keeping the event unsuppressed");
@@ -271,18 +444,11 @@ fn teardown_tap(tap_port: &Mutex<Option<usize>>, tap: CGEventTap<'_>) {
 }
 
 /// Pure-ish core of the callback: never touches macOS APIs beyond reading
-/// fields off the event it was handed, and never panics. Kept out of the
+/// fields off the event it was handed and the cursor calls in `cursor.rs`
+/// for edge detection and parking, and never panics. Kept out of the
 /// closure so `catch_unwind` has a plain function to wrap.
-fn handle_event(
-    event_type: CGEventType,
-    event: &CGEvent,
-    event_tx: &Sender<InputEvent>,
-    remote: &AtomicBool,
-    held_modifiers: &Mutex<HashSet<i64>>,
-    last_seen: &Mutex<Instant>,
-    tap_port: &Mutex<Option<usize>>,
-) -> CallbackResult {
-    *lock_recovering(last_seen, "last_seen") = Instant::now();
+fn handle_event(event_type: CGEventType, event: &CGEvent, ctx: &CaptureContext) -> CallbackResult {
+    *lock_recovering(&ctx.last_seen, "last_seen") = Instant::now();
 
     if matches!(
         event_type,
@@ -295,14 +461,14 @@ fn handle_event(
             ?event_type,
             "macOS disabled the event tap; re-enabling immediately"
         );
-        reenable_tap(tap_port);
+        reenable_tap(&ctx.tap_port);
         return CallbackResult::Keep;
     }
 
     let translated = if matches!(event_type, CGEventType::FlagsChanged) {
         let keycode = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
         let flags = event.get_flags().bits();
-        let mut held = lock_recovering(held_modifiers, "held_modifiers");
+        let mut held = lock_recovering(&ctx.held_modifiers, "held_modifiers");
         translate_modifier(keycode, flags, &mut held)
     } else {
         let keycode = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
@@ -362,10 +528,65 @@ fn handle_event(
         // The receiver only goes away when `MacCapturer` is dropped, at
         // which point there is nothing useful to do with a send failure;
         // dropping the event on the floor is the correct response.
-        let _ = event_tx.send(input_event);
+        let _ = ctx.event_tx.send(input_event);
     }
 
-    if remote.load(Ordering::Relaxed) {
+    let is_motion_event = matches!(
+        event_type,
+        CGEventType::MouseMoved | CGEventType::LeftMouseDragged | CGEventType::RightMouseDragged
+    );
+
+    if ctx.remote.load(Ordering::Relaxed) {
+        // Focus is on the peer: the real cursor must never be seen moving
+        // or land anywhere on this display, so on every motion event it is
+        // warped straight back to wherever it was parked at the moment of
+        // crossing.
+        if is_motion_event {
+            ctx.park.hold();
+        }
+    } else {
+        // Focus is local. If a parked point is still on record here, the
+        // return to Local happened outside this callback (a disconnect, a
+        // panic hotkey, an explicit release, all handled by the
+        // connection loop that owns `Control`), and this is simply the
+        // first event this callback has seen since. Give the cursor back
+        // on this event, of whatever type, rather than waiting for a
+        // motion event that also happens to cross the edge again. Cheap
+        // and a no-op when nothing is parked, so it is safe to call
+        // unconditionally here.
+        ctx.park.restore();
+
+        if is_motion_event {
+            let location = event.location();
+            if crossed(
+                ctx.edge,
+                location.x,
+                location.y,
+                ctx.screen_width,
+                ctx.screen_height,
+            ) {
+                let landing = nudge_inward(
+                    ctx.edge,
+                    location.x,
+                    location.y,
+                    ctx.screen_width,
+                    ctx.screen_height,
+                );
+                ctx.park.park(landing);
+                // Set before the final suppression check below runs, so
+                // the very event that crossed the edge is itself already
+                // suppressed rather than leaking one more pixel of local
+                // motion past the boundary.
+                ctx.remote.store(true, Ordering::Relaxed);
+                // Not translated by `translate`, and not the receiver's
+                // problem if nobody is listening; see the comment above
+                // for `input_event`.
+                let _ = ctx.event_tx.send(InputEvent::EdgeCrossed);
+            }
+        }
+    }
+
+    if ctx.remote.load(Ordering::Relaxed) {
         CallbackResult::Drop
     } else {
         CallbackResult::Keep
@@ -819,4 +1040,156 @@ mod tests {
         assert_eq!(translate_modifier(9999, 0, &mut held), None);
         assert!(held.is_empty());
     }
+
+    // `crossed` is the pure decision behind edge detection: given where
+    // the cursor is and how big the screen is, has it reached the
+    // configured edge. Everything else this task adds (reading the real
+    // cursor, warping it, hiding it) needs hardware and is out of reach
+    // for an automated test; this is the part that actually is one.
+    const SCREEN_W: f64 = 1920.0;
+    const SCREEN_H: f64 = 1080.0;
+
+    #[test]
+    fn top_edge_triggers_exactly_at_y_zero() {
+        assert!(crossed(Edge::Top, 960.0, 0.0, SCREEN_W, SCREEN_H));
+    }
+
+    #[test]
+    fn top_edge_does_not_trigger_just_inside() {
+        assert!(!crossed(Edge::Top, 960.0, 5.0, SCREEN_W, SCREEN_H));
+    }
+
+    #[test]
+    fn bottom_edge_triggers_at_the_screen_height_boundary() {
+        assert!(crossed(
+            Edge::Bottom,
+            960.0,
+            SCREEN_H - 1.0,
+            SCREEN_W,
+            SCREEN_H
+        ));
+    }
+
+    #[test]
+    fn bottom_edge_does_not_trigger_just_inside() {
+        assert!(!crossed(
+            Edge::Bottom,
+            960.0,
+            SCREEN_H - 6.0,
+            SCREEN_W,
+            SCREEN_H
+        ));
+    }
+
+    #[test]
+    fn left_edge_triggers_exactly_at_x_zero() {
+        assert!(crossed(Edge::Left, 0.0, 540.0, SCREEN_W, SCREEN_H));
+    }
+
+    #[test]
+    fn left_edge_does_not_trigger_just_inside() {
+        assert!(!crossed(Edge::Left, 5.0, 540.0, SCREEN_W, SCREEN_H));
+    }
+
+    #[test]
+    fn right_edge_triggers_at_the_screen_width_boundary() {
+        assert!(crossed(
+            Edge::Right,
+            SCREEN_W - 1.0,
+            540.0,
+            SCREEN_W,
+            SCREEN_H
+        ));
+    }
+
+    #[test]
+    fn right_edge_does_not_trigger_just_inside() {
+        assert!(!crossed(
+            Edge::Right,
+            SCREEN_W - 6.0,
+            540.0,
+            SCREEN_W,
+            SCREEN_H
+        ));
+    }
+
+    #[test]
+    fn only_the_top_edge_triggers_at_the_top_boundary() {
+        // The deployment this project ships for: the PC's monitors sit
+        // above the Mac, so `top` is the edge that actually matters, and
+        // it must not be possible for a point on that boundary to also
+        // read as having crossed any other edge.
+        let (x, y) = (960.0, 0.0);
+        assert!(crossed(Edge::Top, x, y, SCREEN_W, SCREEN_H));
+        assert!(!crossed(Edge::Bottom, x, y, SCREEN_W, SCREEN_H));
+        assert!(!crossed(Edge::Left, x, y, SCREEN_W, SCREEN_H));
+        assert!(!crossed(Edge::Right, x, y, SCREEN_W, SCREEN_H));
+    }
+
+    #[test]
+    fn only_the_left_edge_triggers_at_the_left_boundary() {
+        let (x, y) = (0.0, 540.0);
+        assert!(crossed(Edge::Left, x, y, SCREEN_W, SCREEN_H));
+        assert!(!crossed(Edge::Top, x, y, SCREEN_W, SCREEN_H));
+        assert!(!crossed(Edge::Bottom, x, y, SCREEN_W, SCREEN_H));
+        assert!(!crossed(Edge::Right, x, y, SCREEN_W, SCREEN_H));
+    }
+
+    #[test]
+    fn only_the_right_edge_triggers_at_the_right_boundary() {
+        let (x, y) = (SCREEN_W - 1.0, 540.0);
+        assert!(crossed(Edge::Right, x, y, SCREEN_W, SCREEN_H));
+        assert!(!crossed(Edge::Top, x, y, SCREEN_W, SCREEN_H));
+        assert!(!crossed(Edge::Bottom, x, y, SCREEN_W, SCREEN_H));
+        assert!(!crossed(Edge::Left, x, y, SCREEN_W, SCREEN_H));
+    }
+
+    #[test]
+    fn only_the_bottom_edge_triggers_at_the_bottom_boundary() {
+        let (x, y) = (960.0, SCREEN_H - 1.0);
+        assert!(crossed(Edge::Bottom, x, y, SCREEN_W, SCREEN_H));
+        assert!(!crossed(Edge::Top, x, y, SCREEN_W, SCREEN_H));
+        assert!(!crossed(Edge::Left, x, y, SCREEN_W, SCREEN_H));
+        assert!(!crossed(Edge::Right, x, y, SCREEN_W, SCREEN_H));
+    }
+
+    // `nudge_inward` is what keeps a restored cursor from sitting exactly
+    // on the boundary `crossed` treats as a crossing, which would bounce
+    // focus straight back to the peer on the next reported motion. Pure,
+    // so it gets the same direct coverage as `crossed`.
+    #[test]
+    fn nudge_inward_moves_away_from_each_edge_past_its_own_boundary() {
+        let (_, y) = nudge_inward(Edge::Top, 960.0, 0.0, SCREEN_W, SCREEN_H);
+        assert!(!crossed(Edge::Top, 960.0, y, SCREEN_W, SCREEN_H));
+
+        let (_, y) = nudge_inward(Edge::Bottom, 960.0, SCREEN_H - 1.0, SCREEN_W, SCREEN_H);
+        assert!(!crossed(Edge::Bottom, 960.0, y, SCREEN_W, SCREEN_H));
+
+        let (x, _) = nudge_inward(Edge::Left, 0.0, 540.0, SCREEN_W, SCREEN_H);
+        assert!(!crossed(Edge::Left, x, 540.0, SCREEN_W, SCREEN_H));
+
+        let (x, _) = nudge_inward(Edge::Right, SCREEN_W - 1.0, 540.0, SCREEN_W, SCREEN_H);
+        assert!(!crossed(Edge::Right, x, 540.0, SCREEN_W, SCREEN_H));
+    }
+
+    #[test]
+    fn nudge_inward_clamps_on_a_screen_smaller_than_the_margin() {
+        // A screen thinner than `EDGE_MARGIN` must still yield an
+        // in-bounds, non-negative point rather than going negative.
+        let (x, _) = nudge_inward(Edge::Left, 0.0, 5.0, 3.0, 3.0);
+        assert!((0.0..=3.0).contains(&x));
+
+        let (_, y) = nudge_inward(Edge::Top, 5.0, 0.0, 3.0, 3.0);
+        assert!((0.0..=3.0).contains(&y));
+    }
+
+    // `CursorPark::park`/`hold`/`restore` are deliberately not exercised
+    // here: every path through them ends in a real `cursor::hide_cursor`,
+    // `warp_cursor`, or `show_cursor` call, and this workspace's tests run
+    // on real macOS hosts, so calling them from a unit test would actually
+    // hide and warp the developer's cursor as a side effect of `cargo
+    // test`. That is exactly the kind of hardware-dependent behavior this
+    // task's brief calls out as only verifiable by a human, in Task 13;
+    // `crossed` and `nudge_inward` above are the parts of this file that
+    // are actually pure.
 }
