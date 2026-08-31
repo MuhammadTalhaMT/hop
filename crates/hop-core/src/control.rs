@@ -51,6 +51,16 @@ impl Control {
         match self.focus {
             Focus::Local => Action::None,
             Focus::Remote => {
+                // This records the pre-remap usage as captured locally, so
+                // it is a "was anything held" signal only: it decides
+                // whether a disconnect needs to send a blanket
+                // ReleaseAllKeys at all, not which keys to name. The wire
+                // carries usages after remap.apply(), so a future per-key
+                // release built on this set would release the wrong key on
+                // the peer. The client's own HeldKeys, which records the
+                // post-remap usages it actually injects, is the
+                // authoritative per-key record. This is exactly the
+                // stuck-modifier trap this subsystem exists to avoid.
                 self.held.record(usage, pressed);
                 Action::Forward(usage, pressed)
             }
