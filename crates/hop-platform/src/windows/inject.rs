@@ -38,18 +38,29 @@ fn key_input(usage: Usage, pressed: bool) -> Option<INPUT> {
     if !pressed {
         flags |= KEYEVENTF_KEYUP;
     }
-    Some(INPUT {
+    // `INPUT_0` is a 32-byte union but the `ki` arm (`KEYBDINPUT`) is only
+    // 24 bytes; `SendInput` reads all 40 bytes of each `INPUT` regardless
+    // of which arm is logically in use. Starting from `INPUT::default()`
+    // (which `windows-sys` derives as zeroed) initializes every byte, and
+    // then writing only the `ki` field of the union (rather than
+    // constructing a whole new `INPUT_0 { ki: .. }` value and assigning
+    // that over it) touches just those 24 bytes, leaving the union's
+    // unused 8-byte tail at the zero `Default::default()` gave it instead
+    // of picking up whatever was on the stack. Windows ignores that tail
+    // for keyboard input, but it still crosses the FFI boundary in the
+    // `SendInput` call below, uninitialized or not.
+    let mut input = INPUT {
         r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 {
-            ki: KEYBDINPUT {
-                wVk: 0,
-                wScan: scancode,
-                dwFlags: flags,
-                time: 0,
-                dwExtraInfo: 0,
-            },
-        },
-    })
+        ..Default::default()
+    };
+    input.Anonymous.ki = KEYBDINPUT {
+        wVk: 0,
+        wScan: scancode,
+        dwFlags: flags,
+        time: 0,
+        dwExtraInfo: 0,
+    };
+    Some(input)
 }
 
 /// Builds a `MOUSEINPUT`-flavored `INPUT` with the given relative deltas,
