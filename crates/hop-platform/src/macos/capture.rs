@@ -16,7 +16,7 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -32,23 +32,20 @@ use hop_proto::Button;
 use crate::macos::keymap::virtual_key_to_usage;
 use crate::{Capturer, InputEvent};
 
-// `CGEventTapEnable` is declared here rather than used from `core-graphics`
-// because the crate only exposes it through `CGEventTap::enable`, which
-// requires an owned `CGEventTap`. We need to call it from the tap callback
-// and from a watchdog thread, neither of which owns the tap, so we bind the
-// same C function directly, exactly as the spike did.
+// `CGEventTapEnable`/`CGEventTapIsEnabled` are declared here rather than
+// used from `core-graphics` because the crate only exposes enabling
+// through `CGEventTap::enable`, which requires an owned `CGEventTap`, and
+// does not expose a query for the enabled state at all. We need to call
+// both from the tap callback and from a watchdog thread, neither of which
+// owns the tap, so we bind the same C functions directly, exactly as the
+// spike did for `CGEventTapEnable`.
 unsafe extern "C" {
     fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
+    fn CGEventTapIsEnabled(tap: CFMachPortRef) -> u8;
 }
 
-/// The event tap's mach port, stashed as a plain integer so it can be read
-/// from the callback and the watchdog thread without borrowing the
-/// `CGEventTap` itself. Raw pointers are not `Send`/`Sync`; a `usize` is,
-/// and the value is only ever reinterpreted as the pointer it came from.
-static TAP_PORT: OnceLock<usize> = OnceLock::new();
-
-/// How long the watchdog waits without seeing any event before it assumes
-/// the tap went deaf without telling anyone and re-arms it anyway.
+/// How long the watchdog waits without seeing any event before it checks
+/// whether the tap went deaf without telling anyone.
 const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(5);
 const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -112,6 +109,26 @@ impl Capturer for MacCapturer {
     }
 }
 
+/// Locks `mutex`, recovering its contents instead of propagating the
+/// poison if a panic caught elsewhere (the tap callback's `catch_unwind`)
+/// left it poisoned. Every mutex in this file guards data with no
+/// invariant a mid-panic write could break: a `HashSet` of held keycodes,
+/// an `Instant`, or an `Option<usize>` port handle. Taking the
+/// possibly-mid-mutation value is safe, and doing so is what keeps a
+/// single caught panic from silently disabling this subsystem forever.
+/// Also clears the poison flag, so this only warns once per panic rather
+/// than on every lock for the rest of the process's life.
+fn lock_recovering<'a, T>(mutex: &'a Mutex<T>, name: &'static str) -> MutexGuard<'a, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        tracing::warn!(
+            mutex = name,
+            "mutex was poisoned by an earlier panic; recovering its contents"
+        );
+        mutex.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
 /// Body of the dedicated capture thread: creates the tap, wires it into a
 /// run loop on this thread, starts the watchdog, and then blocks forever
 /// pumping that run loop. Reports success or failure back through
@@ -125,6 +142,18 @@ fn run_capture_thread(
     let last_seen = Arc::new(Mutex::new(Instant::now()));
     let last_seen_for_callback = Arc::clone(&last_seen);
 
+    // The tap's mach port, stashed as a plain integer so it can be read
+    // from the callback and the watchdog thread without borrowing the
+    // `CGEventTap` itself (raw pointers are not `Send`/`Sync`; a `usize`
+    // is, and the value is only ever reinterpreted as the pointer it came
+    // from). Owned here, per capture thread, rather than as a process
+    // global: a second `MacCapturer::start()` gets its own port instead of
+    // silently sharing the first one's, and it is cleared back to `None`
+    // in the same lock that drops the `CGEventTap` below, so a stale
+    // value can never outlive the port it names.
+    let tap_port: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
+    let tap_port_for_callback = Arc::clone(&tap_port);
+
     let events_of_interest = vec![
         CGEventType::KeyDown,
         CGEventType::KeyUp,
@@ -132,11 +161,23 @@ fn run_capture_thread(
         CGEventType::MouseMoved,
         CGEventType::LeftMouseDown,
         CGEventType::LeftMouseUp,
+        CGEventType::LeftMouseDragged,
         CGEventType::RightMouseDown,
         CGEventType::RightMouseUp,
+        CGEventType::RightMouseDragged,
+        CGEventType::OtherMouseDown,
+        CGEventType::OtherMouseUp,
         CGEventType::ScrollWheel,
-        CGEventType::TapDisabledByTimeout,
-        CGEventType::TapDisabledByUserInput,
+        // `TapDisabledByTimeout` and `TapDisabledByUserInput` are
+        // deliberately NOT listed here, and must never be added back.
+        // `CGEventTap::new` folds this list into a mask with
+        // `1 << (event_type as u64)`, and those two variants'
+        // discriminants are `0xFFFFFFFE` and `0xFFFFFFFF`; shifting by
+        // either overflows a `u64` and panics in any build with overflow
+        // checks on (the dev profile default), inside `core-graphics`,
+        // before the tap is even created. No mask bit is needed for them
+        // anyway: macOS delivers both to the callback regardless of the
+        // mask, which `handle_event` below already handles.
     ];
 
     let tap = CGEventTap::new(
@@ -159,6 +200,7 @@ fn run_capture_thread(
                     &remote,
                     &held_modifiers,
                     &last_seen_for_callback,
+                    &tap_port_for_callback,
                 )
             }));
             outcome.unwrap_or_else(|_| {
@@ -178,11 +220,12 @@ fn run_capture_thread(
 
     // Stash the port before enabling anything, so the callback and the
     // watchdog can always find it once they might need it.
-    let _ = TAP_PORT.set(tap.mach_port().as_concrete_TypeRef() as usize);
+    *lock_recovering(&tap_port, "tap_port") = Some(tap.mach_port().as_concrete_TypeRef() as usize);
 
     let loop_source = match tap.mach_port().create_runloop_source(0) {
         Ok(source) => source,
         Err(()) => {
+            teardown_tap(&tap_port, tap);
             let _ = ready_tx.send(Err(CaptureError::RunLoopSourceUnavailable));
             return;
         }
@@ -195,13 +238,36 @@ fn run_capture_thread(
     CFRunLoop::get_current().add_source(&loop_source, unsafe { kCFRunLoopCommonModes });
     tap.enable();
 
-    spawn_watchdog(last_seen);
+    spawn_watchdog(last_seen, Arc::clone(&tap_port));
 
     // The tap is live; `start` can stop waiting.
     let _ = ready_tx.send(Ok(()));
 
     // Blocks forever, pumping the run loop that drives the tap callback.
     CFRunLoop::run_current();
+
+    // The run loop is not expected to return in normal operation, but if
+    // it ever does, `tap` (owned on this stack) is about to go out of
+    // scope. Tear it down through the same path every other early return
+    // above uses, so the port is never left pointing at a tap that no
+    // longer exists.
+    teardown_tap(&tap_port, tap);
+}
+
+/// Clears the shared port and drops `tap`, both inside the one critical
+/// section `reenable_tap` and `tap_is_enabled` also lock for their entire
+/// call. That shared section is what makes tearing down the tap here safe
+/// with respect to those two functions: either a call to one of them
+/// completes entirely before this runs (and so used a still-live port), or
+/// it starts entirely after (and so reads the `None` this leaves behind).
+/// Neither can ever observe a port whose tap this call is invalidating.
+fn teardown_tap(tap_port: &Mutex<Option<usize>>, tap: CGEventTap<'_>) {
+    let mut guard = lock_recovering(tap_port, "tap_port");
+    *guard = None;
+    // `CGEventTap`'s `Drop` calls `CFMachPortInvalidate` and releases the
+    // port; dropping it while still holding `guard` is the whole point of
+    // this function.
+    drop(tap);
 }
 
 /// Pure-ish core of the callback: never touches macOS APIs beyond reading
@@ -214,10 +280,9 @@ fn handle_event(
     remote: &AtomicBool,
     held_modifiers: &Mutex<HashSet<i64>>,
     last_seen: &Mutex<Instant>,
+    tap_port: &Mutex<Option<usize>>,
 ) -> CallbackResult {
-    if let Ok(mut guard) = last_seen.lock() {
-        *guard = Instant::now();
-    }
+    *lock_recovering(last_seen, "last_seen") = Instant::now();
 
     if matches!(
         event_type,
@@ -230,30 +295,67 @@ fn handle_event(
             ?event_type,
             "macOS disabled the event tap; re-enabling immediately"
         );
-        reenable_tap();
+        reenable_tap(tap_port);
         return CallbackResult::Keep;
     }
 
     let translated = if matches!(event_type, CGEventType::FlagsChanged) {
         let keycode = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
-        match held_modifiers.lock() {
-            Ok(mut held) => translate_modifier(keycode, &mut held),
-            Err(_) => None,
-        }
+        let flags = event.get_flags().bits();
+        let mut held = lock_recovering(held_modifiers, "held_modifiers");
+        translate_modifier(keycode, flags, &mut held)
     } else {
         let keycode = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
         let (dx, dy) = match event_type {
-            CGEventType::MouseMoved => (
+            CGEventType::MouseMoved
+            | CGEventType::LeftMouseDragged
+            | CGEventType::RightMouseDragged => (
                 event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_X) as i32,
                 event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y) as i32,
             ),
-            CGEventType::ScrollWheel => (
-                event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2) as i32,
-                event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1) as i32,
-            ),
+            CGEventType::ScrollWheel => {
+                let continuous = event
+                    .get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_IS_CONTINUOUS)
+                    != 0;
+                if continuous {
+                    // Trackpads and Magic Mice (the primary input device
+                    // on an Apple Silicon laptop) report continuous,
+                    // pixel-based scrolling. The line-granularity fields
+                    // used below read 0 until a full line accumulates,
+                    // which on these devices may never happen, so a
+                    // continuous event has to read the point-delta fields
+                    // instead. Point deltas are a different scale than
+                    // line deltas, so the peer's injector may eventually
+                    // need its own sensitivity for this axis; unconfirmed
+                    // against real trackpad hardware, see Task 13.
+                    (
+                        event.get_integer_value_field(
+                            EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2,
+                        ) as i32,
+                        event.get_integer_value_field(
+                            EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1,
+                        ) as i32,
+                    )
+                } else {
+                    (
+                        event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2)
+                            as i32,
+                        event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1)
+                            as i32,
+                    )
+                }
+            }
             _ => (0, 0),
         };
-        translate(event_type, keycode, dx, dy)
+        let button_number = if matches!(
+            event_type,
+            CGEventType::OtherMouseDown | CGEventType::OtherMouseUp
+        ) {
+            event.get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER)
+        } else {
+            0
+        };
+        translate(event_type, keycode, dx, dy, button_number)
     };
 
     if let Some(input_event) = translated {
@@ -274,11 +376,18 @@ fn handle_event(
 /// Pure function: no macOS calls, no I/O, so it is the part of this file
 /// that can actually be unit tested without hardware.
 ///
-/// `keycode` is read for key events, `dx`/`dy` for mouse move and scroll
+/// `keycode` is read for key events, `dx`/`dy` for mouse move, drag and
+/// scroll events, `button_number` for the third-and-up mouse button
 /// events; irrelevant fields are ignored by the arms that do not need
-/// them. An unmapped keycode yields `None` rather than a guess, matching
-/// `virtual_key_to_usage`.
-fn translate(event_type: CGEventType, keycode: i64, dx: i32, dy: i32) -> Option<InputEvent> {
+/// them. An unmapped keycode or button number yields `None` rather than a
+/// guess, matching `virtual_key_to_usage`.
+fn translate(
+    event_type: CGEventType,
+    keycode: i64,
+    dx: i32,
+    dy: i32,
+    button_number: i64,
+) -> Option<InputEvent> {
     match event_type {
         CGEventType::KeyDown => virtual_key_to_usage(keycode).map(|usage| InputEvent::Key {
             usage,
@@ -288,7 +397,13 @@ fn translate(event_type: CGEventType, keycode: i64, dx: i32, dy: i32) -> Option<
             usage,
             pressed: false,
         }),
-        CGEventType::MouseMoved => Some(InputEvent::Mouse { dx, dy }),
+        // `LeftMouseDragged`/`RightMouseDragged` are what macOS sends for
+        // motion while a button is held; `MouseMoved` only fires while no
+        // button is down. Treating them as anything other than motion
+        // loses every drag: drag-select, drag-and-drop, window dragging.
+        CGEventType::MouseMoved
+        | CGEventType::LeftMouseDragged
+        | CGEventType::RightMouseDragged => Some(InputEvent::Mouse { dx, dy }),
         CGEventType::LeftMouseDown => Some(InputEvent::Button {
             button: Button::Left,
             pressed: true,
@@ -305,7 +420,64 @@ fn translate(event_type: CGEventType, keycode: i64, dx: i32, dy: i32) -> Option<
             button: Button::Right,
             pressed: false,
         }),
+        CGEventType::OtherMouseDown => {
+            other_mouse_button(button_number).map(|button| InputEvent::Button {
+                button,
+                pressed: true,
+            })
+        }
+        CGEventType::OtherMouseUp => {
+            other_mouse_button(button_number).map(|button| InputEvent::Button {
+                button,
+                pressed: false,
+            })
+        }
         CGEventType::ScrollWheel => Some(InputEvent::Scroll { dx, dy }),
+        _ => None,
+    }
+}
+
+/// Maps a `MOUSE_EVENT_BUTTON_NUMBER` value from an `OtherMouseDown` or
+/// `OtherMouseUp` event to a protocol button. Only button 2 (0-indexed;
+/// the middle button) has a home in the wire protocol; anything past it
+/// (a mouse's 4th or 5th button) is ignored rather than guessed at.
+fn other_mouse_button(button_number: i64) -> Option<Button> {
+    match button_number {
+        2 => Some(Button::Middle),
+        _ => None,
+    }
+}
+
+/// Device-dependent flag bits from IOLLEvent.h (`NX_DEVICE*KEYMASK`) that
+/// distinguish left and right modifier keys, which otherwise share one
+/// device-independent bit in `CGEventFlags`. This crate's `CGEventFlags`
+/// does not name them, but `CGEventGetFlags` still returns them in the raw
+/// `u64` it hands back, so they are read directly by bit value here.
+mod device_flag {
+    pub const LEFT_CONTROL: u64 = 0x0001;
+    pub const LEFT_SHIFT: u64 = 0x0002;
+    pub const RIGHT_SHIFT: u64 = 0x0004;
+    pub const LEFT_COMMAND: u64 = 0x0008;
+    pub const RIGHT_COMMAND: u64 = 0x0010;
+    pub const LEFT_OPTION: u64 = 0x0020;
+    pub const RIGHT_OPTION: u64 = 0x0040;
+    pub const RIGHT_CONTROL: u64 = 0x2000;
+}
+
+/// Maps a macOS virtual keycode for a modifier key to the device-dependent
+/// flag bit that reports whether that specific key, as opposed to its
+/// same-side sibling, is currently held. `None` for modifiers with no
+/// left/right distinction to make, which today is only caps lock.
+fn device_bit_for_keycode(keycode: i64) -> Option<u64> {
+    match keycode {
+        59 => Some(device_flag::LEFT_CONTROL),
+        62 => Some(device_flag::RIGHT_CONTROL),
+        56 => Some(device_flag::LEFT_SHIFT),
+        60 => Some(device_flag::RIGHT_SHIFT),
+        55 => Some(device_flag::LEFT_COMMAND),
+        54 => Some(device_flag::RIGHT_COMMAND),
+        58 => Some(device_flag::LEFT_OPTION),
+        61 => Some(device_flag::RIGHT_OPTION),
         _ => None,
     }
 }
@@ -314,60 +486,108 @@ fn translate(event_type: CGEventType, keycode: i64, dx: i32, dy: i32) -> Option<
 /// shift, control, option, command and caps lock) into a key press or
 /// release.
 ///
-/// `FlagsChanged` does not say which direction the change was; macOS only
-/// hands back the keycode that changed and the resulting flag bitmask,
-/// and left/right variants of the same modifier share a bit, so the
-/// bitmask cannot be used to recover direction reliably. Tracking which
-/// modifier keycodes are currently considered held and toggling on each
-/// event is unambiguous instead, since a physical key produces exactly
-/// one `FlagsChanged` event per press and one per release.
-fn translate_modifier(keycode: i64, held: &mut HashSet<i64>) -> Option<InputEvent> {
+/// `flags` is the raw bit pattern from the event's `CGEventGetFlags()` at
+/// the moment it fired. For modifiers with a left/right distinction, that
+/// value's device-dependent bits (see `device_flag`) report directly
+/// whether THIS key is down right now: absolute state, read fresh from
+/// every event. That makes it self-correcting after a dropped event,
+/// unlike inferring press/release by toggling a "currently held" set,
+/// which desyncs forever the first time a `FlagsChanged` is missed (for
+/// example while the tap is disabled and re-armed): the next press for
+/// that key would read as a release, leaving the peer holding a modifier
+/// that was never actually pressed there. An earlier version of this
+/// function used that toggle for every modifier and reasoned the
+/// device-independent mask alone could not recover direction; that is
+/// true only of the device-independent bits, not of `CGEventFlags` as a
+/// whole.
+///
+/// Caps lock has no left/right distinction and so no device bit to read
+/// this way; it keeps the toggle in `held`, which is fine for it in
+/// practice since caps lock is not usually held through a tap gap.
+fn translate_modifier(keycode: i64, flags: u64, held: &mut HashSet<i64>) -> Option<InputEvent> {
     let usage = virtual_key_to_usage(keycode)?;
-    let pressed = held.insert(keycode);
-    if !pressed {
-        held.remove(&keycode);
-    }
+    let pressed = match device_bit_for_keycode(keycode) {
+        Some(bit) => flags & bit != 0,
+        None => {
+            let inserted = held.insert(keycode);
+            if !inserted {
+                held.remove(&keycode);
+            }
+            inserted
+        }
+    };
     Some(InputEvent::Key { usage, pressed })
 }
 
-/// Calls `CGEventTapEnable(port, true)` on whatever port the callback (or
-/// the watchdog) most recently learned about. A no-op if the tap has not
-/// finished being created yet.
-fn reenable_tap() {
-    if let Some(&port) = TAP_PORT.get() {
-        // SAFETY: `port` was captured from a live `CFMachPortRef` right
-        // after `CGEventTapCreate` succeeded and is never invalidated
-        // before the process exits (`MacCapturer` never drops the tap).
-        // `CGEventTapEnable` is documented as safe to call at any time,
-        // including from the tap's own callback and from another thread,
-        // and the spike proved re-enabling this way recovers capture.
+/// Calls `CGEventTapEnable(port, true)` on whatever port `tap_port`
+/// currently holds; a no-op if it has been cleared, which happens once the
+/// tap has been torn down (see `teardown_tap`).
+///
+/// SAFETY: this function holds `tap_port`'s lock for the entire call to
+/// `CGEventTapEnable` below, and `teardown_tap` holds the same lock for
+/// its entire clear-and-drop. Because of that, this can never read a
+/// port whose tap is concurrently being invalidated: either
+/// `teardown_tap` finishes first (and this then reads `None`), or this
+/// finishes first (and used a port that was still valid for the whole
+/// call). `CGEventTapEnable` itself is documented as safe to call at any
+/// time, including from the tap's own callback and from another thread.
+fn reenable_tap(tap_port: &Mutex<Option<usize>>) {
+    let guard = lock_recovering(tap_port, "tap_port");
+    if let Some(port) = *guard {
         unsafe { CGEventTapEnable(port as CFMachPortRef, true) };
     }
+}
+
+/// Reads whether the tap `tap_port` refers to is currently enabled, or
+/// `None` if the tap has already been torn down. Uses the same lock, held
+/// for the same reason, as `reenable_tap`; see its SAFETY comment.
+fn tap_is_enabled(tap_port: &Mutex<Option<usize>>) -> Option<bool> {
+    let guard = lock_recovering(tap_port, "tap_port");
+    let port = (*guard)?;
+    Some(unsafe { CGEventTapIsEnabled(port as CFMachPortRef) } != 0)
 }
 
 /// Belt-and-braces recovery for disable causes macOS does not report as a
 /// `TapDisabledBy*` event. The spike found that locking the screen alone
 /// did not produce one on macOS 27, so silence for `WATCHDOG_TIMEOUT` is
-/// itself treated as evidence the tap needs re-arming.
-fn spawn_watchdog(last_seen: Arc<Mutex<Instant>>) {
+/// treated as reason to check on the tap.
+///
+/// Checking is not the same as re-arming: an unattended machine is
+/// silent for exactly the same reason (nothing has happened), so this
+/// only calls `CGEventTapEnable`, and only warns, when
+/// `CGEventTapIsEnabled` actually reports the tap disabled. Idle silence
+/// with the tap still enabled logs at debug, so an unattended Mac does
+/// not train its operator to ignore this file's one log line that
+/// matters.
+fn spawn_watchdog(last_seen: Arc<Mutex<Instant>>, tap_port: Arc<Mutex<Option<usize>>>) {
     let spawned = thread::Builder::new()
         .name("hop-capture-watchdog".into())
         .spawn(move || loop {
             thread::sleep(WATCHDOG_POLL_INTERVAL);
-            let elapsed = match last_seen.lock() {
-                Ok(guard) => guard.elapsed(),
-                Err(_) => continue,
-            };
-            if elapsed >= WATCHDOG_TIMEOUT {
-                tracing::warn!(
-                    elapsed_secs = elapsed.as_secs(),
-                    "no event tap activity recently; re-enabling as a precaution"
-                );
-                reenable_tap();
-                if let Ok(mut guard) = last_seen.lock() {
-                    *guard = Instant::now();
+            let elapsed = lock_recovering(&last_seen, "last_seen").elapsed();
+            if elapsed < WATCHDOG_TIMEOUT {
+                continue;
+            }
+            match tap_is_enabled(&tap_port) {
+                Some(false) => {
+                    tracing::warn!(
+                        elapsed_secs = elapsed.as_secs(),
+                        "event tap was disabled without a TapDisabledBy* event; re-enabling"
+                    );
+                    reenable_tap(&tap_port);
+                }
+                Some(true) => {
+                    tracing::debug!(
+                        elapsed_secs = elapsed.as_secs(),
+                        "no event tap activity recently; tap is still enabled, assuming idle"
+                    );
+                }
+                None => {
+                    // The tap has been torn down; nothing left to watch.
+                    return;
                 }
             }
+            *lock_recovering(&last_seen, "last_seen") = Instant::now();
         });
 
     if let Err(err) = spawned {
@@ -387,7 +607,7 @@ mod tests {
     fn translates_key_down() {
         // macOS virtual keycode 0 is 'a', HID usage 0x04.
         assert_eq!(
-            translate(CGEventType::KeyDown, 0, 0, 0),
+            translate(CGEventType::KeyDown, 0, 0, 0, 0),
             Some(InputEvent::Key {
                 usage: Usage::A,
                 pressed: true
@@ -399,7 +619,7 @@ mod tests {
     fn translates_key_up() {
         // Keycode 8 is 'c'.
         assert_eq!(
-            translate(CGEventType::KeyUp, 8, 0, 0),
+            translate(CGEventType::KeyUp, 8, 0, 0, 0),
             Some(InputEvent::Key {
                 usage: Usage::C,
                 pressed: false
@@ -410,36 +630,50 @@ mod tests {
     #[test]
     fn translates_mouse_move_from_deltas_not_position() {
         assert_eq!(
-            translate(CGEventType::MouseMoved, 0, 12, -7),
+            translate(CGEventType::MouseMoved, 0, 12, -7, 0),
             Some(InputEvent::Mouse { dx: 12, dy: -7 })
+        );
+    }
+
+    #[test]
+    fn translates_dragged_events_as_motion_like_mouse_moved() {
+        // A held button turns MouseMoved into a Dragged variant; both
+        // must produce the same motion event or every drag is lost.
+        assert_eq!(
+            translate(CGEventType::LeftMouseDragged, 0, 5, -2, 0),
+            Some(InputEvent::Mouse { dx: 5, dy: -2 })
+        );
+        assert_eq!(
+            translate(CGEventType::RightMouseDragged, 0, -3, 9, 0),
+            Some(InputEvent::Mouse { dx: -3, dy: 9 })
         );
     }
 
     #[test]
     fn translates_scroll() {
         assert_eq!(
-            translate(CGEventType::ScrollWheel, 0, 1, -3),
+            translate(CGEventType::ScrollWheel, 0, 1, -3, 0),
             Some(InputEvent::Scroll { dx: 1, dy: -3 })
         );
     }
 
     #[test]
     fn unmapped_keycode_yields_none_rather_than_a_guess() {
-        assert_eq!(translate(CGEventType::KeyDown, 9999, 0, 0), None);
-        assert_eq!(translate(CGEventType::KeyUp, 9999, 0, 0), None);
+        assert_eq!(translate(CGEventType::KeyDown, 9999, 0, 0, 0), None);
+        assert_eq!(translate(CGEventType::KeyUp, 9999, 0, 0, 0), None);
     }
 
     #[test]
     fn translates_mouse_buttons() {
         assert_eq!(
-            translate(CGEventType::LeftMouseDown, 0, 0, 0),
+            translate(CGEventType::LeftMouseDown, 0, 0, 0, 0),
             Some(InputEvent::Button {
                 button: Button::Left,
                 pressed: true
             })
         );
         assert_eq!(
-            translate(CGEventType::RightMouseUp, 0, 0, 0),
+            translate(CGEventType::RightMouseUp, 0, 0, 0, 0),
             Some(InputEvent::Button {
                 button: Button::Right,
                 pressed: false
@@ -448,68 +682,141 @@ mod tests {
     }
 
     #[test]
-    fn irrelevant_event_types_yield_none() {
-        assert_eq!(translate(CGEventType::FlagsChanged, 56, 0, 0), None);
-        assert_eq!(translate(CGEventType::TapDisabledByTimeout, 0, 0, 0), None);
+    fn translates_middle_button_from_other_mouse_events() {
+        assert_eq!(
+            translate(CGEventType::OtherMouseDown, 0, 0, 0, 2),
+            Some(InputEvent::Button {
+                button: Button::Middle,
+                pressed: true
+            })
+        );
+        assert_eq!(
+            translate(CGEventType::OtherMouseUp, 0, 0, 0, 2),
+            Some(InputEvent::Button {
+                button: Button::Middle,
+                pressed: false
+            })
+        );
     }
 
     #[test]
-    fn modifier_toggles_press_then_release() {
-        let mut held = HashSet::new();
-        // Keycode 56 is left shift.
+    fn other_mouse_buttons_past_middle_are_ignored_not_guessed() {
+        assert_eq!(translate(CGEventType::OtherMouseDown, 0, 0, 0, 3), None);
+        assert_eq!(translate(CGEventType::OtherMouseUp, 0, 0, 0, 4), None);
+    }
+
+    #[test]
+    fn irrelevant_event_types_yield_none() {
+        assert_eq!(translate(CGEventType::FlagsChanged, 56, 0, 0, 0), None);
         assert_eq!(
-            translate_modifier(56, &mut held),
+            translate(CGEventType::TapDisabledByTimeout, 0, 0, 0, 0),
+            None
+        );
+    }
+
+    #[test]
+    fn left_shift_reads_from_its_own_device_bit() {
+        let mut held = HashSet::new();
+        // CGEventFlagShift (0x00020000) | NX_DEVICELSHIFTKEYMASK (0x2).
+        let down = 0x0002_0000 | 0x2;
+        assert_eq!(
+            translate_modifier(56, down, &mut held),
             Some(InputEvent::Key {
                 usage: Usage::LEFT_SHIFT,
                 pressed: true
             })
         );
-        assert!(held.contains(&56));
         assert_eq!(
-            translate_modifier(56, &mut held),
+            translate_modifier(56, 0, &mut held),
             Some(InputEvent::Key {
                 usage: Usage::LEFT_SHIFT,
                 pressed: false
             })
         );
-        assert!(!held.contains(&56));
+    }
+
+    #[test]
+    fn right_shift_is_distinguished_from_left_by_its_own_device_bit() {
+        let mut held = HashSet::new();
+        // CGEventFlagShift | NX_DEVICERSHIFTKEYMASK (0x4): only the right
+        // key's own bit is set.
+        let right_down = 0x0002_0000 | 0x4;
+        assert_eq!(
+            translate_modifier(60, right_down, &mut held),
+            Some(InputEvent::Key {
+                usage: Usage::RIGHT_SHIFT,
+                pressed: true
+            })
+        );
+        // Left shift's own bit is not part of that mask, so it must read
+        // as not pressed even though the device-independent Shift bit is
+        // set alongside the right key's bit.
+        assert_eq!(
+            translate_modifier(56, right_down, &mut held),
+            Some(InputEvent::Key {
+                usage: Usage::LEFT_SHIFT,
+                pressed: false
+            })
+        );
+    }
+
+    #[test]
+    fn shift_state_survives_a_dropped_flags_changed_event() {
+        // Regression test for IMPORTANT 3: a toggle-based implementation
+        // desyncs the first time a `FlagsChanged` is missed (for example
+        // while the tap is disabled and re-armed). Reading the device bit
+        // fresh from every event means a missed release cannot desync
+        // anything: the very next down for the same key still reads as a
+        // press.
+        let mut held = HashSet::new();
+        let down = 0x0002_0000 | 0x2; // left shift down
+        assert_eq!(
+            translate_modifier(56, down, &mut held),
+            Some(InputEvent::Key {
+                usage: Usage::LEFT_SHIFT,
+                pressed: true
+            })
+        );
+        // The matching release never reaches here (lost while the tap was
+        // disabled), so no call happens for it. Shift goes down again
+        // with the same device bit set, and must still be reported as a
+        // press rather than a stray release.
+        assert_eq!(
+            translate_modifier(56, down, &mut held),
+            Some(InputEvent::Key {
+                usage: Usage::LEFT_SHIFT,
+                pressed: true
+            })
+        );
+    }
+
+    #[test]
+    fn caps_lock_still_toggles_via_the_held_set() {
+        // Caps lock has no left/right distinction and so no device bit;
+        // it keeps the previous toggle behavior.
+        let mut held = HashSet::new();
+        assert_eq!(
+            translate_modifier(57, 0, &mut held),
+            Some(InputEvent::Key {
+                usage: Usage(0x39),
+                pressed: true
+            })
+        );
+        assert!(held.contains(&57));
+        assert_eq!(
+            translate_modifier(57, 0, &mut held),
+            Some(InputEvent::Key {
+                usage: Usage(0x39),
+                pressed: false
+            })
+        );
+        assert!(!held.contains(&57));
     }
 
     #[test]
     fn unmapped_modifier_yields_none_and_does_not_get_tracked() {
         let mut held = HashSet::new();
-        assert_eq!(translate_modifier(9999, &mut held), None);
+        assert_eq!(translate_modifier(9999, 0, &mut held), None);
         assert!(held.is_empty());
-    }
-
-    #[test]
-    fn two_modifiers_held_independently() {
-        // Left shift (56) and left control (59) pressed together, then
-        // released in the opposite order; each must toggle on its own
-        // keycode regardless of the other's state.
-        let mut held = HashSet::new();
-        assert_eq!(
-            translate_modifier(56, &mut held),
-            Some(InputEvent::Key {
-                usage: Usage::LEFT_SHIFT,
-                pressed: true
-            })
-        );
-        assert_eq!(
-            translate_modifier(59, &mut held),
-            Some(InputEvent::Key {
-                usage: Usage::LEFT_CTRL,
-                pressed: true
-            })
-        );
-        assert_eq!(
-            translate_modifier(56, &mut held),
-            Some(InputEvent::Key {
-                usage: Usage::LEFT_SHIFT,
-                pressed: false
-            })
-        );
-        assert!(held.contains(&59));
-        assert!(!held.contains(&56));
     }
 }
