@@ -648,6 +648,17 @@ fn validate_server_address(raw: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Resolve the home directory the same way `expand_tilde` does, so these
+    /// tests pass on Windows too, where `HOME` is unset and `USERPROFILE`
+    /// carries the value. Hardcoding `HOME` made three of them fail on the
+    /// Windows CI runner while passing on macOS.
+    fn test_home() -> String {
+        std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .expect("either HOME or USERPROFILE should be set in the test environment")
+    }
+
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -731,7 +742,7 @@ return_edge = "bottom"
         );
         assert_eq!(config.layout.top.as_deref(), Some("pc"));
         assert_eq!(config.layout.bottom, None);
-        let home = std::env::var("HOME").expect("HOME should be set in the test environment");
+        let home = test_home();
         assert_eq!(
             config.security.key_file,
             PathBuf::from(home).join(".config/hop/key")
@@ -1138,7 +1149,7 @@ panic_hotkey = "LeftCtrl+LeftAlt+Escape"
 
     #[test]
     fn tilde_prefixed_path_expands_under_home_directory() {
-        let home = std::env::var("HOME").expect("HOME should be set in the test environment");
+        let home = test_home();
         let expanded = expand_config_path("~/.config/hop/key", "security.key_file")
             .expect("a tilde-prefixed path should expand");
         assert_eq!(expanded, PathBuf::from(home).join(".config/hop/key"));
@@ -1146,7 +1157,7 @@ panic_hotkey = "LeftCtrl+LeftAlt+Escape"
 
     #[test]
     fn bare_tilde_expands_to_home_directory() {
-        let home = std::env::var("HOME").expect("HOME should be set in the test environment");
+        let home = test_home();
         let expanded = expand_config_path("~", "security.key_file")
             .expect("a bare tilde should expand to the home directory");
         assert_eq!(expanded, PathBuf::from(home));
@@ -1187,7 +1198,7 @@ panic_hotkey = "LeftCtrl+LeftAlt+Escape"
         let config = Config::load(&path).expect("valid server config should load");
         fs::remove_file(&path).ok();
 
-        let home = std::env::var("HOME").expect("HOME should be set in the test environment");
+        let home = test_home();
         assert_ne!(
             config.security.key_file,
             PathBuf::from("~/.config/hop/key"),
