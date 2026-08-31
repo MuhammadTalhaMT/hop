@@ -28,7 +28,24 @@
 use crate::{split, TransportError, TransportReader, TransportWriter};
 use hop_proto::{Direction, Message, SessionId, SharedKey, PROTOCOL_VERSION};
 use sha2::{Digest, Sha256};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
+
+/// How long either side of the handshake waits for the whole exchange to
+/// complete before giving up. Five seconds is generous for a LAN.
+///
+/// `server_handshake` runs inline in the accept loop (see hop's
+/// `run.rs`'s `run_server`), so without this a peer that completes the
+/// TCP handshake and then sends nothing at all - a port scanner, a
+/// monitoring probe, a machine that dropped off the network mid
+/// handshake - blocks `read_exact` forever and parks the server
+/// permanently: it stays alive, logs nothing, and never accepts the real
+/// client again. `client_handshake` has the same hole on the other side:
+/// a client dialing a wedged server would otherwise block forever with
+/// no death detection, no backoff, and no reconnect, since `Liveness` is
+/// only constructed after the handshake returns. This is CRITICAL 3 from
+/// the whole-branch review.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Derive the session identifier both peers will authenticate every frame
 /// against.
@@ -82,6 +99,14 @@ pub enum HandshakeError {
     Unexpected(&'static str),
     #[error("system RNG unavailable")]
     Random,
+    /// The peer connected but never completed the handshake within
+    /// `HANDSHAKE_TIMEOUT`. See that constant's doc comment for why this
+    /// exists: without it, a peer that never sends anything parks
+    /// whichever side is waiting forever.
+    #[error(
+        "handshake did not complete within the timeout; the peer connected but never finished it"
+    )]
+    Timeout,
 }
 
 /// Name a message's kind without exposing anything it carries. Used only
@@ -161,6 +186,43 @@ pub async fn client_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     ),
     HandshakeError,
 > {
+    client_handshake_with_timeout(stream, key, peer_id, HANDSHAKE_TIMEOUT).await
+}
+
+/// Same as [`client_handshake`], with the timeout as a parameter so tests
+/// can use a short one instead of waiting out the real
+/// [`HANDSHAKE_TIMEOUT`].
+async fn client_handshake_with_timeout<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: S,
+    key: &SharedKey,
+    peer_id: &str,
+    timeout: Duration,
+) -> Result<
+    (
+        TransportReader<ReadHalf<S>>,
+        TransportWriter<WriteHalf<S>>,
+        SessionId,
+    ),
+    HandshakeError,
+> {
+    match tokio::time::timeout(timeout, client_handshake_inner(stream, key, peer_id)).await {
+        Ok(result) => result,
+        Err(_) => Err(HandshakeError::Timeout),
+    }
+}
+
+async fn client_handshake_inner<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: S,
+    key: &SharedKey,
+    peer_id: &str,
+) -> Result<
+    (
+        TransportReader<ReadHalf<S>>,
+        TransportWriter<WriteHalf<S>>,
+        SessionId,
+    ),
+    HandshakeError,
+> {
     let (mut reader, mut writer) = split(
         stream,
         key.clone(),
@@ -199,6 +261,43 @@ pub async fn client_handshake<S: AsyncRead + AsyncWrite + Unpin>(
 /// the session and the re-keyed halves, since the server learns the peer
 /// id here and has nowhere else to get it.
 pub async fn server_handshake<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: S,
+    key: &SharedKey,
+) -> Result<
+    (
+        TransportReader<ReadHalf<S>>,
+        TransportWriter<WriteHalf<S>>,
+        SessionId,
+        String,
+    ),
+    HandshakeError,
+> {
+    server_handshake_with_timeout(stream, key, HANDSHAKE_TIMEOUT).await
+}
+
+/// Same as [`server_handshake`], with the timeout as a parameter so tests
+/// can use a short one instead of waiting out the real
+/// [`HANDSHAKE_TIMEOUT`].
+async fn server_handshake_with_timeout<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: S,
+    key: &SharedKey,
+    timeout: Duration,
+) -> Result<
+    (
+        TransportReader<ReadHalf<S>>,
+        TransportWriter<WriteHalf<S>>,
+        SessionId,
+        String,
+    ),
+    HandshakeError,
+> {
+    match tokio::time::timeout(timeout, server_handshake_inner(stream, key)).await {
+        Ok(result) => result,
+        Err(_) => Err(HandshakeError::Timeout),
+    }
+}
+
+async fn server_handshake_inner<S: AsyncRead + AsyncWrite + Unpin>(
     stream: S,
     key: &SharedKey,
 ) -> Result<
@@ -399,5 +498,54 @@ mod tests {
 
         assert_eq!(server.await.unwrap(), sent);
         assert_eq!(reply, Message::Heartbeat);
+    }
+
+    // CRITICAL 3 from the whole-branch review: a peer that completes the
+    // TCP handshake and then sends nothing must be abandoned, not allowed
+    // to block a handshake forever. Both tests use a short, test-only
+    // timeout (via the `_with_timeout` helpers) rather than the real
+    // five-second `HANDSHAKE_TIMEOUT`, so a passing run is fast; both are
+    // also wrapped in an outer real-time bound so that if the timeout
+    // wrapper were ever removed, the test fails on its own within a
+    // couple of seconds instead of hanging CI, which has already
+    // happened once in this project.
+    #[tokio::test]
+    async fn server_handshake_gives_up_on_a_silent_peer_instead_of_blocking_forever() {
+        let (server_io, _client_io) = duplex(4096);
+        let key = SharedKey::from_bytes([5u8; 32]);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            server_handshake_with_timeout(server_io, &key, Duration::from_millis(50)),
+        )
+        .await
+        .expect(
+            "server_handshake must give up on its own within its timeout, not hang until this \
+             test's outer bound fires",
+        );
+
+        assert!(matches!(result, Err(HandshakeError::Timeout)));
+    }
+
+    #[tokio::test]
+    async fn client_handshake_gives_up_on_a_silent_peer_instead_of_blocking_forever() {
+        // The client sends its own opening Handshake message first (see
+        // client_handshake_inner), so the peer here has to at least
+        // accept that write; it just never replies, exactly like a
+        // server that accepted the TCP connection and then wedged.
+        let (client_io, _server_io) = duplex(4096);
+        let key = SharedKey::from_bytes([6u8; 32]);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            client_handshake_with_timeout(client_io, &key, "pc", Duration::from_millis(50)),
+        )
+        .await
+        .expect(
+            "client_handshake must give up on its own within its timeout, not hang until this \
+             test's outer bound fires",
+        );
+
+        assert!(matches!(result, Err(HandshakeError::Timeout)));
     }
 }
