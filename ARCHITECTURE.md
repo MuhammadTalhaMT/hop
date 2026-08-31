@@ -118,9 +118,10 @@ so every genuine frame after it is rejected.
 ## Control and held keys
 
 `Control` is the focus state machine (`Focus::Local` / `Focus::Remote`).
-Every path that leaves `Remote` (an explicit release, a disconnect, or the
-panic hotkey) returns focus to `Local` and, if anything was held, returns
-`Action::ReleaseAll` so the caller sends `Message::ReleaseAllKeys`.
+Every path that leaves `Remote` (an explicit release, a disconnect, the
+panic hotkey, or waking from sleep) returns focus to `Local` and, if
+anything was held, returns `Action::ReleaseAll` so the caller sends
+`Message::ReleaseAllKeys`.
 
 There are two distinct `HeldKeys` in play, recording different things for
 different reasons:

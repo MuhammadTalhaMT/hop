@@ -79,6 +79,17 @@ impl Control {
         self.return_focus()
     }
 
+    /// Call this when the machine comes back from sleep.
+    ///
+    /// A machine that just woke must never resume with focus still on the
+    /// peer: whatever this machine's user does first (waking it up at
+    /// all) has to land locally, and any keys the remote side still
+    /// believes are held must be released so sleep cannot leave a
+    /// modifier stuck down on the far machine.
+    pub fn on_wake(&mut self) -> Action {
+        self.return_focus()
+    }
+
     fn return_focus(&mut self) -> Action {
         let was_remote = self.focus == Focus::Remote;
         self.focus = Focus::Local;
@@ -165,6 +176,25 @@ mod tests {
         c.on_edge_crossed();
         c.on_key(Usage::A, true);
         assert_eq!(c.on_panic_hotkey(), Action::ReleaseAll);
+        assert_eq!(c.focus(), Focus::Local);
+    }
+
+    #[test]
+    fn waking_always_returns_focus() {
+        // A machine coming back from sleep must never resume with focus
+        // still on the peer, and anything the peer believes is held must
+        // be released so sleep cannot leave a modifier stuck down there.
+        let mut c = Control::new();
+        c.on_edge_crossed();
+        c.on_key(Usage::LEFT_GUI, true);
+        assert_eq!(c.on_wake(), Action::ReleaseAll);
+        assert_eq!(c.focus(), Focus::Local);
+    }
+
+    #[test]
+    fn waking_while_local_is_a_no_op() {
+        let mut c = Control::new();
+        assert_eq!(c.on_wake(), Action::None);
         assert_eq!(c.focus(), Focus::Local);
     }
 
