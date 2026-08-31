@@ -36,6 +36,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use tokio::sync::Notify;
+
 use core_foundation::base::TCFType;
 use core_foundation::mach_port::CFMachPortRef;
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
@@ -286,6 +288,17 @@ const QUEUE_OVERFLOW_LOG_INTERVAL: Duration = Duration::from_secs(5);
 struct EventQueue {
     events: Mutex<VecDeque<InputEvent>>,
     last_overflow_log: Mutex<Option<Instant>>,
+    /// Signalled every time `push` adds an event, so `MacCapturer`'s owner
+    /// can `await` this instead of polling `poll()` on a fixed tick.
+    /// `Notify::notify_one` is documented as safe to call from any thread,
+    /// with or without a tokio runtime on it, and never blocks, which is
+    /// exactly what the tap callback's "must stay cheap, must never
+    /// block" requirement (see the module doc comment) needs. A single
+    /// stored permit is enough even if several events are pushed between
+    /// two calls to `notified().await`, since the awaiting side always
+    /// drains the whole queue on each wakeup rather than assuming one
+    /// wakeup means one event.
+    notify: Arc<Notify>,
 }
 
 impl EventQueue {
@@ -293,13 +306,14 @@ impl EventQueue {
         Self {
             events: Mutex::new(VecDeque::new()),
             last_overflow_log: Mutex::new(None),
+            notify: Arc::new(Notify::new()),
         }
     }
 
     /// Pushes `event` onto the back of the queue, dropping the oldest
     /// queued event first if this would exceed `MAX_QUEUED_EVENTS`. Never
     /// blocks: the lock it takes is only ever held briefly by this or by
-    /// `pop`.
+    /// `pop`, and `Notify::notify_one` below is itself non-blocking.
     fn push(&self, event: InputEvent) {
         let mut events = lock_recovering(&self.events, "event_queue");
         if events.len() >= MAX_QUEUED_EVENTS {
@@ -310,6 +324,8 @@ impl EventQueue {
             self.log_overflow_rate_limited();
         }
         events.push_back(event);
+        drop(events);
+        self.notify.notify_one();
     }
 
     /// Pops the oldest queued event, or `None` if the queue is empty.
@@ -412,6 +428,16 @@ impl MacCapturer {
     /// This is CRITICAL 1 from the whole-branch review.
     pub fn peer_connected_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.peer_connected)
+    }
+
+    /// A handle the owner can `await` (`notified().await`) to wake up the
+    /// instant the tap callback queues a new event, instead of polling
+    /// `poll()` on a fixed tick. See `EventQueue::notify`'s doc comment
+    /// for why a single missed or coalesced wakeup is harmless: the
+    /// caller is expected to drain the queue fully on every wakeup, not
+    /// assume one wakeup means exactly one event.
+    pub fn event_ready(&self) -> Arc<Notify> {
+        Arc::clone(&self.events.notify)
     }
 }
 

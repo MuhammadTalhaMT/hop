@@ -438,6 +438,57 @@ async fn run_server(
     }
 }
 
+/// Drains `watched` via `hop_core::pump_server`, updates `remote_flag` to
+/// match the resulting focus, and, if the panic hotkey fired somewhere in
+/// that drain, asks the peer to release everything and takes focus back
+/// locally. `Err(())` means the caller should disconnect; this function
+/// has already logged exactly why, at the same level of detail the two
+/// call sites below used to log inline, so the caller only needs to
+/// `break`, never log again itself.
+///
+/// Shared by both branches of `handle_client`'s connection loop that can
+/// trigger a drain: the event-ready notification (fired the instant the
+/// tap callback queues something, the common case) and the periodic tick
+/// (a backstop for a hypothetically missed wakeup, and the only place
+/// liveness and heartbeats are checked). Factored out so that duplication
+/// lives here once instead of twice in the `select!` arms.
+#[cfg(target_os = "macos")]
+async fn drain_and_forward<W, C>(
+    writer: &mut hop_core::TransportWriter<W>,
+    watched: &mut C,
+    control: &mut Control,
+    remap: &hop_core::RemapTable,
+    remote_flag: &Arc<AtomicBool>,
+    triggered: &Arc<AtomicBool>,
+) -> Result<(), ()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    C: Capturer,
+{
+    if let Err(error) = hop_core::pump_server(writer, watched, control, remap).await {
+        tracing::warn!(%error, "failed to forward input; disconnecting");
+        return Err(());
+    }
+    remote_flag.store(
+        control.focus() == hop_core::Focus::Remote,
+        Ordering::Relaxed,
+    );
+
+    if triggered.swap(false, Ordering::SeqCst) {
+        tracing::info!("panic hotkey pressed; returning focus to this machine");
+        let action = control.on_panic_hotkey();
+        remote_flag.store(
+            control.focus() == hop_core::Focus::Remote,
+            Ordering::Relaxed,
+        );
+        if action == Action::ReleaseAll && send_release_all(writer).await.is_err() {
+            tracing::warn!("failed to send release-all after the panic hotkey; disconnecting");
+            return Err(());
+        }
+    }
+    Ok(())
+}
+
 /// Run one client connection to completion: handshake, then forward
 /// captured input until the link drops or goes silent for too long. Never
 /// itself retries; `run_server`'s accept loop does that by construction.
@@ -476,6 +527,11 @@ async fn handle_client(
     // no-op instead of a trap.
     let peer_connected_flag = capturer.peer_connected_flag();
     peer_connected_flag.store(true, Ordering::Relaxed);
+    // Fires the instant the tap callback queues a new event, so the
+    // select! loop below can react to input instead of waiting out a
+    // fixed tick. Grabbed before `capturer` is moved into `watched`, the
+    // same way `remote_flag` and `peer_connected_flag` are above.
+    let notify = capturer.event_ready();
     let mut control = Control::new();
     let triggered = Arc::new(AtomicBool::new(false));
     let mut watched = HotkeyWatcher {
@@ -506,7 +562,14 @@ async fn handle_client(
     let death_timeout = Duration::from_secs(3);
     let now = Instant::now();
     let mut liveness = hop_core::Liveness::new(now, heartbeat_interval, death_timeout);
-    let mut poll_ticker = tokio::time::interval(Duration::from_millis(15));
+    // A backstop, not the primary driver of forwarding any more: real
+    // draining happens the instant `notify` fires below, reacting to the
+    // tap callback rather than waiting out a tick. This tick's remaining
+    // job is liveness and heartbeats, which tolerate far coarser timing
+    // than input latency does; 250ms of jitter against a 1s heartbeat
+    // cadence and a 3s death timeout is negligible, and it still redrains
+    // the capturer itself in case a `notify` wakeup was ever missed.
+    let mut poll_ticker = tokio::time::interval(Duration::from_millis(250));
 
     'connection: loop {
         tokio::select! {
@@ -534,6 +597,11 @@ async fn handle_client(
                     }
                 }
             }
+            _ = notify.notified() => {
+                if drain_and_forward(&mut writer, &mut watched, &mut control, &remap, &remote_flag, &triggered).await.is_err() {
+                    break 'connection;
+                }
+            }
             _ = poll_ticker.tick() => {
                 let now = Instant::now();
                 if liveness.is_dead(now) {
@@ -541,20 +609,8 @@ async fn handle_client(
                     break 'connection;
                 }
 
-                if let Err(error) = hop_core::pump_server(&mut writer, &mut watched, &mut control, &remap).await {
-                    tracing::warn!(%error, "failed to forward input; disconnecting");
+                if drain_and_forward(&mut writer, &mut watched, &mut control, &remap, &remote_flag, &triggered).await.is_err() {
                     break 'connection;
-                }
-                remote_flag.store(control.focus() == hop_core::Focus::Remote, Ordering::Relaxed);
-
-                if triggered.swap(false, Ordering::SeqCst) {
-                    tracing::info!("panic hotkey pressed; returning focus to this machine");
-                    let action = control.on_panic_hotkey();
-                    remote_flag.store(control.focus() == hop_core::Focus::Remote, Ordering::Relaxed);
-                    if action == Action::ReleaseAll && send_release_all(&mut writer).await.is_err() {
-                        tracing::warn!("failed to send release-all after the panic hotkey; disconnecting");
-                        break 'connection;
-                    }
                 }
 
                 if liveness.should_send_heartbeat(now) {
