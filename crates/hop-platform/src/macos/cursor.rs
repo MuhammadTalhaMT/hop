@@ -198,25 +198,8 @@ pub fn show_cursor() {
     let _ = CGDisplay::main().show_cursor();
 }
 
-/// Sets how long, in seconds, local hardware input is suppressed after a
-/// programmatic cursor warp; see `DEFAULT_LOCAL_EVENTS_SUPPRESSION_INTERVAL`
-/// above for why this needs to be overridden while focus is parked on the
-/// peer. Best-effort: if Quartz refuses to hand back an event source
-/// (undocumented but possible, the same caveat `cursor_position` above
-/// already lives with), this silently does nothing rather than panicking
-/// on the input path.
-/// Permit every event class during a suppression window.
-/// `kCGEventFilterMaskPermitAllEvents` is the OR of the local mouse,
-/// local keyboard and system-defined permit bits.
-const PERMIT_ALL_EVENTS: u32 = 1 | 2 | 4;
-/// `kCGEventSupressionStateSupressionInterval`. Apple's own spelling of
-/// "suppression" is missing a letter here; kept so the constant is
-/// greppable against the system headers.
-const SUPPRESSION_STATE_INTERVAL: u32 = 0;
-
 unsafe extern "C" {
     fn CGSetLocalEventsSuppressionInterval(seconds: f64) -> i32;
-    fn CGSetLocalEventsFilterDuringSupressionState(filter: u32, state: u32) -> i32;
 }
 
 /// Stop macOS ignoring the user's own mouse for a quarter second after a
@@ -230,16 +213,17 @@ unsafe extern "C" {
 /// that visibly hesitated for about a second every time focus came back
 /// from the peer.
 ///
-/// Both calls are deprecated by Apple and have no supported replacement
-/// for this purpose. They still work, and every tool in this space uses
-/// them for exactly this.
+/// Deprecated by Apple with no supported replacement for this purpose,
+/// but still present and still working. The companion call
+/// `CGSetLocalEventsFilterDuringSupressionState`, which comparable tools
+/// also use, is NOT present in the modern SDK and fails to link, so it is
+/// deliberately not called here.
 fn set_local_events_suppression_interval(seconds: f64) {
-    // SAFETY: both take plain scalars by value, return a status code, and
-    // touch no memory this crate owns. There is nothing to keep alive
+    // SAFETY: takes a plain scalar by value, returns a status code, and
+    // touches no memory this crate owns. There is nothing to keep alive
     // across the call and nothing to release afterwards.
     unsafe {
         CGSetLocalEventsSuppressionInterval(seconds);
-        CGSetLocalEventsFilterDuringSupressionState(PERMIT_ALL_EVENTS, SUPPRESSION_STATE_INTERVAL);
     }
 }
 
