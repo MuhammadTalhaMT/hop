@@ -213,12 +213,22 @@ mod tests {
         // is exactly the failure mode this project exists to prevent.
         use crate::transport::split;
         use crate::FailingInjector;
-        use hop_proto::{SessionId, SharedKey};
+        use hop_proto::{Direction, SessionId, SharedKey};
         use tokio::io::duplex;
 
         let (a, b) = duplex(4096);
-        let (_ar, mut server) = split(a, SharedKey::from_bytes([1u8; 32]), SessionId::ZERO);
-        let (mut client, _bw) = split(b, SharedKey::from_bytes([1u8; 32]), SessionId::ZERO);
+        let (_ar, mut server) = split(
+            a,
+            SharedKey::from_bytes([1u8; 32]),
+            SessionId::ZERO,
+            Direction::ServerToClient,
+        );
+        let (mut client, _bw) = split(
+            b,
+            SharedKey::from_bytes([1u8; 32]),
+            SessionId::ZERO,
+            Direction::ClientToServer,
+        );
         let mut injector = FailingInjector;
         let mut held = HeldKeys::new();
 

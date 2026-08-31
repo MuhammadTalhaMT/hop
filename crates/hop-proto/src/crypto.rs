@@ -6,6 +6,43 @@ const SEQ_LEN: usize = 8;
 const NONCE_LEN: usize = 24;
 const TAG_LEN: usize = 16;
 const MIN_FRAME: usize = SEQ_LEN + NONCE_LEN + TAG_LEN;
+const DIR_LEN: usize = 1;
+
+/// Which of the two peers sealed a frame, bound into its authenticated
+/// data alongside the session and sequence number.
+///
+/// The session and the replay window bind a connection, but not which
+/// side sent a given frame: without this, an echoed frame (a network loop,
+/// or an attacker who simply reflects traffic back at its sender) is new
+/// to the receiving side's replay window and authenticates as genuine
+/// inbound traffic under the correct key and session. Binding the
+/// direction closes that: a `TransportWriter` seals under its own
+/// direction, and the paired `TransportReader` on the same side opens
+/// expecting the OPPOSITE direction, so a frame this side sent itself can
+/// never authenticate coming back in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    ClientToServer,
+    ServerToClient,
+}
+
+impl Direction {
+    /// The direction traffic flows on the other leg of the same
+    /// connection.
+    pub fn opposite(self) -> Direction {
+        match self {
+            Direction::ClientToServer => Direction::ServerToClient,
+            Direction::ServerToClient => Direction::ClientToServer,
+        }
+    }
+
+    fn tag(self) -> u8 {
+        match self {
+            Direction::ClientToServer => 0,
+            Direction::ServerToClient => 1,
+        }
+    }
+}
 
 /// Identifies one session between two peers, mixed into every frame's
 /// authenticated data so a frame sealed under one session cannot
@@ -73,19 +110,30 @@ pub enum CryptoError {
 }
 
 /// Build the associated data a frame is authenticated under: the session
-/// bytes followed by the 8 big-endian sequence bytes. The session is never
-/// transmitted, since both peers already know it; only the sequence bytes
-/// go on the wire in the clear.
-fn associated_data(session: SessionId, seq_bytes: [u8; SEQ_LEN]) -> [u8; 32 + SEQ_LEN] {
-    let mut aad = [0u8; 32 + SEQ_LEN];
+/// bytes, the direction byte, then the 8 big-endian sequence bytes. Only
+/// the sequence bytes go on the wire in the clear; the session and
+/// direction are never transmitted, since both peers already know them.
+fn associated_data(
+    session: SessionId,
+    direction: Direction,
+    seq_bytes: [u8; SEQ_LEN],
+) -> [u8; 32 + DIR_LEN + SEQ_LEN] {
+    let mut aad = [0u8; 32 + DIR_LEN + SEQ_LEN];
     aad[..32].copy_from_slice(&session.0);
-    aad[32..].copy_from_slice(&seq_bytes);
+    aad[32] = direction.tag();
+    aad[33..].copy_from_slice(&seq_bytes);
     aad
 }
 
+/// Seal a frame as having been sent in `direction`. The paired reader on
+/// the far side must open it expecting the same `direction`; a reader on
+/// the SAME side as this writer must open expecting `direction.opposite()`,
+/// which is what stops a reflected frame from authenticating. See
+/// [`Direction`]'s doc comment.
 pub fn seal(
     key: &SharedKey,
     session: SessionId,
+    direction: Direction,
     seq: u64,
     message: &Message,
 ) -> Result<Vec<u8>, CryptoError> {
@@ -97,7 +145,7 @@ pub fn seal(
 
     let cipher = XChaCha20Poly1305::new(key.as_bytes().into());
     let seq_bytes = seq.to_be_bytes();
-    let aad = associated_data(session, seq_bytes);
+    let aad = associated_data(session, direction, seq_bytes);
     let ciphertext = cipher
         .encrypt(
             &nonce,
@@ -115,9 +163,12 @@ pub fn seal(
     Ok(frame)
 }
 
+/// Open a frame, requiring it to have been sealed under `direction`. See
+/// [`seal`] for which direction a caller should pass.
 pub fn open(
     key: &SharedKey,
     session: SessionId,
+    direction: Direction,
     frame: &[u8],
 ) -> Result<(u64, Message), CryptoError> {
     if frame.len() < MIN_FRAME {
@@ -135,7 +186,7 @@ pub fn open(
     let nonce: XNonce = nonce_arr.into();
 
     let cipher = XChaCha20Poly1305::new(key.as_bytes().into());
-    let aad = associated_data(session, seq_arr);
+    let aad = associated_data(session, direction, seq_arr);
     let plaintext = cipher
         .decrypt(
             &nonce,
@@ -165,51 +216,70 @@ mod tests {
         SessionId([5u8; 32])
     }
 
+    /// The direction used by every test that does not care which one, so
+    /// changing this in one place changes it everywhere.
+    fn direction() -> Direction {
+        Direction::ClientToServer
+    }
+
     #[test]
     fn seals_and_opens_round_trip() {
         let key = SharedKey::generate().unwrap();
-        let sealed = seal(&key, session(), 7, &sample()).expect("seal");
-        let (seq, message) = open(&key, session(), &sealed).expect("open");
+        let sealed = seal(&key, session(), direction(), 7, &sample()).expect("seal");
+        let (seq, message) = open(&key, session(), direction(), &sealed).expect("open");
         assert_eq!(seq, 7);
         assert_eq!(message, sample());
     }
 
     #[test]
     fn rejects_wrong_key() {
-        let sealed = seal(&SharedKey::generate().unwrap(), session(), 1, &sample()).unwrap();
-        assert!(open(&SharedKey::generate().unwrap(), session(), &sealed).is_err());
+        let sealed = seal(
+            &SharedKey::generate().unwrap(),
+            session(),
+            direction(),
+            1,
+            &sample(),
+        )
+        .unwrap();
+        assert!(open(
+            &SharedKey::generate().unwrap(),
+            session(),
+            direction(),
+            &sealed
+        )
+        .is_err());
     }
 
     #[test]
     fn rejects_tampered_ciphertext() {
         let key = SharedKey::generate().unwrap();
-        let mut sealed = seal(&key, session(), 1, &sample()).unwrap();
+        let mut sealed = seal(&key, session(), direction(), 1, &sample()).unwrap();
         let last = sealed.len() - 1;
         sealed[last] ^= 0x01;
-        assert!(open(&key, session(), &sealed).is_err());
+        assert!(open(&key, session(), direction(), &sealed).is_err());
     }
 
     #[test]
     fn rejects_tampered_sequence_number() {
         let key = SharedKey::generate().unwrap();
-        let mut sealed = seal(&key, session(), 1, &sample()).unwrap();
+        let mut sealed = seal(&key, session(), direction(), 1, &sample()).unwrap();
         sealed[0] ^= 0xFF; // seq is authenticated, so this must fail the tag
-        assert!(open(&key, session(), &sealed).is_err());
+        assert!(open(&key, session(), direction(), &sealed).is_err());
     }
 
     #[test]
     fn rejects_short_frame() {
         let key = SharedKey::generate().unwrap();
-        assert!(open(&key, session(), &[]).is_err());
-        assert!(open(&key, session(), &[0u8; 8]).is_err());
-        assert!(open(&key, session(), &[0u8; MIN_FRAME - 1]).is_err());
+        assert!(open(&key, session(), direction(), &[]).is_err());
+        assert!(open(&key, session(), direction(), &[0u8; 8]).is_err());
+        assert!(open(&key, session(), direction(), &[0u8; MIN_FRAME - 1]).is_err());
     }
 
     #[test]
     fn nonces_differ_between_messages() {
         let key = SharedKey::generate().unwrap();
-        let a = seal(&key, session(), 1, &sample()).unwrap();
-        let b = seal(&key, session(), 1, &sample()).unwrap();
+        let a = seal(&key, session(), direction(), 1, &sample()).unwrap();
+        let b = seal(&key, session(), direction(), 1, &sample()).unwrap();
         // Compare the nonce field itself (bytes 8..32), not the whole
         // frame: comparing whole frames would still pass on a fixed-nonce
         // implementation that varied some other byte.
@@ -224,7 +294,7 @@ mod tests {
     fn ciphertext_does_not_contain_the_plaintext() {
         let key = SharedKey::generate().unwrap();
         let plaintext = encode(&sample()).expect("encode");
-        let sealed = seal(&key, session(), 1, &sample()).unwrap();
+        let sealed = seal(&key, session(), direction(), 1, &sample()).unwrap();
         assert!(
             !sealed
                 .windows(plaintext.len())
@@ -241,9 +311,25 @@ mod tests {
         // under a different session, even with the correct shared key and
         // a fresh replay window.
         let key = SharedKey::generate().unwrap();
-        let sealed = seal(&key, SessionId([1u8; 32]), 1, &sample()).unwrap();
+        let sealed = seal(&key, SessionId([1u8; 32]), direction(), 1, &sample()).unwrap();
         assert!(matches!(
-            open(&key, SessionId([2u8; 32]), &sealed),
+            open(&key, SessionId([2u8; 32]), direction(), &sealed),
+            Err(CryptoError::Authentication)
+        ));
+    }
+
+    #[test]
+    fn rejects_a_frame_sealed_under_the_other_direction() {
+        // This is FINDING 2: the session and the replay window bind a
+        // connection, but not which side sent a frame. Without direction
+        // in the AAD, a frame sealed as ClientToServer authenticates just
+        // as well when opened expecting ServerToClient, which is exactly
+        // what lets a reflected frame (our own outbound heartbeat, echoed
+        // back to us) pass as genuine inbound traffic.
+        let key = SharedKey::generate().unwrap();
+        let sealed = seal(&key, session(), Direction::ClientToServer, 1, &sample()).unwrap();
+        assert!(matches!(
+            open(&key, session(), Direction::ServerToClient, &sealed),
             Err(CryptoError::Authentication)
         ));
     }

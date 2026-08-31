@@ -31,6 +31,11 @@ Input is encrypted and authenticated with XChaCha20-Poly1305 under a
 pre-shared key, with replay protection. hop is designed for a local
 network and should not be exposed to the internet.
 
+Each connection derives a session identifier used only as authenticated
+data, not an encryption key, so encryption always uses the same static
+pre-shared key and there is no forward secrecy: anyone who obtains that
+key can decrypt every session ever recorded on the wire, past or future.
+
 That replay protection currently covers a single connection only. Frames
 are bound to a session, but until the handshake exists both peers use
 `SessionId::ZERO`, so traffic recorded from one connection would still be

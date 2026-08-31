@@ -39,6 +39,21 @@ use tokio::io::{AsyncRead, AsyncWrite};
 /// and a recording made under one session cannot be replayed into
 /// another. The order is fixed by role rather than sorted, so a reflected
 /// handshake produces a different session than the genuine one.
+///
+/// Despite the name "per session key derivation" this module is documented
+/// under, this function derives a session IDENTIFIER, not an encryption
+/// key. It is used only as authenticated data (alongside the direction; see
+/// `hop_proto::crypto::Direction`), so a captured frame cannot be replayed
+/// into a different connection. The AEAD key itself never changes: every
+/// session, past and future, is encrypted under the same static pre-shared
+/// key handed to `SharedKey::from_bytes` or produced by
+/// `SharedKey::generate`. There is therefore NO forward secrecy: anyone who
+/// obtains that pre-shared key, now or later, can decrypt every session
+/// ever recorded on the wire, not just the ones that happen after the
+/// compromise. This is an acceptable tradeoff for what session binding is
+/// actually for here (stopping replay across connections), not an
+/// oversight, but callers must not read "per session key derivation" as a
+/// claim of forward secrecy, because it is not one.
 pub fn derive_session(client_nonce: &[u8; 32], server_nonce: &[u8; 32]) -> SessionId {
     let mut hasher = Sha256::new();
     hasher.update(b"hop session v1");
@@ -56,10 +71,36 @@ pub enum HandshakeError {
     Transport(#[from] TransportError),
     #[error("peer speaks protocol version {theirs}, we speak {ours}")]
     VersionMismatch { ours: u16, theirs: u16 },
-    #[error("peer sent {0:?} instead of a handshake")]
-    Unexpected(Message),
+    /// A non-`Handshake` frame arrived where a handshake was expected.
+    ///
+    /// Carries only the message's kind, never the message itself. A
+    /// desynchronized or hostile peer's first frame could be a
+    /// `Message::Key`, and this tool exists to forward passwords: if the
+    /// message were carried here, formatting this error (which any
+    /// supervisor does, straight into a log) would write the user's
+    /// keystroke to disk. `SharedKey`'s manual `Debug` impl in
+    /// `hop_proto::crypto` exists for the same reason.
+    #[error("peer sent {0} instead of a handshake")]
+    Unexpected(&'static str),
     #[error("system RNG unavailable")]
     Random,
+}
+
+/// Name a message's kind without exposing anything it carries. Used only
+/// to populate [`HandshakeError::Unexpected`]; see that variant's doc
+/// comment for why the message itself must never be formatted.
+fn message_kind(message: &Message) -> &'static str {
+    match message {
+        Message::Handshake { .. } => "Handshake",
+        Message::MouseMove { .. } => "MouseMove",
+        Message::MouseButton { .. } => "MouseButton",
+        Message::Scroll { .. } => "Scroll",
+        Message::Key { .. } => "Key",
+        Message::ReleaseAllKeys => "ReleaseAllKeys",
+        Message::Heartbeat => "Heartbeat",
+        Message::Release => "Release",
+        Message::Unknown => "Unknown",
+    }
 }
 
 /// Read one message and require it to be a `Handshake` at our protocol
@@ -87,7 +128,7 @@ async fn recv_handshake<R: AsyncRead + Unpin>(
             }
             Ok((nonce, peer_id))
         }
-        other => Err(HandshakeError::Unexpected(other)),
+        other => Err(HandshakeError::Unexpected(message_kind(&other))),
     }
 }
 
@@ -169,7 +210,7 @@ pub async fn server_handshake<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 mod tests {
     use super::*;
     use crate::split;
-    use hop_proto::SharedKey;
+    use hop_proto::{Direction, SharedKey};
     use tokio::io::duplex;
 
     #[test]
@@ -209,8 +250,8 @@ mod tests {
     async fn client_and_server_agree_on_a_session() {
         let (a, b) = duplex(65536);
         let key = SharedKey::from_bytes([3u8; 32]);
-        let (mut sr, mut sw) = split(a, key.clone(), SessionId::ZERO);
-        let (mut cr, mut cw) = split(b, key, SessionId::ZERO);
+        let (mut sr, mut sw) = split(a, key.clone(), SessionId::ZERO, Direction::ServerToClient);
+        let (mut cr, mut cw) = split(b, key, SessionId::ZERO, Direction::ClientToServer);
 
         let server = tokio::spawn(async move { server_handshake(&mut sr, &mut sw).await });
         let client = client_handshake(&mut cr, &mut cw, "pc")
@@ -229,8 +270,8 @@ mod tests {
         // before any input is processed, not silently tolerated.
         let (a, b) = duplex(65536);
         let key = SharedKey::from_bytes([3u8; 32]);
-        let (mut sr, _sw) = split(a, key.clone(), SessionId::ZERO);
-        let (_cr, mut cw) = split(b, key, SessionId::ZERO);
+        let (mut sr, _sw) = split(a, key.clone(), SessionId::ZERO, Direction::ServerToClient);
+        let (_cr, mut cw) = split(b, key, SessionId::ZERO, Direction::ClientToServer);
 
         cw.send(&Message::Handshake {
             version: PROTOCOL_VERSION + 1,
@@ -248,6 +289,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_unexpected_keystroke_never_reaches_the_formatted_error() {
+        // A desynchronized or hostile peer's first frame could be a
+        // Message::Key, and any supervisor logs a handshake failure by
+        // formatting this error. The keystroke's usage code must never
+        // appear in that formatted string, only the message's kind.
+        let (a, b) = duplex(65536);
+        let key = SharedKey::from_bytes([3u8; 32]);
+        let (mut sr, _sw) = split(a, key.clone(), SessionId::ZERO, Direction::ServerToClient);
+        let (_cr, mut cw) = split(b, key, SessionId::ZERO, Direction::ClientToServer);
+
+        cw.send(&Message::Key {
+            usage: hop_proto::Usage::C,
+            pressed: true,
+        })
+        .await
+        .unwrap();
+
+        let error = server_handshake_read_only(&mut sr)
+            .await
+            .expect_err("a Key message is not a handshake");
+        let rendered = error.to_string();
+
+        assert!(
+            !rendered.contains("Usage"),
+            "rendered error must not name the usage field: {rendered}"
+        );
+        assert!(
+            !rendered.contains('6'),
+            "rendered error must not contain Usage::C's value: {rendered}"
+        );
+        assert!(
+            !rendered.contains("pressed"),
+            "rendered error must not contain the message's fields: {rendered}"
+        );
+        assert!(
+            rendered.contains("Key"),
+            "rendered error should still name the message kind: {rendered}"
+        );
+    }
+
+    #[tokio::test]
     async fn input_after_the_handshake_is_bound_to_the_derived_session_not_zero() {
         // Exercises the full resolution to the split/handshake
         // chicken-and-egg problem described in the module doc comment: the
@@ -257,8 +339,8 @@ mod tests {
         // under ZERO; only the two Handshake messages are.
         let (a, b) = duplex(65536);
         let key = SharedKey::from_bytes([4u8; 32]);
-        let (mut sr, mut sw) = split(a, key.clone(), SessionId::ZERO);
-        let (mut cr, mut cw) = split(b, key.clone(), SessionId::ZERO);
+        let (mut sr, mut sw) = split(a, key.clone(), SessionId::ZERO, Direction::ServerToClient);
+        let (mut cr, mut cw) = split(b, key.clone(), SessionId::ZERO, Direction::ClientToServer);
 
         let server_key = key.clone();
         let server = tokio::spawn(async move {
@@ -266,7 +348,7 @@ mod tests {
                 .await
                 .expect("server handshake");
             let stream = sr.into_inner().unsplit(sw.into_inner());
-            let (mut r, mut w) = split(stream, server_key, session);
+            let (mut r, mut w) = split(stream, server_key, session, Direction::ServerToClient);
             let received = r.recv().await.expect("recv input");
             w.send(&Message::Heartbeat).await.expect("send input");
             received
@@ -276,7 +358,7 @@ mod tests {
             .await
             .expect("client handshake");
         let stream = cr.into_inner().unsplit(cw.into_inner());
-        let (mut r, mut w) = split(stream, key, session);
+        let (mut r, mut w) = split(stream, key, session, Direction::ClientToServer);
         let sent = Message::Key {
             usage: hop_proto::Usage::C,
             pressed: true,

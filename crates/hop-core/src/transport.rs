@@ -1,4 +1,4 @@
-use hop_proto::{open, seal, Message, ReplayWindow, SessionId, SharedKey};
+use hop_proto::{open, seal, Direction, Message, ReplayWindow, SessionId, SharedKey};
 use tokio::io::{
     split as io_split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf,
 };
@@ -38,7 +38,9 @@ fn validated_len(prefix: [u8; 4]) -> Result<usize, TransportError> {
 }
 
 /// The receiving half of a split transport. Owns the replay window for its
-/// direction.
+/// direction, and requires every inbound frame to have been sealed under
+/// the OPPOSITE direction from this side's writer (see [`Direction`] and
+/// [`split`]).
 ///
 /// Generic over the stream so tests can drive it through an in-memory
 /// duplex pipe rather than a real socket.
@@ -46,11 +48,13 @@ pub struct TransportReader<R> {
     stream: R,
     key: SharedKey,
     session: SessionId,
+    direction: Direction,
     replay: ReplayWindow,
 }
 
 /// The sending half of a split transport. Owns the outbound sequence
-/// counter for its direction.
+/// counter for its direction, and seals every frame under this side's own
+/// direction (see [`Direction`] and [`split`]).
 ///
 /// Generic over the stream so tests can drive it through an in-memory
 /// duplex pipe rather than a real socket.
@@ -58,6 +62,7 @@ pub struct TransportWriter<W> {
     stream: W,
     key: SharedKey,
     session: SessionId,
+    direction: Direction,
     send_seq: u64,
 }
 
@@ -70,6 +75,16 @@ pub struct TransportWriter<W> {
 /// another (or on the same task interleaved with a heartbeat timer),
 /// which a single `&mut self` type could never allow.
 ///
+/// `direction` is the direction THIS side's writer sends in: pass
+/// `Direction::ClientToServer` when splitting on the client, and
+/// `Direction::ServerToClient` when splitting on the server. The returned
+/// `TransportWriter` seals under `direction`; the returned
+/// `TransportReader` opens expecting `direction.opposite()`. That is what
+/// stops a reflected frame (this side's own outbound frame, echoed back to
+/// it, whether by an attacker or a plain network loop) from authenticating
+/// as inbound: it was sealed under `direction`, but this side's reader
+/// requires the opposite.
+///
 /// Dropping only one half does NOT close the underlying connection: the
 /// other half still holds its share of the stream, so no EOF is ever
 /// delivered and a `recv` on the surviving half blocks forever. Tearing a
@@ -81,6 +96,7 @@ pub fn split<S: AsyncRead + AsyncWrite>(
     stream: S,
     key: SharedKey,
     session: SessionId,
+    direction: Direction,
 ) -> (TransportReader<ReadHalf<S>>, TransportWriter<WriteHalf<S>>) {
     let (r, w) = io_split(stream);
     (
@@ -88,12 +104,14 @@ pub fn split<S: AsyncRead + AsyncWrite>(
             stream: r,
             key: key.clone(),
             session,
+            direction: direction.opposite(),
             replay: ReplayWindow::new(),
         },
         TransportWriter {
             stream: w,
             key,
             session,
+            direction,
             send_seq: 0,
         },
     )
@@ -138,8 +156,14 @@ impl<W: AsyncWrite + Unpin> TransportWriter<W> {
         // wrapping u64 takes roughly 5.8e8 years. The counter is 64 bit
         // specifically so this never matters.
         self.send_seq = self.send_seq.wrapping_add(1);
-        let frame = seal(&self.key, self.session, self.send_seq, message)
-            .map_err(|_| TransportError::Crypto)?;
+        let frame = seal(
+            &self.key,
+            self.session,
+            self.direction,
+            self.send_seq,
+            message,
+        )
+        .map_err(|_| TransportError::Crypto)?;
         if frame.len() > MAX_FRAME {
             return Err(TransportError::FrameTooLarge);
         }
@@ -183,8 +207,8 @@ impl<R: AsyncRead + Unpin> TransportReader<R> {
             Err(e) => return Err(TransportError::Io(e)),
         }
 
-        let (seq, message) =
-            open(&self.key, self.session, &frame).map_err(|_| TransportError::Crypto)?;
+        let (seq, message) = open(&self.key, self.session, self.direction, &frame)
+            .map_err(|_| TransportError::Crypto)?;
         if !self.replay.accept(seq) {
             return Err(TransportError::Replay);
         }
@@ -198,7 +222,7 @@ mod tests {
     use hop_proto::{Message, SessionId, SharedKey, Usage};
     use std::time::Duration;
     use tokio::io::duplex;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn key() -> SharedKey {
         SharedKey::from_bytes([7u8; 32])
@@ -220,11 +244,23 @@ mod tests {
             .expect("recv must not hang")
     }
 
+    /// The direction passed to `split` on the client side of a pair, used
+    /// throughout these tests so the client/server roles stay explicit at
+    /// every call site.
+    fn client_dir() -> Direction {
+        Direction::ClientToServer
+    }
+
+    /// The direction passed to `split` on the server side of a pair.
+    fn server_dir() -> Direction {
+        Direction::ServerToClient
+    }
+
     #[tokio::test]
     async fn sends_and_receives_a_message() {
         let (a, b) = duplex(4096);
-        let (_ar, mut client) = split(a, key(), session());
-        let (mut server, _bw) = split(b, key(), session());
+        let (_ar, mut client) = split(a, key(), session(), client_dir());
+        let (mut server, _bw) = split(b, key(), session(), server_dir());
 
         let sent = Message::Key {
             usage: Usage::C,
@@ -237,8 +273,8 @@ mod tests {
     #[tokio::test]
     async fn preserves_order_across_many_messages() {
         let (a, b) = duplex(65536);
-        let (_ar, mut client) = split(a, key(), session());
-        let (mut server, _bw) = split(b, key(), session());
+        let (_ar, mut client) = split(a, key(), session(), client_dir());
+        let (mut server, _bw) = split(b, key(), session(), server_dir());
 
         for i in 0..50 {
             client
@@ -257,8 +293,8 @@ mod tests {
     #[tokio::test]
     async fn rejects_a_peer_with_the_wrong_key() {
         let (a, b) = duplex(4096);
-        let (_ar, mut client) = split(a, SharedKey::from_bytes([1u8; 32]), session());
-        let (mut server, _bw) = split(b, SharedKey::from_bytes([2u8; 32]), session());
+        let (_ar, mut client) = split(a, SharedKey::from_bytes([1u8; 32]), session(), client_dir());
+        let (mut server, _bw) = split(b, SharedKey::from_bytes([2u8; 32]), session(), server_dir());
 
         client.send(&Message::Heartbeat).await.unwrap();
         assert!(matches!(
@@ -276,8 +312,8 @@ mod tests {
         // rejects frames sealed under the earlier one even though the
         // shared key and every AEAD tag would otherwise be valid.
         let (a, b) = duplex(4096);
-        let (_ar, mut client) = split(a, key(), SessionId([1u8; 32]));
-        let (mut server, _bw) = split(b, key(), SessionId([2u8; 32]));
+        let (_ar, mut client) = split(a, key(), SessionId([1u8; 32]), client_dir());
+        let (mut server, _bw) = split(b, key(), SessionId([2u8; 32]), server_dir());
 
         client.send(&Message::Heartbeat).await.unwrap();
         assert!(matches!(
@@ -287,14 +323,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_reflected_frame_is_rejected() {
+        // This is FINDING 2: the session and the replay window bind a
+        // connection, but not which side sent a frame. Before binding the
+        // direction, a frame this side sealed and sent out could be
+        // echoed straight back to this side's own reader (a network loop,
+        // or an attacker who just reflects what it sees) and would
+        // authenticate as genuine inbound traffic, since it was new to
+        // that reader's replay window. Binding the direction closes this:
+        // the reflected frame was sealed under this side's OWN direction,
+        // but this side's reader requires the opposite.
+        let (a, mut peer) = duplex(4096);
+        let (mut reader, mut writer) = split(a, key(), session(), client_dir());
+
+        writer.send(&Message::Heartbeat).await.expect("send");
+
+        // Read the exact bytes `writer` just put on the wire, then feed
+        // them straight back into this side's own `reader` (`peer` is the
+        // far end of the same duplex `a` was split from, so writing into
+        // it delivers to `reader`), exactly as an echo would.
+        let mut len_bytes = [0u8; 4];
+        peer.read_exact(&mut len_bytes).await.expect("read len");
+        let len = u32::from_be_bytes(len_bytes) as usize;
+        let mut frame = vec![0u8; len];
+        peer.read_exact(&mut frame).await.expect("read frame");
+
+        peer.write_all(&len_bytes).await.expect("write len");
+        peer.write_all(&frame).await.expect("write frame");
+        peer.flush().await.expect("flush");
+
+        let result = recv_or_timeout(&mut reader).await;
+        assert!(
+            matches!(result, Err(TransportError::Crypto)),
+            "a reflected frame must fail authentication, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn reports_closure_when_the_peer_goes_away() {
         // Dropping only the writer half leaves the reader half still
         // holding its share of the duplex, so the stream never sees EOF.
         // Tearing down a connection means dropping BOTH halves, which is
         // exactly the semantic `split`'s doc comment now calls out.
         let (a, b) = duplex(4096);
-        let (a_reader, a_writer) = split(a, key(), session());
-        let (mut server, _bw) = split(b, key(), session());
+        let (a_reader, a_writer) = split(a, key(), session(), client_dir());
+        let (mut server, _bw) = split(b, key(), session(), server_dir());
         drop(a_reader);
         drop(a_writer);
         assert!(matches!(
@@ -308,10 +381,19 @@ mod tests {
         // Capturing a frame and sending it twice must not deliver it twice,
         // or an attacker could re-inject a captured keystroke.
         let (mut a, b) = duplex(4096);
-        let (mut receiver, _bw) = split(b, key(), session());
+        let (mut receiver, _bw) = split(b, key(), session(), server_dir());
 
-        // Build one frame by hand so it can be sent twice verbatim.
-        let frame = hop_proto::seal(&key(), session(), 1, &Message::Heartbeat).unwrap();
+        // Build one frame by hand so it can be sent twice verbatim. The
+        // receiver was split as the server side, so it expects inbound
+        // frames sealed as ClientToServer.
+        let frame = hop_proto::seal(
+            &key(),
+            session(),
+            Direction::ClientToServer,
+            1,
+            &Message::Heartbeat,
+        )
+        .unwrap();
         let len = u32::try_from(frame.len()).unwrap();
         for _ in 0..2 {
             a.write_all(&len.to_be_bytes()).await.unwrap();
@@ -333,7 +415,7 @@ mod tests {
     async fn refuses_an_oversized_declared_length() {
         // A peer claiming a huge frame must be refused before we allocate.
         let (mut a, b) = duplex(4096);
-        let (mut receiver, _bw) = split(b, key(), session());
+        let (mut receiver, _bw) = split(b, key(), session(), server_dir());
         a.write_all(&u32::MAX.to_be_bytes()).await.unwrap();
         a.flush().await.unwrap();
         assert!(matches!(
@@ -348,7 +430,7 @@ mod tests {
         // frame authenticates. Otherwise one forged frame claiming a huge
         // seq pins the window and permanently rejects genuine traffic.
         let (mut a, b) = duplex(4096);
-        let (mut receiver, _bw) = split(b, key(), session());
+        let (mut receiver, _bw) = split(b, key(), session(), server_dir());
 
         let mut forged = Vec::new();
         forged.extend_from_slice(&u64::MAX.to_be_bytes());
@@ -363,7 +445,14 @@ mod tests {
         ));
 
         // A genuine frame must still be accepted afterwards.
-        let real = hop_proto::seal(&key(), session(), 1, &Message::Heartbeat).unwrap();
+        let real = hop_proto::seal(
+            &key(),
+            session(),
+            Direction::ClientToServer,
+            1,
+            &Message::Heartbeat,
+        )
+        .unwrap();
         let len = u32::try_from(real.len()).unwrap();
         a.write_all(&len.to_be_bytes()).await.unwrap();
         a.write_all(&real).await.unwrap();
@@ -380,9 +469,16 @@ mod tests {
         // limiting, not a graceful shutdown, so it must not be conflated
         // with `Closed`.
         let (mut a, b) = duplex(4096);
-        let (mut receiver, _bw) = split(b, key(), session());
+        let (mut receiver, _bw) = split(b, key(), session(), server_dir());
 
-        let frame = hop_proto::seal(&key(), session(), 1, &Message::Heartbeat).unwrap();
+        let frame = hop_proto::seal(
+            &key(),
+            session(),
+            Direction::ClientToServer,
+            1,
+            &Message::Heartbeat,
+        )
+        .unwrap();
         let len = u32::try_from(frame.len()).unwrap();
         a.write_all(&len.to_be_bytes()).await.unwrap();
         a.write_all(&frame[..frame.len() - 1]).await.unwrap();
@@ -401,7 +497,7 @@ mod tests {
         // arriving (a clean close between frames) is different from a
         // partial frame arriving (a truncation).
         let (a, b) = duplex(4096);
-        let (mut receiver, _bw) = split(b, key(), session());
+        let (mut receiver, _bw) = split(b, key(), session(), server_dir());
         drop(a);
         assert!(matches!(
             recv_or_timeout(&mut receiver).await,
@@ -415,8 +511,8 @@ mod tests {
         // heartbeat timer fires on the same connection. That is impossible
         // with a single &mut self type, which is why this split exists.
         let (a, b) = duplex(65536);
-        let (mut ar, mut aw) = split(a, key(), SessionId::ZERO);
-        let (mut br, mut bw) = split(b, key(), SessionId::ZERO);
+        let (mut ar, mut aw) = split(a, key(), SessionId::ZERO, client_dir());
+        let (mut br, mut bw) = split(b, key(), SessionId::ZERO, server_dir());
 
         let reader = tokio::spawn(async move {
             let first = recv_or_timeout(&mut ar).await.expect("recv");
@@ -444,8 +540,8 @@ mod tests {
         // Both sides start at seq 1. If they shared a replay window, the
         // second direction's first frame would look like a replay.
         let (a, b) = duplex(65536);
-        let (mut ar, mut aw) = split(a, key(), SessionId::ZERO);
-        let (mut br, mut bw) = split(b, key(), SessionId::ZERO);
+        let (mut ar, mut aw) = split(a, key(), SessionId::ZERO, client_dir());
+        let (mut br, mut bw) = split(b, key(), SessionId::ZERO, server_dir());
 
         aw.send(&Message::Heartbeat).await.unwrap();
         bw.send(&Message::Heartbeat).await.unwrap();
@@ -479,7 +575,8 @@ mod tests {
             Message::Release,
         ];
         for message in cases {
-            let frame = hop_proto::seal(&key(), session(), 1, &message).unwrap();
+            let frame =
+                hop_proto::seal(&key(), session(), Direction::ClientToServer, 1, &message).unwrap();
             assert!(
                 frame.len() < MAX_FRAME,
                 "{message:?} sealed to {} bytes, which is not under MAX_FRAME",

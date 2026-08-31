@@ -14,7 +14,7 @@ use crate::{
     client_handshake, message_to_event, Backoff, HandshakeError, HeldKeys, Injector, InputEvent,
     Liveness, TransportError, TransportReader, TransportWriter,
 };
-use hop_proto::{Message, SessionId, SharedKey};
+use hop_proto::{Direction, Message, SessionId, SharedKey};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
@@ -90,24 +90,6 @@ impl Default for ReconnectPolicy {
     }
 }
 
-/// A safe-to-log description of a handshake failure that never includes
-/// message contents.
-///
-/// `HandshakeError::Unexpected` carries the whole offending `Message`. If a
-/// desynchronized peer's first frame happens to be a `Message::Key`,
-/// formatting the error via its `Display` impl (which debug-prints that
-/// message) would write the user's keystroke straight into the log. This
-/// tool forwards passwords; that must never happen, so this function names
-/// the failure kind instead of ever touching that payload.
-fn describe_handshake_error(error: &HandshakeError) -> String {
-    match error {
-        HandshakeError::Unexpected(_) => {
-            "peer sent an unexpected message instead of a handshake".to_string()
-        }
-        other => other.to_string(),
-    }
-}
-
 /// Run the client handshake over `stream`, then move both transport halves
 /// onto the session it derives before returning them.
 ///
@@ -133,10 +115,19 @@ async fn handshake_and_rekey<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let (mut zero_reader, mut zero_writer) = crate::split(stream, key.clone(), SessionId::ZERO);
+    // This function always runs the CLIENT side of the handshake (it calls
+    // client_handshake below), so both splits use Direction::ClientToServer:
+    // this side's writer always seals as the client, and its reader always
+    // expects the server's opposite direction.
+    let (mut zero_reader, mut zero_writer) = crate::split(
+        stream,
+        key.clone(),
+        SessionId::ZERO,
+        Direction::ClientToServer,
+    );
     let session = client_handshake(&mut zero_reader, &mut zero_writer, peer_id).await?;
     let stream = zero_reader.into_inner().unsplit(zero_writer.into_inner());
-    let (reader, writer) = crate::split(stream, key.clone(), session);
+    let (reader, writer) = crate::split(stream, key.clone(), session, Direction::ClientToServer);
     Ok((reader, writer, session))
 }
 
@@ -259,7 +250,11 @@ impl ClientSupervisor {
             match handshake_and_rekey(stream, &self.key, &self.peer_id).await {
                 Ok(v) => v,
                 Err(error) => {
-                    tracing::warn!(reason = %describe_handshake_error(&error), "handshake failed");
+                    // Safe to log directly: HandshakeError::Unexpected now
+                    // carries only the offending message's kind (see its
+                    // doc comment), never the message itself, so this can
+                    // never write a keystroke to the log.
+                    tracing::warn!(%error, "handshake failed");
                     return;
                 }
             };
@@ -446,12 +441,18 @@ mod tests {
 
         let server_key = key.clone();
         let server = tokio::spawn(async move {
-            let (mut zr, mut zw) = crate::split(server_io, server_key.clone(), SessionId::ZERO);
+            let (mut zr, mut zw) = crate::split(
+                server_io,
+                server_key.clone(),
+                SessionId::ZERO,
+                Direction::ServerToClient,
+            );
             let (session, _peer_id) = crate::server_handshake(&mut zr, &mut zw)
                 .await
                 .expect("server handshake");
             let stream = zr.into_inner().unsplit(zw.into_inner());
-            let (real_reader, real_writer) = crate::split(stream, server_key, session);
+            let (real_reader, real_writer) =
+                crate::split(stream, server_key, session, Direction::ServerToClient);
             (real_reader, real_writer, session)
         });
 
@@ -522,12 +523,17 @@ mod tests {
         let server_key = key.clone();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let (mut zr, mut zw) = crate::split(stream, server_key.clone(), SessionId::ZERO);
+            let (mut zr, mut zw) = crate::split(
+                stream,
+                server_key.clone(),
+                SessionId::ZERO,
+                Direction::ServerToClient,
+            );
             let (session, _peer_id) = crate::server_handshake(&mut zr, &mut zw)
                 .await
                 .expect("server handshake");
             let stream = zr.into_inner().unsplit(zw.into_inner());
-            let (_r, mut w) = crate::split(stream, server_key, session);
+            let (_r, mut w) = crate::split(stream, server_key, session, Direction::ServerToClient);
             w.send(&Message::Key {
                 usage: Usage::LEFT_CTRL,
                 pressed: true,

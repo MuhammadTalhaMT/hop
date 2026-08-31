@@ -2,7 +2,7 @@ use hop_core::{
     pump_client, pump_server, send_release_all, split, Control, FakeCapturer, FakeInjector,
     HeldKeys, InputEvent, RemapTable,
 };
-use hop_proto::{Button, Message, SessionId, SharedKey, Usage};
+use hop_proto::{Button, Direction, Message, SessionId, SharedKey, Usage};
 use std::time::Duration;
 use tokio::io::duplex;
 use tokio::time::timeout;
@@ -21,6 +21,17 @@ fn session() -> SessionId {
     SessionId([9u8; 32])
 }
 
+/// Direction passed to `split` for the server side's transport half in
+/// these tests: the server always writes and the client always reads.
+fn server_dir() -> Direction {
+    Direction::ServerToClient
+}
+
+/// Direction passed to `split` for the client side's transport half.
+fn client_dir() -> Direction {
+    Direction::ClientToServer
+}
+
 async fn pump_client_or_timeout<R>(
     transport: &mut hop_core::TransportReader<R>,
     injector: &mut FakeInjector,
@@ -37,8 +48,8 @@ where
 #[tokio::test]
 async fn captured_input_arrives_injected_on_the_far_side() {
     let (a, b) = duplex(65536);
-    let (_a_reader, mut server_side) = split(a, key(), session());
-    let (mut client_side, _b_writer) = split(b, key(), session());
+    let (_a_reader, mut server_side) = split(a, key(), session(), server_dir());
+    let (mut client_side, _b_writer) = split(b, key(), session(), client_dir());
 
     // Every input-carrying InputEvent variant is exercised here so that
     // dropping or mis-mapping any one of them (for example Scroll arriving
@@ -100,8 +111,8 @@ async fn captured_input_arrives_injected_on_the_far_side() {
 #[tokio::test]
 async fn input_before_the_edge_is_not_forwarded() {
     let (a, b) = duplex(65536);
-    let (_a_reader, mut server_side) = split(a, key(), session());
-    let (mut client_side, _b_writer) = split(b, key(), session());
+    let (_a_reader, mut server_side) = split(a, key(), session(), server_dir());
+    let (mut client_side, _b_writer) = split(b, key(), session(), client_dir());
 
     // No EdgeCrossed, so focus stays local and nothing should cross.
     let mut capturer = FakeCapturer::new(vec![InputEvent::Key {
@@ -135,8 +146,8 @@ async fn local_pointer_and_click_activity_does_not_cross_the_wire() {
     // arm of pump_server specifically, since Mouse/Scroll/Button all fall
     // into it rather than the dedicated Key arm.
     let (a, b) = duplex(65536);
-    let (_a_reader, mut server_side) = split(a, key(), session());
-    let (mut client_side, _b_writer) = split(b, key(), session());
+    let (_a_reader, mut server_side) = split(a, key(), session(), server_dir());
+    let (mut client_side, _b_writer) = split(b, key(), session(), client_dir());
 
     let mut capturer = FakeCapturer::new(vec![
         InputEvent::Mouse { dx: 3, dy: 4 },
@@ -179,8 +190,8 @@ async fn explicit_release_clears_keys_held_on_the_peer() {
     // holding nothing. This is the stuck-modifier guarantee verified end to
     // end rather than on Control in isolation.
     let (a, b) = duplex(65536);
-    let (_a_reader, mut server_side) = split(a, key(), session());
-    let (mut client_side, _b_writer) = split(b, key(), session());
+    let (_a_reader, mut server_side) = split(a, key(), session(), server_dir());
+    let (mut client_side, _b_writer) = split(b, key(), session(), client_dir());
 
     let mut capturer = FakeCapturer::new(vec![
         InputEvent::EdgeCrossed,
@@ -251,8 +262,18 @@ async fn a_peer_with_the_wrong_key_gets_nothing() {
     // Sharing a network is not sharing trust: a machine that does not hold
     // the key must not be able to read a single keystroke.
     let (a, b) = duplex(65536);
-    let (_a_reader, mut server_side) = split(a, SharedKey::from_bytes([42u8; 32]), session());
-    let (mut eavesdropper, _b_writer) = split(b, SharedKey::from_bytes([43u8; 32]), session());
+    let (_a_reader, mut server_side) = split(
+        a,
+        SharedKey::from_bytes([42u8; 32]),
+        session(),
+        server_dir(),
+    );
+    let (mut eavesdropper, _b_writer) = split(
+        b,
+        SharedKey::from_bytes([43u8; 32]),
+        session(),
+        client_dir(),
+    );
 
     let mut capturer = FakeCapturer::new(vec![
         InputEvent::EdgeCrossed,
