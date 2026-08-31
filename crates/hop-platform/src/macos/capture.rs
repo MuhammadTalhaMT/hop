@@ -197,33 +197,6 @@ fn scale_continuous_scroll(points: i32, remainder: f64) -> (i32, f64) {
     (whole as i32, total - whole)
 }
 
-/// Pick the point to physically park the cursor at while focus is on the
-/// peer: the desktop corner furthest from the edge it crossed through.
-///
-/// `cursor::hide_cursor` cannot be relied on (macOS only honours
-/// `CGDisplayHideCursor` for the foreground application, and hop is a
-/// background process; registering as an accessory application does not
-/// help, both tested on macOS 27), so the cursor stays visible. Putting
-/// it in the opposite corner keeps a frozen arrow out of the user's
-/// eyeline instead of leaving it hovering at the edge they just used.
-///
-/// Insetting by one pixel keeps it inside the desktop, since warping to
-/// exactly `max_x`/`max_y` can land on a coordinate no display owns.
-fn stash_corner(edge: Edge, bounds: cursor::Bounds) -> (f64, f64) {
-    let inset = 1.0;
-    let left = bounds.min_x + inset;
-    let right = bounds.max_x - inset;
-    let top = bounds.min_y + inset;
-    let bottom = bounds.max_y - inset;
-    match edge {
-        // Crossed off the top, so park at the bottom, and vice versa.
-        Edge::Top => (right, bottom),
-        Edge::Bottom => (right, top),
-        Edge::Left => (right, bottom),
-        Edge::Right => (left, bottom),
-    }
-}
-
 /// Owns the state needed to safely hide and pin the real cursor while
 /// focus is on the peer, and to always be able to give it back.
 ///
@@ -235,24 +208,12 @@ fn stash_corner(edge: Edge, bounds: cursor::Bounds) -> (f64, f64) {
 /// fact) and from `MacCapturer`'s `Drop`.
 struct CursorPark {
     origin: Mutex<Option<(f64, f64)>>,
-    /// Where the real cursor is physically parked while focus is remote.
-    ///
-    /// `cursor::hide_cursor` is a no-op for hop: macOS only honours
-    /// `CGDisplayHideCursor` for the foreground application, and hop is a
-    /// background process. Registering as an accessory application does
-    /// not change that; both were tested on macOS 27 and neither hid the
-    /// cursor. So instead of relying on hiding, the cursor is warped to
-    /// the far corner of the desktop, away from the edge it crossed
-    /// through, where a frozen arrow is out of the user's sight while
-    /// they work on the peer.
-    stash: (f64, f64),
 }
 
 impl CursorPark {
-    fn new(stash: (f64, f64)) -> Self {
+    fn new() -> Self {
         Self {
             origin: Mutex::new(None),
-            stash,
         }
     }
 
@@ -268,9 +229,6 @@ impl CursorPark {
             *origin = Some(at);
             cursor::hide_cursor();
             cursor::enter_parked_state();
-            // Hiding is unreliable here (see `stash`), so move it out of
-            // sight as well.
-            cursor::warp_cursor(self.stash.0, self.stash.1);
         }
     }
 
@@ -278,8 +236,8 @@ impl CursorPark {
     /// is currently parked.
     fn hold(&self) {
         let origin = lock_recovering(&self.origin, "cursor_park_origin");
-        if origin.is_some() {
-            cursor::warp_cursor(self.stash.0, self.stash.1);
+        if let Some((x, y)) = *origin {
+            cursor::warp_cursor(x, y);
         }
     }
 
@@ -419,11 +377,10 @@ impl MacCapturer {
         let (ready_tx, ready_rx) = mpsc::channel();
         let remote = Arc::new(AtomicBool::new(false));
         let remote_for_thread = Arc::clone(&remote);
-        // Park the cursor in the corner furthest from the edge it crosses
-        // through, so a frozen arrow is not sitting in the user's eyeline
-        // while they work on the peer.
-        let bounds = cursor::display_bounds();
-        let park = Arc::new(CursorPark::new(stash_corner(edge, bounds)));
+        // Let the window server hide the cursor even though hop is not the
+        // foreground app. Without this the hide silently does nothing.
+        cursor::allow_background_cursor_hiding();
+        let park = Arc::new(CursorPark::new());
         let park_for_thread = Arc::clone(&park);
         let peer_connected = Arc::new(AtomicBool::new(false));
         let peer_connected_for_thread = Arc::clone(&peer_connected);
@@ -1147,49 +1104,6 @@ fn spawn_watchdog(last_seen: Arc<Mutex<Instant>>, tap_port: Arc<Mutex<Option<usi
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn bounds(min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> cursor::Bounds {
-        cursor::Bounds {
-            min_x,
-            min_y,
-            max_x,
-            max_y,
-        }
-    }
-
-    #[test]
-    fn stash_corner_is_opposite_the_crossing_edge() {
-        // Crossing off the top parks at the bottom, so the frozen cursor is
-        // not left sitting in the user's eyeline at the edge they just used.
-        let b = bounds(0.0, 0.0, 1920.0, 1080.0);
-        let (_, y) = stash_corner(Edge::Top, b);
-        assert!(y > 1000.0, "crossing the top should park near the bottom");
-
-        let (_, y) = stash_corner(Edge::Bottom, b);
-        assert!(y < 100.0, "crossing the bottom should park near the top");
-    }
-
-    #[test]
-    fn stash_corner_stays_inside_the_desktop() {
-        // Warping to exactly max_x or max_y can land on a coordinate no
-        // display owns, so the corner is inset by a pixel.
-        let b = bounds(0.0, 0.0, 1920.0, 1080.0);
-        for edge in [Edge::Top, Edge::Bottom, Edge::Left, Edge::Right] {
-            let (x, y) = stash_corner(edge, b);
-            assert!(x > b.min_x && x < b.max_x, "{edge:?} x out of bounds: {x}");
-            assert!(y > b.min_y && y < b.max_y, "{edge:?} y out of bounds: {y}");
-        }
-    }
-
-    #[test]
-    fn stash_corner_handles_negative_origins() {
-        // A display above or left of the main one pushes the origin
-        // negative; the corner must follow the real desktop, not assume 0.
-        let b = bounds(-1920.0, -1080.0, 1920.0, 1080.0);
-        let (x, y) = stash_corner(Edge::Top, b);
-        assert!(x > -1920.0 && x < 1920.0, "x out of bounds: {x}");
-        assert!(y > -1080.0 && y < 1080.0, "y out of bounds: {y}");
-    }
 
     use hop_proto::Usage;
 

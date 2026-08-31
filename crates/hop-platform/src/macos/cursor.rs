@@ -138,6 +138,54 @@ pub fn warp_cursor(x: f64, y: f64) {
 
 /// Hides the cursor. Pairs with `show_cursor`; see its doc comment for why
 /// callers must never leave a call to this one unmatched.
+/// Connection id for the window server. `CGSSetConnectionProperty` and
+/// `_CGSDefaultConnection` are private CoreGraphics SPI: undocumented by
+/// Apple, but stable for many years and what every tool in this space
+/// relies on to hide the cursor from a background process.
+type CGSConnectionID = u32;
+
+unsafe extern "C" {
+    fn _CGSDefaultConnection() -> CGSConnectionID;
+    fn CGSSetConnectionProperty(
+        cid: CGSConnectionID,
+        target: CGSConnectionID,
+        key: core_foundation::string::CFStringRef,
+        value: *const std::os::raw::c_void,
+    ) -> i32;
+}
+
+/// Ask the window server to let this process hide the cursor even though
+/// it is not the foreground application.
+///
+/// Without this, `CGDisplayHideCursor` silently does nothing for hop:
+/// macOS honours it only for the frontmost app, and hop is a background
+/// process. Verified on macOS 27, where the plain call, and the call
+/// after registering as an accessory application, both left the cursor
+/// visible, while setting this property made it vanish immediately.
+///
+/// Safe to call more than once; it just sets a property.
+pub fn allow_background_cursor_hiding() {
+    use core_foundation::base::TCFType;
+    // SAFETY: `_CGSDefaultConnection` takes no arguments and returns a
+    // connection id by value. `CGSSetConnectionProperty` borrows the key
+    // and value only for the duration of the call, and both outlive it
+    // here, so neither pointer can dangle.
+    unsafe {
+        let cid = _CGSDefaultConnection();
+        let key = core_foundation::string::CFString::new("SetsCursorInBackground");
+        let yes = core_foundation::boolean::CFBoolean::true_value();
+        let err = CGSSetConnectionProperty(
+            cid,
+            cid,
+            key.as_concrete_TypeRef(),
+            yes.as_CFTypeRef() as *const std::os::raw::c_void,
+        );
+        if err != 0 {
+            tracing::warn!(error = err, "could not enable background cursor hiding");
+        }
+    }
+}
+
 pub fn hide_cursor() {
     let _ = CGDisplay::main().hide_cursor();
 }
