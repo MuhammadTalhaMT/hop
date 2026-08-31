@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/hop-proto", "crates/hop-core"]
+members = ["crates/hop-proto", "crates/hop-core", "crates/hop-platform"]
 
 [workspace.package]
 edition = "2021"
@@ -15,3 +15,9 @@ getrandom = "0.4.3"
 thiserror = "2.0.20"
 tracing = "0.1.44"
 tokio = { version = "1.53.1", features = ["net", "io-util", "rt", "macros", "time", "sync"] }
+core-graphics = "0.25.0"
+core-foundation = "0.10.1"
+windows-sys = "0.61.2"
+sha2 = "0.11.0"
+toml = "1.1.4"
+clap = { version = "4.6.6", features = ["derive"] }
