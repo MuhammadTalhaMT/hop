@@ -3,14 +3,69 @@
 //! The schema is defined in the spec's Configuration section
 //! (`docs/superpowers/specs/2026-08-31-hop-design.md`): `role`, `bind`,
 //! `[[peers]]` with `id` and `[peers.remap]`, `[layout]`, `[security]`
-//! with `key_file`, and `[input]` with `panic_hotkey`.
+//! with `key_file`, and `[input]` with `panic_hotkey` and `return_edge`.
+//!
+//! # Example: server (the Mac)
+//!
+//! ```toml
+//! role = "server"
+//! bind = "0.0.0.0:24810"
+//!
+//! [[peers]]
+//! id = "pc"                  # matched against the id the client presents
+//!
+//! [peers.remap]
+//! LeftGui = "LeftCtrl"
+//! RightGui = "RightCtrl"
+//! LeftAlt = "LeftAlt"
+//!
+//! [layout]
+//! top = "pc"                 # the edge input crosses to reach "pc"
+//!
+//! [security]
+//! key_file = "~/.config/hop/key"   # a leading '~' expands to $HOME
+//!
+//! [input]
+//! # Required for role = "server": the emergency escape that returns
+//! # control to this machine if input ever gets stuck on the peer (see
+//! # ConfigError::ServerMissingPanicHotkey below). Without it there is
+//! # no way to recover except killing hop from another machine.
+//! panic_hotkey = "LeftCtrl+LeftAlt+Escape"
+//! ```
+//!
+//! # Example: client (the PC)
+//!
+//! ```toml
+//! role = "client"
+//! id = "pc"
+//! server = "192.168.18.90:24810"   # host:port; discovery by name is not
+//!                                   # implemented yet, so a bare name
+//!                                   # like "talhas-mac" is rejected
+//!
+//! [security]
+//! key_file = "%APPDATA%\\hop\\key"   # '%VAR%' expands on Windows
+//!
+//! [input]
+//! # Required for role = "client": the edge of THIS machine's screen
+//! # that hands focus back to the server. It must be the mirror image
+//! # of the server's own [layout] edge above: the server's `top = "pc"`
+//! # pairs with the client's `return_edge = "bottom"`, `left` pairs
+//! # with `right`. The two settings live in separate config files on
+//! # separate machines, so this pairing cannot be checked at load time;
+//! # get it backwards and focus crosses to the PC but has no automatic
+//! # way back, only the server's panic hotkey.
+//! return_edge = "bottom"
+//! ```
 //!
 //! A config file is user input. Every failure to parse or validate it
 //! returns a `ConfigError` that names the field or key at fault rather
 //! than panicking or silently ignoring the problem. This matters most
 //! for `[peers.remap]` and `[layout]`: a remap line or edge name that is
 //! silently dropped leaves the user with a key or edge that mysteriously
-//! does not work and no way to tell why.
+//! does not work and no way to tell why. The same is true of the two
+//! escape hatches above: a missing `panic_hotkey` on the server or a
+//! missing `return_edge` on the client fails config loading loudly
+//! instead of leaving the user with no way back to the local machine.
 
 use std::collections::HashMap;
 use std::fs;
@@ -61,6 +116,11 @@ pub struct SecurityConfig {
 /// `[input]`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InputConfig {
+    /// Required for `role = "server"` (see
+    /// [`ConfigError::ServerMissingPanicHotkey`]): the emergency escape
+    /// that returns control to this machine if input ever gets stuck on
+    /// the peer. Not required, and never consulted, for
+    /// `role = "client"`: only the server ever captures input.
     pub panic_hotkey: Option<String>,
     /// Client only: which edge of this machine's virtual screen hands
     /// focus back to the server, the mirror image of the server's own
@@ -68,6 +128,13 @@ pub struct InputConfig {
     /// automatic way focus ever returns (see CRITICAL 2 in the
     /// whole-branch review that added it), short of the panic hotkey,
     /// which lives only on the server.
+    ///
+    /// Must be the opposite edge from the server's `[layout]` entry for
+    /// this peer: a server `top = "pc"` pairs with a client
+    /// `return_edge = "bottom"`, and `left` pairs with `right`. The two
+    /// settings live in separate config files on separate machines, so
+    /// this pairing cannot be checked at load time; get it backwards and
+    /// focus crosses over but has no automatic way back.
     pub return_edge: Option<String>,
 }
 
@@ -169,6 +236,23 @@ pub enum ConfigError {
         "[input] return_edge has unknown value '{value}'; expected one of \"top\", \"bottom\", \"left\", \"right\""
     )]
     UnknownReturnEdge { value: String },
+
+    #[error(
+        "a server config must set [input] panic_hotkey. It is the emergency escape that returns control to this machine if input ever gets stuck on the peer. Without it there is no way to recover except killing hop from another machine. Example: panic_hotkey = \"LeftCtrl+LeftAlt+Escape\""
+    )]
+    ServerMissingPanicHotkey,
+
+    #[error("config field '{field}' has an unusable path '{raw}': {reason}")]
+    PathExpansion {
+        field: String,
+        raw: String,
+        reason: String,
+    },
+
+    #[error(
+        "config field 'server' = \"{value}\" is not a valid host:port address ({reason}); hop does not implement discovery by name yet, so 'server' must be a literal address and port, for example \"192.168.1.42:24810\" or \"[::1]:24810\" for an IPv6 literal"
+    )]
+    InvalidServerAddress { value: String, reason: String },
 }
 
 /// The raw shape of the TOML file, before validation. Every field is
@@ -281,14 +365,14 @@ impl Config {
             enabled: raw.discovery.and_then(|d| d.enabled).unwrap_or(false),
         };
 
-        let key_file =
+        let key_file_raw =
             raw.security
                 .and_then(|s| s.key_file)
                 .ok_or_else(|| ConfigError::MissingField {
                     field: "security.key_file".into(),
                 })?;
         let security = SecurityConfig {
-            key_file: PathBuf::from(key_file),
+            key_file: expand_config_path(&key_file_raw, "security.key_file")?,
         };
 
         let input = match raw.input {
@@ -332,13 +416,23 @@ impl Config {
                 if config.peers.is_empty() {
                     return Err(ConfigError::ServerMissingPeers);
                 }
+                if config.input.panic_hotkey.is_none() {
+                    return Err(ConfigError::ServerMissingPanicHotkey);
+                }
             }
             Role::Client => {
                 if config.id.is_none() {
                     return Err(ConfigError::ClientMissingId);
                 }
-                if config.server.is_none() {
-                    return Err(ConfigError::ClientMissingServer);
+                let server = match &config.server {
+                    Some(server) => server,
+                    None => return Err(ConfigError::ClientMissingServer),
+                };
+                if let Err(reason) = validate_server_address(server) {
+                    return Err(ConfigError::InvalidServerAddress {
+                        value: server.clone(),
+                        reason,
+                    });
                 }
                 match config.input.return_edge.as_deref() {
                     None => return Err(ConfigError::ClientMissingReturnEdge),
@@ -394,6 +488,163 @@ impl Config {
     }
 }
 
+/// Expand `~` and, on Windows, `%VAR%` environment references in a
+/// user-supplied path, the way a shell would. Both of the spec's own
+/// example configs use exactly this syntax: `key_file =
+/// "~/.config/hop/key"` on macOS and `key_file = "%APPDATA%\\hop\\key"`
+/// on Windows. Neither means anything to `PathBuf::from` on its own:
+/// without expansion `~` becomes a literal directory named `~` under
+/// the current working directory, and `hop keygen` reports success
+/// while writing the key somewhere the user can never find again.
+///
+/// Expansion happens once, here, so every consumer of a config path
+/// (today, only `[security] key_file`) gets it automatically.
+fn expand_config_path(raw: &str, field: &str) -> Result<PathBuf, ConfigError> {
+    let percent_expanded = expand_percent_vars(raw, field)?;
+    expand_tilde(&percent_expanded, field)
+}
+
+/// Expand a leading `~` to the user's home directory (`HOME`, falling
+/// back to `USERPROFILE` for the rare case this runs on Windows without
+/// `HOME` set). Any other use of `~`, such as `~otheruser/...` naming
+/// another account's home, is rejected rather than silently treated as
+/// a literal path component, since `std::env` alone cannot resolve it.
+fn expand_tilde(raw: &str, field: &str) -> Result<PathBuf, ConfigError> {
+    expand_tilde_with(raw, field, |name| std::env::var(name).ok())
+}
+
+fn expand_tilde_with(
+    raw: &str,
+    field: &str,
+    home_var: impl Fn(&str) -> Option<String>,
+) -> Result<PathBuf, ConfigError> {
+    let Some(rest) = raw.strip_prefix('~') else {
+        return Ok(PathBuf::from(raw));
+    };
+
+    if !(rest.is_empty() || rest.starts_with('/') || rest.starts_with('\\')) {
+        return Err(ConfigError::PathExpansion {
+            field: field.to_string(),
+            raw: raw.to_string(),
+            reason: "\"~name/...\" (another user's home directory) is not supported; write an absolute path instead".to_string(),
+        });
+    }
+
+    let home = home_var("HOME")
+        .or_else(|| home_var("USERPROFILE"))
+        .ok_or_else(|| ConfigError::PathExpansion {
+            field: field.to_string(),
+            raw: raw.to_string(),
+            reason: "could not expand '~': neither HOME nor USERPROFILE is set in the environment"
+                .to_string(),
+        })?;
+
+    let mut path = PathBuf::from(home);
+    let rest = rest.trim_start_matches(['/', '\\']);
+    if !rest.is_empty() {
+        path.push(rest);
+    }
+    Ok(path)
+}
+
+/// Expand Windows `%VAR%` environment references, the way `cmd.exe`
+/// would. Actually reads the environment only when compiled for
+/// Windows; `%VAR%` syntax is a Windows convention, and this project's
+/// only user of it, `role = "client"`, only ever runs on Windows (see
+/// `run::dispatch`). On other platforms it is passed through unchanged
+/// rather than failing to resolve a variable, such as `APPDATA`, that
+/// legitimately does not exist there.
+#[cfg(target_os = "windows")]
+fn expand_percent_vars(raw: &str, field: &str) -> Result<String, ConfigError> {
+    expand_percent_vars_with(raw, field, |name| std::env::var(name).ok())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn expand_percent_vars(raw: &str, _field: &str) -> Result<String, ConfigError> {
+    Ok(raw.to_string())
+}
+
+/// The actual `%VAR%` substitution, parameterized over the lookup so it
+/// can be unit tested on any platform without touching real environment
+/// variables. Only called for real (non-test) work on Windows, via
+/// `expand_percent_vars` above; `cfg`-gated rather than `#[allow(dead_code)]`
+/// so a non-Windows, non-test build does not carry unreachable code.
+#[cfg(any(test, target_os = "windows"))]
+fn expand_percent_vars_with(
+    raw: &str,
+    field: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<String, ConfigError> {
+    let mut result = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(start) = rest.find('%') {
+        result.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        match after.find('%') {
+            Some(end) if end > 0 => {
+                let name = &after[..end];
+                let value = lookup(name).ok_or_else(|| ConfigError::PathExpansion {
+                    field: field.to_string(),
+                    raw: raw.to_string(),
+                    reason: format!("environment variable '{name}' is not set"),
+                })?;
+                result.push_str(&value);
+                rest = &after[end + 1..];
+            }
+            _ => {
+                // A lone '%' or an empty "%%" is not a variable
+                // reference; pass it through literally rather than
+                // guessing what the user meant.
+                result.push('%');
+                rest = after;
+            }
+        }
+    }
+    result.push_str(rest);
+    Ok(result)
+}
+
+/// Validate that `raw` is a literal `host:port` address, the only form
+/// `TcpStream::connect` can use today. Returns `Err` naming exactly
+/// what is wrong; the caller wraps that into
+/// `ConfigError::InvalidServerAddress`.
+///
+/// Discovery-by-name, the spec's other accepted form (`server =
+/// "talhas-mac"`), is not implemented in this build. Accepting it here
+/// would let a config load successfully and then fail every single
+/// connection attempt forever, visible only as a `warn` log line the
+/// user may never see, so it is rejected at load time instead.
+fn validate_server_address(raw: &str) -> Result<(), String> {
+    let (host, port_str) = if let Some(rest) = raw.strip_prefix('[') {
+        let (host, after) = rest.split_once(']').ok_or_else(|| {
+            "starts with '[' but has no matching ']'; an IPv6 literal looks like \"[::1]:24810\""
+                .to_string()
+        })?;
+        let port_str = after
+            .strip_prefix(':')
+            .ok_or_else(|| format!("expected \":<port>\" right after \"]\", got \"{after}\""))?;
+        (host, port_str)
+    } else if raw.matches(':').count() > 1 {
+        return Err(
+            "looks like an IPv6 address but has no brackets; wrap it, for example \"[::1]:24810\""
+                .to_string(),
+        );
+    } else if let Some((host, port_str)) = raw.rsplit_once(':') {
+        (host, port_str)
+    } else {
+        return Err("no ':' found; got a bare name with no port".to_string());
+    };
+
+    if host.is_empty() {
+        return Err("the host part is empty".to_string());
+    }
+
+    match port_str.parse::<u16>() {
+        Ok(0) | Err(_) => Err(format!("'{port_str}' is not a valid port number (1-65535)")),
+        Ok(_) => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,7 +695,7 @@ panic_hotkey = "LeftCtrl+LeftAlt+Escape"
     const CLIENT_CONFIG: &str = r#"
 role = "client"
 id = "pc"
-server = "talhas-mac"
+server = "192.168.18.90:24810"
 
 [discovery]
 enabled = true
@@ -480,7 +731,11 @@ return_edge = "bottom"
         );
         assert_eq!(config.layout.top.as_deref(), Some("pc"));
         assert_eq!(config.layout.bottom, None);
-        assert_eq!(config.security.key_file, PathBuf::from("~/.config/hop/key"));
+        let home = std::env::var("HOME").expect("HOME should be set in the test environment");
+        assert_eq!(
+            config.security.key_file,
+            PathBuf::from(home).join(".config/hop/key")
+        );
         assert_eq!(
             config.input.panic_hotkey.as_deref(),
             Some("LeftCtrl+LeftAlt+Escape")
@@ -495,7 +750,7 @@ return_edge = "bottom"
 
         assert_eq!(config.role, Role::Client);
         assert_eq!(config.id.as_deref(), Some("pc"));
-        assert_eq!(config.server.as_deref(), Some("talhas-mac"));
+        assert_eq!(config.server.as_deref(), Some("192.168.18.90:24810"));
         assert!(config.discovery.enabled);
         assert_eq!(
             config.security.key_file,
@@ -756,7 +1011,7 @@ key_file = "~/.config/hop/key"
         let path = write_config(
             r#"
 role = "client"
-server = "talhas-mac"
+server = "192.168.18.90:24810"
 
 [security]
 key_file = "%APPDATA%\\hop\\key"
@@ -798,7 +1053,7 @@ key_file = "%APPDATA%\\hop\\key"
             r#"
 role = "client"
 id = "pc"
-server = "talhas-mac"
+server = "192.168.18.90:24810"
 
 [security]
 key_file = "%APPDATA%\\hop\\key"
@@ -819,7 +1074,7 @@ key_file = "%APPDATA%\\hop\\key"
             r#"
 role = "client"
 id = "pc"
-server = "talhas-mac"
+server = "192.168.18.90:24810"
 
 [security]
 key_file = "%APPDATA%\\hop\\key"
@@ -862,6 +1117,9 @@ top = "typo-d-pc"
 
 [security]
 key_file = "~/.config/hop/key"
+
+[input]
+panic_hotkey = "LeftCtrl+LeftAlt+Escape"
 "#,
         );
         let err =
@@ -874,5 +1132,270 @@ key_file = "~/.config/hop/key"
             message.contains("typo-d-pc") && message.contains("top"),
             "error should name the offending edge and peer, got: {message}"
         );
+    }
+
+    // --- FINDING 1: `~` and `%VAR%` expansion in key_file ---
+
+    #[test]
+    fn tilde_prefixed_path_expands_under_home_directory() {
+        let home = std::env::var("HOME").expect("HOME should be set in the test environment");
+        let expanded = expand_config_path("~/.config/hop/key", "security.key_file")
+            .expect("a tilde-prefixed path should expand");
+        assert_eq!(expanded, PathBuf::from(home).join(".config/hop/key"));
+    }
+
+    #[test]
+    fn bare_tilde_expands_to_home_directory() {
+        let home = std::env::var("HOME").expect("HOME should be set in the test environment");
+        let expanded = expand_config_path("~", "security.key_file")
+            .expect("a bare tilde should expand to the home directory");
+        assert_eq!(expanded, PathBuf::from(home));
+    }
+
+    #[test]
+    fn absolute_path_passes_through_untouched() {
+        let expanded = expand_config_path("/etc/hop/key", "security.key_file")
+            .expect("an absolute path should pass through");
+        assert_eq!(expanded, PathBuf::from("/etc/hop/key"));
+    }
+
+    #[test]
+    fn relative_path_passes_through_unchanged() {
+        // No `~` and no `%...%`: a relative path is left exactly as
+        // written, to be resolved against the current directory the
+        // same way it always has been.
+        let expanded = expand_config_path("hop-key", "security.key_file")
+            .expect("a relative path should pass through");
+        assert_eq!(expanded, PathBuf::from("hop-key"));
+    }
+
+    #[test]
+    fn tilde_other_user_home_is_rejected_rather_than_taken_literally() {
+        let err = expand_config_path("~talha/key", "security.key_file")
+            .expect_err("\"~name/...\" should be rejected, not silently written to a literal path");
+        assert!(matches!(err, ConfigError::PathExpansion { .. }));
+    }
+
+    #[test]
+    fn config_load_expands_tilde_key_file_end_to_end() {
+        // The same check as `valid_server_config_parses`'s key_file
+        // assertion, but exercised as its own named test since this is
+        // the exact reviewer-reported failure from FINDING 1: `hop
+        // keygen` claiming success while writing under a literal `~`
+        // directory in the current working directory.
+        let path = write_config(SERVER_CONFIG);
+        let config = Config::load(&path).expect("valid server config should load");
+        fs::remove_file(&path).ok();
+
+        let home = std::env::var("HOME").expect("HOME should be set in the test environment");
+        assert_ne!(
+            config.security.key_file,
+            PathBuf::from("~/.config/hop/key"),
+            "key_file must not be left as a literal path starting with '~'"
+        );
+        assert_eq!(
+            config.security.key_file,
+            PathBuf::from(home).join(".config/hop/key")
+        );
+    }
+
+    #[test]
+    fn percent_var_expands_using_the_given_lookup() {
+        let expanded =
+            expand_percent_vars_with("%APPDATA%\\hop\\key", "security.key_file", |name| {
+                if name == "APPDATA" {
+                    Some("C:\\Users\\talha\\AppData\\Roaming".to_string())
+                } else {
+                    None
+                }
+            })
+            .expect("a known variable should expand");
+        assert_eq!(expanded, "C:\\Users\\talha\\AppData\\Roaming\\hop\\key");
+    }
+
+    #[test]
+    fn percent_var_reports_the_missing_variable_by_name() {
+        let err = expand_percent_vars_with("%NOPE%\\key", "security.key_file", |_| None)
+            .expect_err("an unset variable should be rejected, not treated as literal text");
+        match err {
+            ConfigError::PathExpansion { reason, .. } => {
+                assert!(reason.contains("NOPE"), "got: {reason}");
+            }
+            other => panic!("expected PathExpansion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn percent_var_wrapper_is_a_noop_off_windows() {
+        // `expand_percent_vars` is the OS-dispatching wrapper around
+        // `expand_percent_vars_with`. Off Windows it must leave a
+        // "%..." string untouched rather than trying, and failing, to
+        // look up a variable like APPDATA that only exists on Windows.
+        #[cfg(not(target_os = "windows"))]
+        {
+            let result = expand_percent_vars("%APPDATA%\\hop\\key", "security.key_file")
+                .expect("non-Windows platforms must not attempt %VAR% expansion");
+            assert_eq!(result, "%APPDATA%\\hop\\key");
+        }
+    }
+
+    // --- FINDING 2: `server` must be a literal host:port address ---
+
+    #[test]
+    fn bare_discovery_name_as_server_is_rejected() {
+        let path = write_config(
+            r#"
+role = "client"
+id = "pc"
+server = "talhas-mac"
+
+[security]
+key_file = "%APPDATA%\\hop\\key"
+
+[input]
+return_edge = "bottom"
+"#,
+        );
+        let err = Config::load(&path)
+            .expect_err("a bare discovery name should be rejected: discovery is not implemented");
+        fs::remove_file(&path).ok();
+
+        let message = err.to_string();
+        match &err {
+            ConfigError::InvalidServerAddress { value, .. } => {
+                assert_eq!(value, "talhas-mac");
+            }
+            other => panic!("expected InvalidServerAddress, got {other:?}"),
+        }
+        assert!(
+            message.contains("discovery"),
+            "error should explain that discovery by name is not implemented, got: {message}"
+        );
+    }
+
+    #[test]
+    fn host_port_server_is_accepted() {
+        let path = write_config(CLIENT_CONFIG);
+        let config = Config::load(&path).expect("a host:port server address should be accepted");
+        fs::remove_file(&path).ok();
+        assert_eq!(config.server.as_deref(), Some("192.168.18.90:24810"));
+    }
+
+    #[test]
+    fn ipv6_literal_server_is_accepted() {
+        let path = write_config(
+            r#"
+role = "client"
+id = "pc"
+server = "[::1]:24810"
+
+[security]
+key_file = "%APPDATA%\\hop\\key"
+
+[input]
+return_edge = "bottom"
+"#,
+        );
+        let config =
+            Config::load(&path).expect("a bracketed IPv6 literal with a port should be accepted");
+        fs::remove_file(&path).ok();
+        assert_eq!(config.server.as_deref(), Some("[::1]:24810"));
+    }
+
+    #[test]
+    fn server_with_bad_port_is_rejected() {
+        let path = write_config(
+            r#"
+role = "client"
+id = "pc"
+server = "192.168.18.90:notaport"
+
+[security]
+key_file = "%APPDATA%\\hop\\key"
+
+[input]
+return_edge = "bottom"
+"#,
+        );
+        let err = Config::load(&path).expect_err("a non-numeric port should be rejected");
+        fs::remove_file(&path).ok();
+        assert!(matches!(err, ConfigError::InvalidServerAddress { .. }));
+    }
+
+    #[test]
+    fn unbracketed_ipv6_server_is_rejected_with_a_bracket_hint() {
+        let path = write_config(
+            r#"
+role = "client"
+id = "pc"
+server = "::1:24810"
+
+[security]
+key_file = "%APPDATA%\\hop\\key"
+
+[input]
+return_edge = "bottom"
+"#,
+        );
+        let err = Config::load(&path)
+            .expect_err("an unbracketed address with multiple colons should be rejected");
+        fs::remove_file(&path).ok();
+        let message = err.to_string();
+        assert!(
+            message.contains("bracket") || message.contains("["),
+            "error should hint at brackets for IPv6, got: {message}"
+        );
+    }
+
+    // --- FINDING 5: panic_hotkey is required for role = "server" ---
+
+    #[test]
+    fn server_missing_panic_hotkey_is_an_error() {
+        let path = write_config(
+            r#"
+role = "server"
+bind = "0.0.0.0:24810"
+
+[[peers]]
+id = "pc"
+
+[security]
+key_file = "~/.config/hop/key"
+"#,
+        );
+        let err =
+            Config::load(&path).expect_err("a server config with no panic_hotkey must be rejected");
+        fs::remove_file(&path).ok();
+
+        assert!(matches!(err, ConfigError::ServerMissingPanicHotkey));
+        let message = err.to_string();
+        assert!(
+            message.contains("panic_hotkey") && message.contains("emergency"),
+            "error should explain why panic_hotkey is required, got: {message}"
+        );
+    }
+
+    #[test]
+    fn server_with_panic_hotkey_is_accepted() {
+        // SERVER_CONFIG already sets panic_hotkey; this just names the
+        // positive case explicitly alongside the negative one above.
+        let path = write_config(SERVER_CONFIG);
+        let config = Config::load(&path).expect("a server config with panic_hotkey should load");
+        fs::remove_file(&path).ok();
+        assert_eq!(
+            config.input.panic_hotkey.as_deref(),
+            Some("LeftCtrl+LeftAlt+Escape")
+        );
+    }
+
+    #[test]
+    fn client_without_panic_hotkey_is_still_fine() {
+        // Only the server ever captures input, so only the server needs
+        // the emergency escape; CLIENT_CONFIG never sets panic_hotkey
+        // and must still load.
+        let path = write_config(CLIENT_CONFIG);
+        let config = Config::load(&path).expect("a client config needs no panic_hotkey");
+        fs::remove_file(&path).ok();
+        assert_eq!(config.input.panic_hotkey, None);
     }
 }

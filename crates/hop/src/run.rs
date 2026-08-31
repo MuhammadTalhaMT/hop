@@ -665,13 +665,19 @@ mod tests {
         assert!(matches!(err, RunError::KeyRead { .. }));
     }
 
+    /// Builds a config to exercise `parse_panic_hotkey` in isolation.
+    /// Uses `role = "client"` rather than `"server"`, since a server
+    /// config now requires `[input] panic_hotkey` to load at all (see
+    /// `ConfigError::ServerMissingPanicHotkey`); a client never captures
+    /// input and so never requires one, letting the `None` case here
+    /// still exercise a config that loads successfully.
     fn config_with_hotkey(raw: Option<&str>) -> Config {
         let hotkey_line = match raw {
             Some(raw) => format!("panic_hotkey = \"{raw}\"\n"),
             None => String::new(),
         };
         let text = format!(
-            "role = \"server\"\nbind = \"0.0.0.0:24810\"\n\n[[peers]]\nid = \"pc\"\n\n[security]\nkey_file = \"/tmp/hop-key\"\n\n[input]\n{hotkey_line}"
+            "role = \"client\"\nid = \"pc\"\nserver = \"192.168.18.90:24810\"\n\n[security]\nkey_file = \"/tmp/hop-key\"\n\n[input]\nreturn_edge = \"bottom\"\n{hotkey_line}"
         );
         let path = temp_path("hotkey-config.toml");
         fs::write(&path, text).unwrap();
