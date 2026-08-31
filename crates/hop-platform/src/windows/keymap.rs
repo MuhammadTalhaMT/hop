@@ -5,6 +5,14 @@ use hop_proto::Usage;
 /// Entries are `(hid_usage, scancode, extended)`. Extended keys share a
 /// base scancode with a non-extended key and are distinguished by a 0xE0
 /// prefix, which `SendInput` expresses with `KEYEVENTF_EXTENDEDKEY`.
+///
+/// Home, End, Page Up, Page Down and forward delete are exactly this
+/// class of extended key: on a real PC keyboard they share their base
+/// scancode with a numeric keypad key (Home/0x47 with Keypad 7, Page
+/// Up/0x49 with Keypad 9, and so on) and are told apart only by the
+/// extended flag. Getting the flag wrong on one of these does not drop
+/// the key, it sticks the numeric keypad's key down instead, which is
+/// worse than dropping it.
 pub(crate) const TABLE: &[(u16, u16, bool)] = &[
     (0x04, 0x1E, false), // a
     (0x05, 0x30, false), // b
@@ -71,10 +79,41 @@ pub(crate) const TABLE: &[(u16, u16, bool)] = &[
     (0x43, 0x44, false), // f10
     (0x44, 0x57, false), // f11
     (0x45, 0x58, false), // f12
+    (0x4A, 0x47, true),  // home; shares base scancode with keypad 7
+    (0x4B, 0x49, true),  // page up; shares base scancode with keypad 9
+    (0x4C, 0x53, true),  // forward delete; shares base scancode with keypad .
+    (0x4D, 0x4F, true),  // end; shares base scancode with keypad 1
+    (0x4E, 0x51, true),  // page down; shares base scancode with keypad 3
     (0x4F, 0x4D, true),  // right arrow
     (0x50, 0x4B, true),  // left arrow
     (0x51, 0x50, true),  // down arrow
     (0x52, 0x48, true),  // up arrow
+    (0x53, 0x45, false), // keypad num lock / clear
+    (0x54, 0x35, true),  // keypad /; shares base scancode with "/"
+    (0x55, 0x37, false), // keypad *
+    (0x56, 0x4A, false), // keypad -
+    (0x57, 0x4E, false), // keypad +
+    (0x58, 0x1C, true),  // keypad enter; shares base scancode with return
+    (0x59, 0x4F, false), // keypad 1
+    (0x5A, 0x50, false), // keypad 2
+    (0x5B, 0x51, false), // keypad 3
+    (0x5C, 0x4B, false), // keypad 4
+    (0x5D, 0x4C, false), // keypad 5
+    (0x5E, 0x4D, false), // keypad 6
+    (0x5F, 0x47, false), // keypad 7
+    (0x60, 0x48, false), // keypad 8
+    (0x61, 0x49, false), // keypad 9
+    (0x62, 0x52, false), // keypad 0
+    (0x63, 0x53, false), // keypad .
+    (0x67, 0x59, false), // keypad =
+    (0x68, 0x64, false), // f13
+    (0x69, 0x65, false), // f14
+    (0x6A, 0x66, false), // f15
+    (0x6B, 0x67, false), // f16
+    (0x6C, 0x68, false), // f17
+    (0x6D, 0x69, false), // f18
+    (0x6E, 0x6A, false), // f19
+    (0x6F, 0x6B, false), // f20
     (0xE0, 0x1D, false), // left control
     (0xE1, 0x2A, false), // left shift
     (0xE2, 0x38, false), // left alt
@@ -128,5 +167,32 @@ mod tests {
                 "duplicate scancode {code:#x}"
             );
         }
+    }
+
+    #[test]
+    fn home_end_and_forward_delete_map_to_extended_scancodes() {
+        // FINDING 4: Home, End, Page Up, Page Down and forward delete
+        // are extended keys, sharing a base scancode with a numeric
+        // keypad key. Getting the extended flag wrong sticks the
+        // keypad's key down instead of typing the intended one.
+        assert_eq!(usage_to_scancode(Usage(0x4A)), Some((0x47, true))); // home
+        assert_eq!(usage_to_scancode(Usage(0x4D)), Some((0x4F, true))); // end
+        assert_eq!(usage_to_scancode(Usage(0x4C)), Some((0x53, true))); // forward delete
+        assert_eq!(usage_to_scancode(Usage(0x4B)), Some((0x49, true))); // page up
+        assert_eq!(usage_to_scancode(Usage(0x4E)), Some((0x51, true))); // page down
+
+        // And each shares its base scancode with the keypad key that
+        // sends the same, non-extended, scancode.
+        assert_eq!(usage_to_scancode(Usage(0x5F)), Some((0x47, false))); // keypad 7
+        assert_eq!(usage_to_scancode(Usage(0x59)), Some((0x4F, false))); // keypad 1
+        assert_eq!(usage_to_scancode(Usage(0x63)), Some((0x53, false))); // keypad .
+        assert_eq!(usage_to_scancode(Usage(0x61)), Some((0x49, false))); // keypad 9
+        assert_eq!(usage_to_scancode(Usage(0x5B)), Some((0x51, false))); // keypad 3
+    }
+
+    #[test]
+    fn function_keys_f13_through_f20_are_mapped() {
+        assert_eq!(usage_to_scancode(Usage(0x68)), Some((0x64, false))); // f13
+        assert_eq!(usage_to_scancode(Usage(0x6F)), Some((0x6B, false))); // f20
     }
 }
