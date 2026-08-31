@@ -31,6 +31,10 @@ Input is encrypted and authenticated with XChaCha20-Poly1305 under a
 pre-shared key, with replay protection. hop is designed for a local
 network and should not be exposed to the internet.
 
+Frame lengths and timing are not padded or masked, so an observer on the
+network can learn typing rhythm and can distinguish some keystroke
+classes by frame size, even though it cannot read the keys themselves.
+
 ## License
 
 MIT
