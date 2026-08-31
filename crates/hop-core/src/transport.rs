@@ -166,6 +166,7 @@ impl<R: AsyncRead + Unpin> TransportReader<R> {
 mod tests {
     use super::*;
     use hop_proto::{Message, SessionId, SharedKey, Usage};
+    use std::time::Duration;
     use tokio::io::duplex;
     use tokio::io::AsyncWriteExt;
 
@@ -240,10 +241,21 @@ mod tests {
     #[tokio::test]
     async fn reports_closure_when_the_peer_goes_away() {
         let (a, b) = duplex(4096);
-        let (_ar, client) = split(a, key(), session());
+        let (ar, aw) = split(a, key(), session());
         let (mut server, _bw) = split(b, key(), session());
-        drop(client);
-        assert!(matches!(server.recv().await, Err(TransportError::Closed)));
+
+        // BOTH halves must go. Dropping only the writer leaves the reader
+        // holding its share of the stream, so no EOF is ever delivered and
+        // the peer waits forever.
+        drop(aw);
+        drop(ar);
+
+        // Bounded so a regression fails fast instead of hanging CI with no
+        // message, which is what this test did when it dropped one half.
+        let outcome = tokio::time::timeout(Duration::from_secs(2), server.recv())
+            .await
+            .expect("recv should report closure promptly, not block");
+        assert!(matches!(outcome, Err(TransportError::Closed)));
     }
 
     #[tokio::test]
