@@ -30,3 +30,6 @@ pub use session::{event_to_message, message_to_event, pump_client, pump_server, 
 
 pub mod handshake;
 pub use handshake::{client_handshake, derive_session, server_handshake, HandshakeError};
+
+pub mod supervisor;
+pub use supervisor::{release_everything, ClientSupervisor, ReconnectPolicy};
