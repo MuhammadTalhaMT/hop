@@ -46,6 +46,17 @@ Known rough edges a first user will hit:
 - `~` and `%APPDATA%` are not expanded in the config file's `key_file`
   path. Key paths must be written out in full.
 
+## What it does
+
+- Share one keyboard and mouse between a Mac and a Windows PC
+- Command acts as Control on the PC, so Cmd+C copies there
+- Clipboard sync: copy text on one machine, paste on the other
+- A menu bar item on the Mac for starting and stopping it
+- Recovers by itself from lock, sleep and network loss
+
+Not yet: peer discovery (addresses are configured by hand), driving the
+Mac from the PC's keyboard, and clipboard images or files.
+
 ## Setup
 
 Both machines need the SAME key file. Generate it once on the Mac with
@@ -104,6 +115,32 @@ back, leaving only the panic hotkey.
 On macOS, whatever runs `hop` needs Accessibility permission (System
 Settings, Privacy and Security, Accessibility). Without it the event tap
 cannot be created at all and `hop run` will say so.
+
+## Running it
+
+    hop run --config ~/.config/hop/config.toml
+
+Or, on the Mac, put it in the menu bar instead:
+
+    hop menubar --config ~/.config/hop/config.toml
+
+The menu bar item shows `hop ●` while running and `hop ○` while stopped,
+with Start, Stop and Quit. It launches `hop run` as a separate process,
+so a problem in hop cannot take the menu bar item down with it, and Quit
+always stops the engine rather than leaving it orphaned holding your
+input.
+
+## Clipboard
+
+Copying text on either machine makes it available to paste on the other.
+Text only, up to 56 KB; a larger copy is skipped rather than truncated,
+so you never get text that looks complete but is not. Images and files do
+not cross.
+
+Worth knowing: everything you copy is sent to the other machine,
+including passwords copied from a password manager. It travels encrypted
+and only your paired machine can read it, and clipboard contents are
+never written to logs, but it does leave the machine you copied on.
 
 ## Security
 
