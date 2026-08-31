@@ -251,9 +251,12 @@ impl CursorPark {
     fn restore(&self) {
         let mut origin = lock_recovering(&self.origin, "cursor_park_origin");
         if let Some((x, y)) = origin.take() {
+            // Re-associate and clear suppression BEFORE the warp, so the
+            // warp itself cannot swallow the first moments of the user's
+            // own mouse movement as focus comes home.
+            cursor::leave_parked_state();
             cursor::warp_cursor(x, y);
             cursor::show_cursor();
-            cursor::leave_parked_state();
         }
     }
 }

@@ -200,18 +200,6 @@ pub fn show_cursor() {
     let _ = CGDisplay::main().show_cursor();
 }
 
-/// macOS's own documented default: any local hardware mouse or keyboard
-/// event arriving within this many seconds of a programmatic warp
-/// (`CGWarpMouseCursorPosition`) is suppressed rather than allowed to move
-/// the cursor, so a real mouse nudge right after a warp cannot fight it.
-/// Reasonable for a single, one-off warp; this is exactly what breaks
-/// IMPORTANT 2 from the whole-branch review, because `CursorPark::hold`
-/// (in `capture.rs`) warps on every remote motion event, dozens of times a
-/// second while focus is remote, so this window never has a chance to
-/// expire before the next warp restarts it: the local cursor moves once
-/// and then appears to freeze.
-const DEFAULT_LOCAL_EVENTS_SUPPRESSION_INTERVAL: f64 = 0.25;
-
 /// Opaque pointer type matching `CGEventSourceRef` from
 /// `<CoreGraphics/CGEventSource.h>`. `core-graphics`'s own
 /// `event_source::CGEventSource` wraps the same underlying pointer, but
@@ -289,8 +277,16 @@ pub fn enter_parked_state() {
 /// already-associated mouse, or resetting an already-default suppression
 /// interval, is a harmless no-op.
 pub fn leave_parked_state() {
+    // Re-associate FIRST, then leave the suppression interval at zero.
+    //
+    // Restoring the interval to its 0.25s default here made the cursor
+    // sit still for a moment after focus came back: the warp that returns
+    // it to where the user left off would suppress their own hardware
+    // movement for that interval. Leaving it at zero costs nothing (it
+    // only governs how long local input is ignored after a warp, and hop
+    // warps deliberately) and the cursor tracks the hand immediately.
     let _ = CGDisplay::associate_mouse_and_mouse_cursor_position(true);
-    set_local_events_suppression_interval(DEFAULT_LOCAL_EVENTS_SUPPRESSION_INTERVAL);
+    set_local_events_suppression_interval(0.0);
 }
 
 #[cfg(test)]
