@@ -11,8 +11,6 @@
 //! other machine, which is not worth returning an error over, let alone
 //! panicking on.
 
-use std::ffi::c_void;
-
 use windows_sys::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL};
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber, OpenClipboard,
@@ -131,7 +129,7 @@ pub fn set_text(text: &str) -> bool {
 
     // SAFETY: the lock yields a pointer to at least `bytes` bytes, which
     // is exactly what is copied into it.
-    let ok = unsafe {
+    unsafe {
         let dest = GlobalLock(handle) as *mut u16;
         if dest.is_null() {
             GlobalFree(handle);
@@ -142,16 +140,14 @@ pub fn set_text(text: &str) -> bool {
 
         // On success the clipboard takes ownership of the handle and it
         // must NOT be freed here; on failure it does not, and it must be.
-        let set = SetClipboardData(CF_UNICODETEXT as u32, handle as *mut c_void);
+        let set = SetClipboardData(CF_UNICODETEXT as u32, handle);
         if set.is_null() {
             GlobalFree(handle);
             false
         } else {
             true
         }
-    };
-
-    ok
+    }
 }
 
 /// The Windows clipboard, as `hop-core` sees it.

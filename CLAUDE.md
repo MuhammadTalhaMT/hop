@@ -9,6 +9,12 @@ sleep, and network loss is the point of the project, not a nice to have.
 - `cargo test --workspace` must pass before any commit.
 - `cargo clippy --workspace --all-targets -- -D warnings` must be silent.
 - `cargo fmt --all -- --check` must be silent.
+- Windows-only code must pass BOTH of these, not just the first:
+  `cargo check --workspace --all-targets --target x86_64-pc-windows-msvc`
+  `cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings`
+  Omitting `--all-targets` silently skips all Windows test code, and
+  running only `check` skips the lints. Both gaps have already reached CI
+  as red builds on this project.
 - No `unsafe` in `hop-proto`, `hop-core`, or `hop`; all three crates
   forbid it with `#![forbid(unsafe_code)]`.
 - `hop-platform` is the only crate in the workspace permitted `unsafe`.
