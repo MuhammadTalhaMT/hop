@@ -941,7 +941,22 @@ unsafe extern "C" {
 }
 ```
 
-The tap is created with `CGEventTapLocation::HID`, `CGEventTapPlacement::HeadInsertEventTap`, and `CGEventTapOptions::Default` (NOT `ListenOnly`, which cannot suppress). Events of interest must include `KeyDown`, `KeyUp`, `FlagsChanged`, `MouseMoved`, `LeftMouseDown`, `LeftMouseUp`, `RightMouseDown`, `RightMouseUp`, `ScrollWheel`, and both `TapDisabledByTimeout` and `TapDisabledByUserInput`.
+The tap is created with `CGEventTapLocation::HID`, `CGEventTapPlacement::HeadInsertEventTap`, and `CGEventTapOptions::Default` (NOT `ListenOnly`, which cannot suppress). Events of interest must include `KeyDown`, `KeyUp`, `FlagsChanged`, `MouseMoved`, `LeftMouseDragged`, `RightMouseDragged`, `LeftMouseDown`, `LeftMouseUp`, `RightMouseDown`, `RightMouseUp`, `OtherMouseDown`, `OtherMouseUp`, and `ScrollWheel`.
+
+The dragged variants are not optional: macOS emits `MouseMoved` only while no
+button is held, and switches to `LeftMouseDragged` or `RightMouseDragged` once
+one is. Omitting them means the peer sees a button press, a frozen cursor, and
+a release, so drag-select, drag-and-drop and window dragging all fail.
+
+**Do NOT put `TapDisabledByTimeout` or `TapDisabledByUserInput` in
+`events_of_interest`.** Their discriminants are `0xFFFFFFFE` and `0xFFFFFFFF`,
+and the mask is built as `1 << (etype as u64)`, so including them shifts by
+about four billion. With overflow checks on, which is the default dev profile,
+that panics inside `CGEventTap::new` before the tap is ever created, killing
+capture entirely in every debug build while working by accident in release.
+macOS delivers both events to the callback regardless of the mask, which is
+precisely why no mask bit is defined for them. Handle them in the callback,
+never in the mask.
 
 Three requirements the spike proved necessary:
 
