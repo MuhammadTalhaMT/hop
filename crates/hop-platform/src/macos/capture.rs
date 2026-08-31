@@ -40,7 +40,7 @@ use core_graphics::event::{
     CGEvent, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
     CallbackResult, EventField,
 };
-use hop_proto::Button;
+use hop_proto::{Button, Usage};
 
 use crate::macos::cursor;
 use crate::macos::keymap::virtual_key_to_usage;
@@ -115,6 +115,30 @@ fn crossed(edge: Edge, x: f64, y: f64, screen_width: f64, screen_height: f64) ->
         Edge::Left => x <= 0.0,
         Edge::Right => x >= screen_width - 1.0,
     }
+}
+
+/// Whether a motion event that has crossed `edge`, while focus is local,
+/// should actually start a crossing into the peer. Pure: the whole
+/// decision is "is a peer actually connected", so it is directly
+/// testable without hardware. This is CRITICAL 1 from the whole-branch
+/// review: before this gate existed, `MacCapturer::start` began edge
+/// detection the instant it returned, long before `run_server`'s
+/// listener even binds and far before any client connects, so crossing
+/// the edge with the PC off, asleep, or rebooting suppressed the Mac's
+/// own keyboard and mouse with nothing to hand them to and no way to get
+/// them back short of SSH from another machine or a forced power-off.
+fn should_begin_crossing(peer_connected: bool, edge_crossed: bool) -> bool {
+    peer_connected && edge_crossed
+}
+
+/// Whether the currently held keys satisfy the panic hotkey `combo`. An
+/// empty combo (no panic hotkey configured) never matches, mirroring
+/// `HotkeyWatcher` in hop's run.rs, which makes the equivalent check from
+/// the connection loop. Pure, so this exact decision is directly
+/// testable without a tap; see the callback's use of it for why the same
+/// check also has to live here rather than only there.
+fn hotkey_matched(combo: &HashSet<Usage>, held: &HashSet<Usage>) -> bool {
+    !combo.is_empty() && combo.is_subset(held)
 }
 
 /// Nudges a point that just crossed `edge` back inside the screen by
@@ -194,25 +218,40 @@ pub struct MacCapturer {
     events: Receiver<InputEvent>,
     remote: Arc<AtomicBool>,
     park: Arc<CursorPark>,
+    peer_connected: Arc<AtomicBool>,
 }
 
 impl MacCapturer {
     /// Starts the background capture thread and blocks until the tap is
     /// either up and enabled, or has failed to start. `edge` is the
     /// screen edge that hands focus to the peer, taken from the caller's
-    /// `[layout]` configuration rather than assumed here.
-    pub fn start(edge: Edge) -> Result<Self, CaptureError> {
+    /// `[layout]` configuration rather than assumed here. `panic_combo` is
+    /// the panic hotkey's set of usages, or empty if none is configured;
+    /// it is checked on every event, entirely inside the tap callback, so
+    /// the escape hatch it provides (see `hotkey_matched`) works even when
+    /// nothing is driving the connection loop that owns `poll`.
+    pub fn start(edge: Edge, panic_combo: HashSet<Usage>) -> Result<Self, CaptureError> {
         let (event_tx, event_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
         let remote = Arc::new(AtomicBool::new(false));
         let remote_for_thread = Arc::clone(&remote);
         let park = Arc::new(CursorPark::new());
         let park_for_thread = Arc::clone(&park);
+        let peer_connected = Arc::new(AtomicBool::new(false));
+        let peer_connected_for_thread = Arc::clone(&peer_connected);
 
         thread::Builder::new()
             .name("hop-capture-tap".into())
             .spawn(move || {
-                run_capture_thread(event_tx, remote_for_thread, park_for_thread, edge, ready_tx)
+                run_capture_thread(
+                    event_tx,
+                    remote_for_thread,
+                    park_for_thread,
+                    peer_connected_for_thread,
+                    edge,
+                    panic_combo,
+                    ready_tx,
+                )
             })
             .map_err(CaptureError::ThreadSpawnFailed)?;
 
@@ -221,6 +260,7 @@ impl MacCapturer {
                 events: event_rx,
                 remote,
                 park,
+                peer_connected,
             }),
             Ok(Err(err)) => Err(err),
             Err(_) => Err(CaptureError::ThreadExitedEarly),
@@ -232,6 +272,20 @@ impl MacCapturer {
     /// letting it also reach the local Mac.
     pub fn remote_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.remote)
+    }
+
+    /// A handle the owner sets while a peer connection actually exists,
+    /// and clears the moment it ends, by any path including an error.
+    /// Edge detection in the tap callback only starts a crossing while
+    /// this is `true` (see `should_begin_crossing`): before this flag
+    /// existed, `MacCapturer::start` began watching for the edge the
+    /// instant it returned, long before `run_server`'s listener even
+    /// binds, so crossing the edge with no client connected suppressed
+    /// this machine's own keyboard and mouse with nothing to hand them to
+    /// and no way to get them back short of SSH or a forced power-off.
+    /// This is CRITICAL 1 from the whole-branch review.
+    pub fn peer_connected_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.peer_connected)
     }
 }
 
@@ -289,6 +343,19 @@ struct CaptureContext {
     screen_width: f64,
     screen_height: f64,
     park: Arc<CursorPark>,
+    /// Set only while a peer is actually connected; see
+    /// `MacCapturer::peer_connected_flag` and `should_begin_crossing`.
+    peer_connected: Arc<AtomicBool>,
+    /// The panic hotkey's usages, or empty if none is configured. Checked
+    /// against `held_usages` on every key event so the escape hatch this
+    /// file provides (see `hotkey_matched`) never depends on `poll` or on
+    /// anything outside this callback.
+    panic_combo: HashSet<Usage>,
+    /// Keys currently held, tracked purely for the panic-hotkey check
+    /// above. Deliberately separate from `held_modifiers`, which tracks
+    /// raw macOS device keycodes for the left/right modifier toggle, not
+    /// canonical `Usage`s.
+    held_usages: Mutex<HashSet<Usage>>,
 }
 
 /// Body of the dedicated capture thread: creates the tap, wires it into a
@@ -299,7 +366,9 @@ fn run_capture_thread(
     event_tx: Sender<InputEvent>,
     remote: Arc<AtomicBool>,
     park: Arc<CursorPark>,
+    peer_connected: Arc<AtomicBool>,
     edge: Edge,
+    panic_combo: HashSet<Usage>,
     ready_tx: Sender<Result<(), CaptureError>>,
 ) {
     let last_seen = Arc::new(Mutex::new(Instant::now()));
@@ -333,6 +402,9 @@ fn run_capture_thread(
         screen_width,
         screen_height,
         park,
+        peer_connected,
+        panic_combo,
+        held_usages: Mutex::new(HashSet::new()),
     };
 
     let events_of_interest = vec![
@@ -524,6 +596,29 @@ fn handle_event(event_type: CGEventType, event: &CGEvent, ctx: &CaptureContext) 
         translate(event_type, keycode, dx, dy, button_number)
     };
 
+    if let Some(InputEvent::Key { usage, pressed }) = translated {
+        // The unconditional escape hatch for CRITICAL 1: checked on every
+        // key event, entirely inside this callback, before any
+        // suppression decision below. This does not replace
+        // `HotkeyWatcher` in hop's run.rs, which still runs the sanctioned
+        // path (releasing the peer's held keys through `Control`) once
+        // the connection loop's next poll tick notices the same key
+        // event via the channel send just below; this is what makes the
+        // local keyboard and mouse come back even when that loop, or
+        // `poll`, is not currently running at all, for example because no
+        // client has ever connected.
+        let mut held = lock_recovering(&ctx.held_usages, "held_usages");
+        if pressed {
+            held.insert(usage);
+        } else {
+            held.remove(&usage);
+        }
+        if hotkey_matched(&ctx.panic_combo, &held) {
+            ctx.remote.store(false, Ordering::Relaxed);
+            ctx.park.restore();
+        }
+    }
+
     if let Some(input_event) = translated {
         // The receiver only goes away when `MacCapturer` is dropped, at
         // which point there is nothing useful to do with a send failure;
@@ -558,13 +653,14 @@ fn handle_event(event_type: CGEventType, event: &CGEvent, ctx: &CaptureContext) 
 
         if is_motion_event {
             let location = event.location();
-            if crossed(
+            let edge_crossed = crossed(
                 ctx.edge,
                 location.x,
                 location.y,
                 ctx.screen_width,
                 ctx.screen_height,
-            ) {
+            );
+            if should_begin_crossing(ctx.peer_connected.load(Ordering::Relaxed), edge_crossed) {
                 let landing = nudge_inward(
                     ctx.edge,
                     location.x,
@@ -1181,6 +1277,63 @@ mod tests {
 
         let (_, y) = nudge_inward(Edge::Top, 5.0, 0.0, 3.0, 3.0);
         assert!((0.0..=3.0).contains(&y));
+    }
+
+    // `should_begin_crossing` is the pure decision behind CRITICAL 1: an
+    // edge crossing with nobody connected must never suppress this
+    // machine's own input.
+    #[test]
+    fn crossing_with_no_peer_connected_is_a_no_op() {
+        assert!(!should_begin_crossing(false, true));
+    }
+
+    #[test]
+    fn crossing_with_a_peer_connected_starts_a_crossing() {
+        assert!(should_begin_crossing(true, true));
+    }
+
+    #[test]
+    fn no_edge_crossing_never_starts_one_regardless_of_peer_state() {
+        assert!(!should_begin_crossing(true, false));
+        assert!(!should_begin_crossing(false, false));
+    }
+
+    // `hotkey_matched` is the pure decision behind CRITICAL 1's escape
+    // hatch: it must clear `remote` the moment the configured combo is
+    // fully held, and must never fire when no hotkey is configured.
+    #[test]
+    fn hotkey_matches_once_every_key_in_the_combo_is_held() {
+        let combo: HashSet<Usage> = [Usage::LEFT_CTRL, Usage::LEFT_ALT, Usage::ESCAPE]
+            .into_iter()
+            .collect();
+        let mut held = HashSet::new();
+        held.insert(Usage::LEFT_CTRL);
+        held.insert(Usage::LEFT_ALT);
+        assert!(!hotkey_matched(&combo, &held), "combo not fully held yet");
+        held.insert(Usage::ESCAPE);
+        assert!(hotkey_matched(&combo, &held), "combo now fully held");
+    }
+
+    #[test]
+    fn an_empty_combo_never_matches() {
+        let combo: HashSet<Usage> = HashSet::new();
+        let mut held = HashSet::new();
+        held.insert(Usage::A);
+        held.insert(Usage::LEFT_GUI);
+        assert!(!hotkey_matched(&combo, &held));
+    }
+
+    #[test]
+    fn extra_held_keys_beyond_the_combo_still_match() {
+        // The combo only has to be a subset of what is held, not exactly
+        // equal to it: pressing an extra key alongside the combo must not
+        // block the escape hatch.
+        let combo: HashSet<Usage> = [Usage::LEFT_CTRL, Usage::LEFT_ALT].into_iter().collect();
+        let mut held = HashSet::new();
+        held.insert(Usage::LEFT_CTRL);
+        held.insert(Usage::LEFT_ALT);
+        held.insert(Usage::A);
+        assert!(hotkey_matched(&combo, &held));
     }
 
     // `CursorPark::park`/`hold`/`restore` are deliberately not exercised

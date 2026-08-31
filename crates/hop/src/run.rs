@@ -376,7 +376,13 @@ async fn run_server(
     })?;
     let edge = configured_edge(&config.layout).ok_or(RunError::ServerMissingLayoutEdge)?;
 
-    let mut capturer = hop_platform::macos::MacCapturer::start(edge)
+    // Built before `MacCapturer::start` so the same combo can be handed
+    // to both the capturer (for its own unconditional escape hatch, see
+    // CRITICAL 1) and `handle_client` below (for the sanctioned,
+    // connection-aware path through `Control`).
+    let panic_combo: HashSet<Usage> = panic_hotkey.into_iter().collect();
+
+    let mut capturer = hop_platform::macos::MacCapturer::start(edge, panic_combo.clone())
         .map_err(|error| RunError::Capture(error.to_string()))?;
     tracing::info!(?edge, "macOS input capture started");
 
@@ -387,8 +393,6 @@ async fn run_server(
             source,
         })?;
     tracing::info!(addr = %bind, "listening for a client");
-
-    let panic_combo: HashSet<Usage> = panic_hotkey.into_iter().collect();
 
     loop {
         let (stream, peer_addr) = match listener.accept().await {
@@ -437,6 +441,14 @@ async fn handle_client(
     tracing::info!(peer_id = %peer_id, ?session, "handshake complete");
 
     let remote_flag = capturer.remote_flag();
+    // Set now that a peer genuinely exists, and cleared below however this
+    // connection ends, including every early `break`: this is the other
+    // half of CRITICAL 1's fix. Edge detection in the tap callback checks
+    // this before it will ever start a crossing (see
+    // `should_begin_crossing`), so a crossing with nobody connected is a
+    // no-op instead of a trap.
+    let peer_connected_flag = capturer.peer_connected_flag();
+    peer_connected_flag.store(true, Ordering::Relaxed);
     let mut control = Control::new();
     let triggered = Arc::new(AtomicBool::new(false));
     let mut watched = HotkeyWatcher {
@@ -534,6 +546,9 @@ async fn handle_client(
     // side, applied here to the tap's suppression flag rather than to
     // injected keys.
     remote_flag.store(false, Ordering::Relaxed);
+    // And no crossing can begin again until a fresh peer actually
+    // connects; see the comment where this was set above.
+    peer_connected_flag.store(false, Ordering::Relaxed);
 
     // Tear down both transport halves together; see
     // `ClientSupervisor::run_connection`'s comment on why dropping only one
