@@ -11,12 +11,11 @@
 //! logs every transition.
 
 use crate::{
-    client_handshake, message_to_event, Backoff, HandshakeError, HeldKeys, Injector, InputEvent,
-    Liveness, TransportError, TransportReader, TransportWriter,
+    client_handshake, message_to_event, Backoff, HeldKeys, Injector, InputEvent, Liveness,
+    TransportError,
 };
-use hop_proto::{Direction, Message, SessionId, SharedKey};
+use hop_proto::{Message, SharedKey};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
@@ -88,47 +87,6 @@ impl Default for ReconnectPolicy {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Run the client handshake over `stream`, then move both transport halves
-/// onto the session it derives before returning them.
-///
-/// This is the resolution to the chicken-and-egg problem documented on
-/// [`crate::handshake`]: `stream` is split under `SessionId::ZERO` only for
-/// the handshake exchange itself, then reassembled and re-split under the
-/// real session. The `SessionId::ZERO`-keyed halves never leave this
-/// function, so nothing outside it can accidentally keep using them for
-/// input. No caller of this function ever sees a transport bound to
-/// `SessionId::ZERO`.
-async fn handshake_and_rekey<S>(
-    stream: S,
-    key: &SharedKey,
-    peer_id: &str,
-) -> Result<
-    (
-        TransportReader<ReadHalf<S>>,
-        TransportWriter<WriteHalf<S>>,
-        SessionId,
-    ),
-    HandshakeError,
->
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    // This function always runs the CLIENT side of the handshake (it calls
-    // client_handshake below), so both splits use Direction::ClientToServer:
-    // this side's writer always seals as the client, and its reader always
-    // expects the server's opposite direction.
-    let (mut zero_reader, mut zero_writer) = crate::split(
-        stream,
-        key.clone(),
-        SessionId::ZERO,
-        Direction::ClientToServer,
-    );
-    let session = client_handshake(&mut zero_reader, &mut zero_writer, peer_id).await?;
-    let stream = zero_reader.into_inner().unsplit(zero_writer.into_inner());
-    let (reader, writer) = crate::split(stream, key.clone(), session, Direction::ClientToServer);
-    Ok((reader, writer, session))
 }
 
 /// Apply one already-received message: update `held` and inject the
@@ -247,7 +205,7 @@ impl ClientSupervisor {
         policy: &mut ReconnectPolicy,
     ) {
         let (reader, mut writer, session) =
-            match handshake_and_rekey(stream, &self.key, &self.peer_id).await {
+            match client_handshake(stream, &self.key, &self.peer_id).await {
                 Ok(v) => v,
                 Err(error) => {
                     // Safe to log directly: HandshakeError::Unexpected now
@@ -427,37 +385,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handshake_and_rekey_moves_input_onto_the_derived_session_not_zero() {
+    async fn client_handshake_moves_input_onto_the_derived_session_not_zero() {
         // Pins the trap a security review found in this exact loop: after
-        // the handshake returns a SessionId, nothing in the type system
-        // stops a caller from continuing to use the SessionId::ZERO-keyed
-        // halves it ran over. That compiles, passes clippy, and silently
-        // reinstates the replay vulnerability the session binding exists
-        // to close. This test exercises the actual `handshake_and_rekey`
-        // function `run_connection` calls, not a reimplementation of it,
-        // so it fails if the re-key is ever removed from that function.
+        // the handshake returns a SessionId, nothing should let a caller
+        // keep using SessionId::ZERO-keyed halves for input. FINDING 5
+        // closes this structurally: client_handshake and server_handshake
+        // consume the stream and hand back halves already re-split under
+        // the derived session, so a ZERO-keyed transport is never even
+        // reachable from `run_connection`'s call site. This test exercises
+        // the actual `client_handshake` function `run_connection` calls,
+        // not a reimplementation of it, so it fails if the re-key is ever
+        // removed from that function.
         let (client_io, server_io) = duplex(65536);
         let key = SharedKey::from_bytes([13u8; 32]);
 
         let server_key = key.clone();
         let server = tokio::spawn(async move {
-            let (mut zr, mut zw) = crate::split(
-                server_io,
-                server_key.clone(),
-                SessionId::ZERO,
-                Direction::ServerToClient,
-            );
-            let (session, _peer_id) = crate::server_handshake(&mut zr, &mut zw)
-                .await
-                .expect("server handshake");
-            let stream = zr.into_inner().unsplit(zw.into_inner());
-            let (real_reader, real_writer) =
-                crate::split(stream, server_key, session, Direction::ServerToClient);
+            let (real_reader, real_writer, session, _peer_id) =
+                crate::server_handshake(server_io, &server_key)
+                    .await
+                    .expect("server handshake");
             (real_reader, real_writer, session)
         });
 
         let (client_reader, mut client_writer, client_session) =
-            handshake_and_rekey(client_io, &key, "pc")
+            client_handshake(client_io, &key, "pc")
                 .await
                 .expect("client handshake");
         let (server_reader, mut server_writer, server_session) = server.await.unwrap();
@@ -468,7 +420,7 @@ mod tests {
         );
         assert_ne!(client_session, SessionId::ZERO);
 
-        // A frame the client sends after handshake_and_rekey returns must
+        // A frame the client sends after client_handshake returns must
         // authenticate under the derived session...
         client_writer
             .send(&Message::Key {
@@ -523,17 +475,9 @@ mod tests {
         let server_key = key.clone();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let (mut zr, mut zw) = crate::split(
-                stream,
-                server_key.clone(),
-                SessionId::ZERO,
-                Direction::ServerToClient,
-            );
-            let (session, _peer_id) = crate::server_handshake(&mut zr, &mut zw)
+            let (_r, mut w, _session, _peer_id) = crate::server_handshake(stream, &server_key)
                 .await
                 .expect("server handshake");
-            let stream = zr.into_inner().unsplit(zw.into_inner());
-            let (_r, mut w) = crate::split(stream, server_key, session, Direction::ServerToClient);
             w.send(&Message::Key {
                 usage: Usage::LEFT_CTRL,
                 pressed: true,

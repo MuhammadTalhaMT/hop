@@ -11,26 +11,24 @@
 //!
 //! [`crate::split`] takes a [`SessionId`] up front, but the session is only
 //! known after the handshake runs, and the handshake itself needs a
-//! transport to exchange messages over. This module resolves that by
-//! running the handshake over a transport that was split with
-//! [`SessionId::ZERO`]. That is safe because the handshake exchanges
-//! nothing but the two `Handshake` messages themselves: their freshness
-//! comes from the random nonces they carry, not from session binding, and
-//! neither `client_handshake` nor `server_handshake` ever sends or receives
-//! anything else. Once both peers derive the real session, the caller must
-//! move the transport onto it before any input message is sent or
-//! received; `TransportReader::into_inner` and `TransportWriter::into_inner`
-//! exist for exactly this, so the stream can be reassembled (for example
-//! with `tokio::io::ReadHalf::unsplit`) and re-split under the derived
-//! session. `client_handshake` and `server_handshake` hand back the derived
-//! `SessionId` rather than mutating the transport themselves, so a caller
-//! cannot start pumping input without first doing something with that
-//! value.
+//! transport to exchange messages over. [`client_handshake`] and
+//! [`server_handshake`] resolve this internally, by owning the stream for
+//! the whole call rather than taking already-split transport halves: each
+//! one splits `stream` under [`SessionId::ZERO`] to exchange the two
+//! `Handshake` messages (safe, since their freshness comes from the random
+//! nonces they carry, not from session binding), then reclaims the stream
+//! and re-splits it under the derived session before returning the new
+//! halves. A caller can never obtain the `SessionId::ZERO`-keyed halves and
+//! keep using them for input: they never leave this module, because the
+//! stream is consumed by these functions rather than passed in pre-split.
+//! This is why `TransportReader::into_inner` and `TransportWriter::into_inner`
+//! are `pub(crate)` rather than public: nothing outside this crate has a
+//! reason to touch them.
 
-use crate::{TransportError, TransportReader, TransportWriter};
-use hop_proto::{Message, SessionId, PROTOCOL_VERSION};
+use crate::{split, TransportError, TransportReader, TransportWriter};
+use hop_proto::{Direction, Message, SessionId, SharedKey, PROTOCOL_VERSION};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
 
 /// Derive the session identifier both peers will authenticate every frame
 /// against.
@@ -142,18 +140,34 @@ async fn server_handshake_read_only<R: AsyncRead + Unpin>(
     recv_handshake(reader).await
 }
 
-/// Perform the client side of the handshake: send a fresh nonce, receive
-/// the server's, and derive the session both sides will use from here on.
+/// Perform the full client side of the handshake over `stream`: split it
+/// under [`SessionId::ZERO`], send a fresh nonce, receive the server's,
+/// derive the session both sides will use from here on, then reclaim the
+/// stream and re-split it under that session.
 ///
-/// `reader` and `writer` must be a transport split with
-/// [`SessionId::ZERO`]; see the module doc comment for why that is safe
-/// here and why the caller must move onto the returned session before any
-/// further message is sent or received.
-pub async fn client_handshake<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
-    reader: &mut TransportReader<R>,
-    writer: &mut TransportWriter<W>,
+/// `stream` is consumed rather than taken as already-split halves so that
+/// the `SessionId::ZERO`-keyed transport can never escape this function;
+/// see the module doc comment. The returned halves are already bound to
+/// the derived session, ready for input.
+pub async fn client_handshake<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: S,
+    key: &SharedKey,
     peer_id: &str,
-) -> Result<SessionId, HandshakeError> {
+) -> Result<
+    (
+        TransportReader<ReadHalf<S>>,
+        TransportWriter<WriteHalf<S>>,
+        SessionId,
+    ),
+    HandshakeError,
+> {
+    let (mut reader, mut writer) = split(
+        stream,
+        key.clone(),
+        SessionId::ZERO,
+        Direction::ClientToServer,
+    );
+
     let mut client_nonce = [0u8; 32];
     getrandom::fill(&mut client_nonce).map_err(|_| HandshakeError::Random)?;
 
@@ -166,26 +180,44 @@ pub async fn client_handshake<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         })
         .await?;
 
-    let (server_nonce, _server_peer_id) = recv_handshake(reader).await?;
-    Ok(derive_session(&client_nonce, &server_nonce))
+    let (server_nonce, _server_peer_id) = recv_handshake(&mut reader).await?;
+    let session = derive_session(&client_nonce, &server_nonce);
+
+    let stream = reader.into_inner().unsplit(writer.into_inner());
+    let (reader, writer) = split(stream, key.clone(), session, Direction::ClientToServer);
+    Ok((reader, writer, session))
 }
 
-/// Perform the server side of the handshake: receive the client's nonce
-/// and peer id, reply with a fresh nonce of our own, and derive the
-/// session both sides will use from here on.
+/// Perform the full server side of the handshake over `stream`: split it
+/// under [`SessionId::ZERO`], receive the client's nonce and peer id,
+/// reply with a fresh nonce of our own, derive the session both sides
+/// will use from here on, then reclaim the stream and re-split it under
+/// that session.
 ///
-/// `reader` and `writer` must be a transport split with
-/// [`SessionId::ZERO`]; see the module doc comment for why that is safe
-/// here and why the caller must move onto the returned session before any
-/// further message is sent or received.
-///
-/// Returns the client's `peer_id` alongside the session, since the server
-/// learns it here and has nowhere else to get it.
-pub async fn server_handshake<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
-    reader: &mut TransportReader<R>,
-    writer: &mut TransportWriter<W>,
-) -> Result<(SessionId, String), HandshakeError> {
-    let (client_nonce, peer_id) = server_handshake_read_only(reader).await?;
+/// `stream` is consumed for the same reason as in [`client_handshake`]:
+/// see the module doc comment. Returns the client's `peer_id` alongside
+/// the session and the re-keyed halves, since the server learns the peer
+/// id here and has nowhere else to get it.
+pub async fn server_handshake<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: S,
+    key: &SharedKey,
+) -> Result<
+    (
+        TransportReader<ReadHalf<S>>,
+        TransportWriter<WriteHalf<S>>,
+        SessionId,
+        String,
+    ),
+    HandshakeError,
+> {
+    let (mut reader, mut writer) = split(
+        stream,
+        key.clone(),
+        SessionId::ZERO,
+        Direction::ServerToClient,
+    );
+
+    let (client_nonce, peer_id) = server_handshake_read_only(&mut reader).await?;
 
     let mut server_nonce = [0u8; 32];
     getrandom::fill(&mut server_nonce).map_err(|_| HandshakeError::Random)?;
@@ -203,7 +235,10 @@ pub async fn server_handshake<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         })
         .await?;
 
-    Ok((derive_session(&client_nonce, &server_nonce), peer_id))
+    let session = derive_session(&client_nonce, &server_nonce);
+    let stream = reader.into_inner().unsplit(writer.into_inner());
+    let (reader, writer) = split(stream, key.clone(), session, Direction::ServerToClient);
+    Ok((reader, writer, session, peer_id))
 }
 
 #[cfg(test)]
@@ -250,18 +285,20 @@ mod tests {
     async fn client_and_server_agree_on_a_session() {
         let (a, b) = duplex(65536);
         let key = SharedKey::from_bytes([3u8; 32]);
-        let (mut sr, mut sw) = split(a, key.clone(), SessionId::ZERO, Direction::ServerToClient);
-        let (mut cr, mut cw) = split(b, key, SessionId::ZERO, Direction::ClientToServer);
 
-        let server = tokio::spawn(async move { server_handshake(&mut sr, &mut sw).await });
-        let client = client_handshake(&mut cr, &mut cw, "pc")
-            .await
-            .expect("client");
-        let (server_session, peer_id) = server.await.unwrap().expect("server");
+        let server_key = key.clone();
+        let server = tokio::spawn(async move { server_handshake(a, &server_key).await });
+        let (_client_reader, _client_writer, client_session) =
+            client_handshake(b, &key, "pc").await.expect("client");
+        let (_server_reader, _server_writer, server_session, peer_id) =
+            server.await.unwrap().expect("server");
 
-        assert_eq!(client, server_session, "peers must derive the same session");
+        assert_eq!(
+            client_session, server_session,
+            "peers must derive the same session"
+        );
         assert_eq!(peer_id, "pc");
-        assert_ne!(client, SessionId::ZERO);
+        assert_ne!(client_session, SessionId::ZERO);
     }
 
     #[tokio::test]
@@ -331,34 +368,28 @@ mod tests {
 
     #[tokio::test]
     async fn input_after_the_handshake_is_bound_to_the_derived_session_not_zero() {
-        // Exercises the full resolution to the split/handshake
-        // chicken-and-egg problem described in the module doc comment: the
-        // handshake runs entirely under SessionId::ZERO, then both peers
-        // reclaim the raw stream, unsplit it, and re-split under the
-        // derived session. No input message is ever sealed or opened
-        // under ZERO; only the two Handshake messages are.
+        // This is FINDING 5: client_handshake and server_handshake consume
+        // the stream and hand back halves already re-split under the
+        // derived session, so there is no SessionId::ZERO-keyed transport
+        // for a caller to obtain and keep using for input. No input
+        // message is ever sealed or opened under ZERO; only the two
+        // Handshake messages are, entirely inside these two functions.
         let (a, b) = duplex(65536);
         let key = SharedKey::from_bytes([4u8; 32]);
-        let (mut sr, mut sw) = split(a, key.clone(), SessionId::ZERO, Direction::ServerToClient);
-        let (mut cr, mut cw) = split(b, key.clone(), SessionId::ZERO, Direction::ClientToServer);
 
         let server_key = key.clone();
         let server = tokio::spawn(async move {
-            let (session, _peer_id) = server_handshake(&mut sr, &mut sw)
+            let (mut r, mut w, _session, _peer_id) = server_handshake(a, &server_key)
                 .await
                 .expect("server handshake");
-            let stream = sr.into_inner().unsplit(sw.into_inner());
-            let (mut r, mut w) = split(stream, server_key, session, Direction::ServerToClient);
             let received = r.recv().await.expect("recv input");
             w.send(&Message::Heartbeat).await.expect("send input");
             received
         });
 
-        let session = client_handshake(&mut cr, &mut cw, "pc")
+        let (mut r, mut w, _session) = client_handshake(b, &key, "pc")
             .await
             .expect("client handshake");
-        let stream = cr.into_inner().unsplit(cw.into_inner());
-        let (mut r, mut w) = split(stream, key, session, Direction::ClientToServer);
         let sent = Message::Key {
             usage: hop_proto::Usage::C,
             pressed: true,

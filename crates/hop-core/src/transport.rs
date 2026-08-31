@@ -121,12 +121,16 @@ impl<R> TransportReader<R> {
     /// Reclaim the underlying stream half, discarding this reader's key,
     /// session, and replay window.
     ///
-    /// Exists so a caller can run the handshake (see
-    /// `crate::handshake`) over a transport split with `SessionId::ZERO`,
-    /// then reassemble the raw stream (for example with
-    /// `tokio::io::ReadHalf::unsplit`) and call `split` again with the
-    /// session the handshake derived, before any input message flows.
-    pub fn into_inner(self) -> R {
+    /// Exists so `crate::handshake` can run the handshake over a transport
+    /// split with `SessionId::ZERO`, then reassemble the raw stream (for
+    /// example with `tokio::io::ReadHalf::unsplit`) and call `split` again
+    /// with the session the handshake derived, before any input message
+    /// flows. Deliberately `pub(crate)`, not `pub`: `client_handshake` and
+    /// `server_handshake` consume the stream and do this internally, so
+    /// nothing outside this crate has a reason to reclaim a transport's
+    /// stream half, and nothing outside it can obtain a `SessionId::ZERO`-
+    /// keyed transport and keep using it for input.
+    pub(crate) fn into_inner(self) -> R {
         self.stream
     }
 }
@@ -134,7 +138,7 @@ impl<R> TransportReader<R> {
 impl<W> TransportWriter<W> {
     /// Reclaim the underlying stream half. See
     /// [`TransportReader::into_inner`].
-    pub fn into_inner(self) -> W {
+    pub(crate) fn into_inner(self) -> W {
         self.stream
     }
 }
