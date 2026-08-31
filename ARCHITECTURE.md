@@ -88,10 +88,26 @@ then the frame body with two separate `read_exact` calls; if the future is
 dropped between or during those reads (for example by losing a
 `tokio::select!` race against a timer), any bytes already consumed are
 lost and the stream desynchronizes permanently: the next `recv` reads from
-the middle of a stale frame and every call after that fails. Callers that
-need to wait on `recv` alongside something else must run it on its own
-task rather than selecting on it directly, unless `Transport` first grows
-a persistent read buffer across calls.
+the middle of a stale frame and every call after that fails.
+
+This is not solved by simply "giving `recv` its own task". `Transport`
+owns the stream plus `send_seq`, so both `send` and `recv` need `&mut
+self`; moving the whole `Transport` into a reader task strands the write
+half (and `send_seq` with it), and heartbeats could then never be sent
+from the task that still holds `self`. Wrapping it in `Arc<Mutex<_>>`
+does not fix this either: `recv` is not cancel safe, so it must run to
+completion once started, which means it can park holding the lock for as
+long as it takes the peer to send the next frame, and `send` on the same
+`Arc` then blocks behind it, which is a deadlock the moment a heartbeat
+needs to go out while `recv` is waiting on the network. What actually
+composes is one of: split `Transport` into independent reader and writer
+halves (for example over `tokio::io::split`, so each half owns only the
+state its direction needs), or give `Transport` a persistent read buffer
+across calls so `recv` becomes genuinely cancel safe and can be raced in
+a `select!` directly. See the handoff notes below: `Liveness` has no
+working consumer until one of these exists, because the spec requires
+heartbeats in both directions and the current type cannot do bidirectional
+I/O concurrently.
 
 The sequence number is authenticated (it is AEAD associated data) before
 it is ever shown to `ReplayWindow::accept`. Checking the replay window
@@ -167,13 +183,20 @@ supervisor:
   The client side must independently detect a dead connection (via
   `Liveness`) and release everything in its own `HeldKeys` without
   waiting for a message that will never arrive.
-- **`Transport::recv` needs a supervision strategy, not a `select!`.**
-  Because `recv` is not cancel safe (see above), whatever drives the
-  client's receive loop alongside a liveness timer must give `recv` its
-  own task and communicate results back over a channel, or `Transport`
-  must be extended with a persistent read buffer first. Wiring `recv`
-  directly into a `tokio::select!` against a timeout will eventually
-  desynchronize the stream.
+- **`Transport` needs to be split or buffered before anything can drive
+  `recv` alongside a liveness timer.** Because `recv` is not cancel safe
+  (see above), and because `Transport` bundles the read and write halves
+  behind one `&mut self`, neither "run `recv` on its own task" nor
+  `Arc<Mutex<Transport>>` composes: the former strands `send` (and
+  `send_seq`) on whichever side does not hold the task, and the latter
+  deadlocks the first time `send` needs the lock while `recv` is parked
+  waiting on the network, since `recv` cannot be cancelled once started.
+  This plan must either split `Transport` into independent reader and
+  writer halves (for example over `tokio::io::split`) or give it a
+  persistent read buffer so `recv` becomes cancel safe and can be raced
+  in a `select!` directly. Until one of those exists, `Liveness` has no
+  working consumer: the spec requires heartbeats in both directions, and
+  the current `Transport` cannot do bidirectional I/O concurrently.
 - **The handshake must derive a real `SessionId` before any input is
   processed.** `hop_proto::crypto::SessionId` now binds every frame to a
   session, so a frame sealed under one session cannot authenticate under
