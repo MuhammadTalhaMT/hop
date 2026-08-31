@@ -8,10 +8,13 @@
 //! initiative and reports it as an ordinary event rather than an error.
 //!
 //! A background thread owns the `CFRunLoop` and the tap. The tap callback
-//! translates each event and pushes it into a channel; `MacCapturer::poll`
-//! drains that channel without blocking, so the trait's non-blocking
-//! contract holds even though the tap itself lives on a loop that blocks
-//! forever.
+//! translates each event and pushes it into a capped queue (`EventQueue`)
+//! only while focus is actually remote, since local input is never
+//! forwarded; `MacCapturer::poll` drains that queue without blocking, so
+//! the trait's non-blocking contract holds even though the tap itself
+//! lives on a loop that blocks forever. See IMPORTANT 4 from the
+//! whole-branch review for why the queue is gated and capped rather than
+//! an unconditional, unbounded channel.
 //!
 //! The same callback also owns edge detection and cursor parking. While
 //! focus is local, every mouse-motion event is checked against the
@@ -26,9 +29,9 @@
 //! callback or is only noticed by it, and again on `Drop` so a crash or
 //! early exit can never leave the pointer invisible.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -98,22 +101,28 @@ pub enum Edge {
 /// back to the peer the instant it returned to local.
 const EDGE_MARGIN: f64 = 12.0;
 
-/// Whether cursor position `(x, y)`, in global display coordinates on a
-/// screen sized `screen_width` by `screen_height`, has reached `edge`.
-/// Pure and side effect free, so it is the part of edge detection that
-/// can actually be unit tested without hardware; see the `tests` module
-/// below.
+/// Whether cursor position `(x, y)`, in global display coordinates, has
+/// reached `edge` of `bounds`, the union of every active display (see
+/// `cursor::display_bounds`). Pure and side effect free, so it is the
+/// part of edge detection that can actually be unit tested without
+/// hardware; see the `tests` module below.
 ///
-/// Global display coordinates on macOS put the origin at the top-left
-/// with y increasing downward, so the top edge is `y <= 0.0` and the
-/// bottom edge is `y >= screen_height - 1.0`; left and right are the same
-/// idea on the x axis.
-fn crossed(edge: Edge, x: f64, y: f64, screen_width: f64, screen_height: f64) -> bool {
+/// This is IMPORTANT 1's fix from the whole-branch review: comparing
+/// against `bounds`, rather than assuming the screen starts at `(0, 0)`,
+/// is what makes this correct on a multi-display Mac. A display
+/// positioned above or to the left of the main one gives `bounds` a
+/// negative `min_y` or `min_x`; comparing against that instead of a
+/// hardcoded `0.0` is the whole fix. Global display coordinates on macOS
+/// put the origin at the main display's top-left with y increasing
+/// downward, so the top edge is `y <= bounds.min_y` and the bottom edge
+/// is `y >= bounds.max_y - 1.0`; left and right are the same idea on the
+/// x axis.
+fn crossed(edge: Edge, x: f64, y: f64, bounds: cursor::Bounds) -> bool {
     match edge {
-        Edge::Top => y <= 0.0,
-        Edge::Bottom => y >= screen_height - 1.0,
-        Edge::Left => x <= 0.0,
-        Edge::Right => x >= screen_width - 1.0,
+        Edge::Top => y <= bounds.min_y,
+        Edge::Bottom => y >= bounds.max_y - 1.0,
+        Edge::Left => x <= bounds.min_x,
+        Edge::Right => x >= bounds.max_x - 1.0,
     }
 }
 
@@ -141,16 +150,49 @@ fn hotkey_matched(combo: &HashSet<Usage>, held: &HashSet<Usage>) -> bool {
     !combo.is_empty() && combo.is_subset(held)
 }
 
-/// Nudges a point that just crossed `edge` back inside the screen by
-/// `EDGE_MARGIN`, clamping so a screen smaller than the margin still
-/// yields an in-bounds point rather than a negative coordinate.
-fn nudge_inward(edge: Edge, x: f64, y: f64, screen_width: f64, screen_height: f64) -> (f64, f64) {
+/// Nudges a point that just crossed `edge` back inside `bounds` by
+/// `EDGE_MARGIN`, clamping so a display smaller than the margin still
+/// yields an in-bounds point rather than one that overshoots past the
+/// opposite edge. Bounds-relative for the same reason `crossed` is: on a
+/// multi-display Mac the screen this point is nudged back into does not
+/// start at `(0, 0)`.
+fn nudge_inward(edge: Edge, x: f64, y: f64, bounds: cursor::Bounds) -> (f64, f64) {
     match edge {
-        Edge::Top => (x, EDGE_MARGIN.min(screen_height)),
-        Edge::Bottom => (x, (screen_height - 1.0 - EDGE_MARGIN).max(0.0)),
-        Edge::Left => (EDGE_MARGIN.min(screen_width), y),
-        Edge::Right => ((screen_width - 1.0 - EDGE_MARGIN).max(0.0), y),
+        Edge::Top => (x, (bounds.min_y + EDGE_MARGIN).min(bounds.max_y)),
+        Edge::Bottom => (x, (bounds.max_y - 1.0 - EDGE_MARGIN).max(bounds.min_y)),
+        Edge::Left => ((bounds.min_x + EDGE_MARGIN).min(bounds.max_x), y),
+        Edge::Right => ((bounds.max_x - 1.0 - EDGE_MARGIN).max(bounds.min_x), y),
     }
+}
+
+/// How many continuous-scroll points (the unit trackpads and Magic Mice
+/// report; see `handle_event`'s `ScrollWheel` arm) are treated as
+/// equivalent to one line-delta unit, the unit a real wheel mouse's
+/// `ScrollWheel` events already report roughly one-per-notch, and what
+/// `wheel_delta` in `windows/inject.rs` multiplies by `WHEEL_DELTA` (120)
+/// to get a single notch of Windows wheel input.
+///
+/// 10.0 was chosen by reasoning from the default per-line scroll height
+/// AppKit documents for `NSScrollView` (about 10 points), not measured
+/// against real hardware, and needs confirming on an actual trackpad and
+/// Magic Mouse before it can be trusted; see Task 13. This is IMPORTANT 3
+/// from the whole-branch review: without this scaling, a single 30 point
+/// trackpad flick became 30 full notches (3600 raw wheel units) in one
+/// event.
+const CONTINUOUS_SCROLL_POINTS_PER_UNIT: f64 = 10.0;
+
+/// Converts one axis of a continuous (trackpad/Magic Mouse) scroll
+/// event's point delta into whole line-delta units, carrying forward
+/// whatever does not divide evenly so a string of slow, sub-threshold
+/// flicks still adds up to a scroll instead of being silently discarded
+/// on every event. Pure: takes this event's raw point delta and the
+/// remainder left over from the previous event on this axis, returns the
+/// whole-unit delta to send plus the new remainder to carry forward; see
+/// the `tests` module below.
+fn scale_continuous_scroll(points: i32, remainder: f64) -> (i32, f64) {
+    let total = points as f64 / CONTINUOUS_SCROLL_POINTS_PER_UNIT + remainder;
+    let whole = total.trunc();
+    (whole as i32, total - whole)
 }
 
 /// Owns the state needed to safely hide and pin the real cursor while
@@ -173,15 +215,18 @@ impl CursorPark {
         }
     }
 
-    /// Records `at` as the point to come back to and hides the cursor, but
-    /// only the first time this is called after a crossing: a no-op if
-    /// already parked, so it is safe to call on every remote motion event
-    /// rather than only the first.
+    /// Records `at` as the point to come back to, hides the cursor, and
+    /// disconnects hardware mouse movement from the cursor (see
+    /// `cursor::enter_parked_state`, IMPORTANT 2's fix), but only the
+    /// first time this is called after a crossing: a no-op if already
+    /// parked, so it is safe to call on every remote motion event rather
+    /// than only the first.
     fn park(&self, at: (f64, f64)) {
         let mut origin = lock_recovering(&self.origin, "cursor_park_origin");
         if origin.is_none() {
             *origin = Some(at);
             cursor::hide_cursor();
+            cursor::enter_parked_state();
         }
     }
 
@@ -195,7 +240,9 @@ impl CursorPark {
     }
 
     /// Gives the cursor back: warps it to the parked point one last time,
-    /// makes it visible again, and clears the parked state. Safe to call
+    /// makes it visible again, reassociates hardware mouse movement with
+    /// the cursor and restores the default suppression interval (undoing
+    /// `enter_parked_state`), and clears the parked state. Safe to call
     /// whether or not anything is actually parked, which is what lets
     /// both the callback and `Drop` call it unconditionally rather than
     /// tracking their own "did we already restore this" flag.
@@ -204,6 +251,84 @@ impl CursorPark {
         if let Some((x, y)) = origin.take() {
             cursor::warp_cursor(x, y);
             cursor::show_cursor();
+            cursor::leave_parked_state();
+        }
+    }
+}
+
+/// Hard cap on how many events `EventQueue` holds for `MacCapturer::poll`
+/// to drain. This is IMPORTANT 4's second line of defence from the
+/// whole-branch review: the tap callback only pushes onto this queue
+/// while focus is remote (see `handle_event`), which is the actual fix
+/// for the unbounded growth an always-connected consumer (`pump_server`)
+/// never has a problem draining; this cap exists for the case where focus
+/// really is remote but the consumer has stalled or fallen behind anyway.
+/// 4096 events, at a couple hundred bytes each worst case, is a low
+/// single-digit number of megabytes: several seconds of even fast mouse
+/// motion, comfortably more slack than a healthy connection ever needs.
+const MAX_QUEUED_EVENTS: usize = 4096;
+
+/// How often the "queue is full, dropping the oldest event" warning is
+/// allowed to fire, so a consumer that stays stalled for a long time logs
+/// about it once in a while instead of once per dropped event.
+const QUEUE_OVERFLOW_LOG_INTERVAL: Duration = Duration::from_secs(5);
+
+/// A capped FIFO queue shared between the tap callback (the only
+/// producer) and `MacCapturer::poll` (the only consumer). Deliberately
+/// not `std::sync::mpsc`: dropping the oldest entry once
+/// `MAX_QUEUED_EVENTS` is reached needs access to the front of the queue
+/// from the producer side, and an mpsc `Sender` can only ever push. A
+/// `Mutex<VecDeque<_>>` gives both sides that access. The lock is held
+/// only for a `push_back`/`pop_front`, cheap and non-blocking enough for
+/// the tap callback's "must stay cheap, must never block" requirement
+/// (see the module doc comment), and it is never contended for long since
+/// the only other holder is `poll`'s own quick pop.
+struct EventQueue {
+    events: Mutex<VecDeque<InputEvent>>,
+    last_overflow_log: Mutex<Option<Instant>>,
+}
+
+impl EventQueue {
+    fn new() -> Self {
+        Self {
+            events: Mutex::new(VecDeque::new()),
+            last_overflow_log: Mutex::new(None),
+        }
+    }
+
+    /// Pushes `event` onto the back of the queue, dropping the oldest
+    /// queued event first if this would exceed `MAX_QUEUED_EVENTS`. Never
+    /// blocks: the lock it takes is only ever held briefly by this or by
+    /// `pop`.
+    fn push(&self, event: InputEvent) {
+        let mut events = lock_recovering(&self.events, "event_queue");
+        if events.len() >= MAX_QUEUED_EVENTS {
+            events.pop_front();
+            // `last_overflow_log` is a separate mutex from `events`, so
+            // logging here while still holding this lock cannot deadlock
+            // against `pop`, which only ever takes `events`.
+            self.log_overflow_rate_limited();
+        }
+        events.push_back(event);
+    }
+
+    /// Pops the oldest queued event, or `None` if the queue is empty.
+    fn pop(&self) -> Option<InputEvent> {
+        lock_recovering(&self.events, "event_queue").pop_front()
+    }
+
+    fn log_overflow_rate_limited(&self) {
+        let mut last = lock_recovering(&self.last_overflow_log, "event_queue_overflow_log");
+        let now = Instant::now();
+        let should_log = last
+            .map(|previous| now.duration_since(previous) >= QUEUE_OVERFLOW_LOG_INTERVAL)
+            .unwrap_or(true);
+        if should_log {
+            *last = Some(now);
+            tracing::warn!(
+                cap = MAX_QUEUED_EVENTS,
+                "input event queue is full; dropping the oldest queued events"
+            );
         }
     }
 }
@@ -211,11 +336,11 @@ impl CursorPark {
 /// Captures keyboard and mouse input system wide via a `CGEventTap`.
 ///
 /// The tap and its run loop live on a dedicated background thread; this
-/// struct only holds the receiving end of the channel that thread feeds,
-/// the flag that tells it whether to suppress what it sees, and a handle
-/// to the cursor-parking state so `Drop` can always give the cursor back.
+/// struct only holds a handle to the capped queue that thread feeds, the
+/// flag that tells it whether to suppress what it sees, and a handle to
+/// the cursor-parking state so `Drop` can always give the cursor back.
 pub struct MacCapturer {
-    events: Receiver<InputEvent>,
+    events: Arc<EventQueue>,
     remote: Arc<AtomicBool>,
     park: Arc<CursorPark>,
     peer_connected: Arc<AtomicBool>,
@@ -231,7 +356,8 @@ impl MacCapturer {
     /// the escape hatch it provides (see `hotkey_matched`) works even when
     /// nothing is driving the connection loop that owns `poll`.
     pub fn start(edge: Edge, panic_combo: HashSet<Usage>) -> Result<Self, CaptureError> {
-        let (event_tx, event_rx) = mpsc::channel();
+        let events = Arc::new(EventQueue::new());
+        let events_for_thread = Arc::clone(&events);
         let (ready_tx, ready_rx) = mpsc::channel();
         let remote = Arc::new(AtomicBool::new(false));
         let remote_for_thread = Arc::clone(&remote);
@@ -244,7 +370,7 @@ impl MacCapturer {
             .name("hop-capture-tap".into())
             .spawn(move || {
                 run_capture_thread(
-                    event_tx,
+                    events_for_thread,
                     remote_for_thread,
                     park_for_thread,
                     peer_connected_for_thread,
@@ -257,7 +383,7 @@ impl MacCapturer {
 
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(Self {
-                events: event_rx,
+                events,
                 remote,
                 park,
                 peer_connected,
@@ -291,7 +417,7 @@ impl MacCapturer {
 
 impl Capturer for MacCapturer {
     fn poll(&mut self) -> Option<InputEvent> {
-        self.events.try_recv().ok()
+        self.events.pop()
     }
 }
 
@@ -327,21 +453,24 @@ fn lock_recovering<'a, T>(mutex: &'a Mutex<T>, name: &'static str) -> MutexGuard
     })
 }
 
-/// Everything the tap callback needs beyond the event itself: the channel
+/// Everything the tap callback needs beyond the event itself: the queue
 /// events are pushed into, shared flags, and the small pieces of mutable
 /// state a single capture thread owns. Bundled into one struct, moved
 /// whole into the callback closure, so `handle_event` takes a reasonable
 /// number of arguments instead of nine separate ones.
 struct CaptureContext {
-    event_tx: Sender<InputEvent>,
+    events: Arc<EventQueue>,
     remote: Arc<AtomicBool>,
     held_modifiers: Mutex<HashSet<i64>>,
     last_seen: Arc<Mutex<Instant>>,
     tap_port: Arc<Mutex<Option<usize>>>,
     /// The screen edge that hands focus to the peer.
     edge: Edge,
-    screen_width: f64,
-    screen_height: f64,
+    /// The union of every active display's bounds; see
+    /// `cursor::display_bounds`. IMPORTANT 1's fix from the whole-branch
+    /// review: `crossed` and `nudge_inward` compare against this instead
+    /// of the main display's bounds alone.
+    bounds: cursor::Bounds,
     park: Arc<CursorPark>,
     /// Set only while a peer is actually connected; see
     /// `MacCapturer::peer_connected_flag` and `should_begin_crossing`.
@@ -356,6 +485,12 @@ struct CaptureContext {
     /// raw macOS device keycodes for the left/right modifier toggle, not
     /// canonical `Usage`s.
     held_usages: Mutex<HashSet<Usage>>,
+    /// Fractional remainder carried across continuous (trackpad/Magic
+    /// Mouse) scroll events, `(x, y)`. See `scale_continuous_scroll`,
+    /// IMPORTANT 3's fix from the whole-branch review, for why this needs
+    /// to persist between events rather than being recomputed from
+    /// scratch each time.
+    scroll_remainder: Mutex<(f64, f64)>,
 }
 
 /// Body of the dedicated capture thread: creates the tap, wires it into a
@@ -363,7 +498,7 @@ struct CaptureContext {
 /// pumping that run loop. Reports success or failure back through
 /// `ready_tx` once the tap is enabled (or definitely is not going to be).
 fn run_capture_thread(
-    event_tx: Sender<InputEvent>,
+    events: Arc<EventQueue>,
     remote: Arc<AtomicBool>,
     park: Arc<CursorPark>,
     peer_connected: Arc<AtomicBool>,
@@ -386,25 +521,27 @@ fn run_capture_thread(
     let tap_port: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
     let tap_port_for_callback = Arc::clone(&tap_port);
 
-    // Read once, up front, rather than on every event: the display's size
-    // does not change often enough to justify a syscall on every mouse
-    // move, and a resolution change mid session is an accepted limitation
-    // here (see Task 13).
-    let (screen_width, screen_height) = cursor::screen_size();
+    // Read once, up front, rather than on every event: display bounds do
+    // not change often enough to justify recomputing them (a
+    // `CGDisplay::active_displays()` call plus one `bounds()` per
+    // display) on every mouse move, and a display being hot-plugged,
+    // unplugged, or rearranged mid session is an accepted limitation here
+    // (see Task 13 and `cursor::display_bounds`'s doc comment).
+    let bounds = cursor::display_bounds();
 
     let ctx = CaptureContext {
-        event_tx,
+        events,
         remote,
         held_modifiers: Mutex::new(HashSet::new()),
         last_seen: last_seen_for_callback,
         tap_port: tap_port_for_callback,
         edge,
-        screen_width,
-        screen_height,
+        bounds,
         park,
         peer_connected,
         panic_combo,
         held_usages: Mutex::new(HashSet::new()),
+        scroll_remainder: Mutex::new((0.0, 0.0)),
     };
 
     let events_of_interest = vec![
@@ -562,19 +699,31 @@ fn handle_event(event_type: CGEventType, event: &CGEvent, ctx: &CaptureContext) 
                     // used below read 0 until a full line accumulates,
                     // which on these devices may never happen, so a
                     // continuous event has to read the point-delta fields
-                    // instead. Point deltas are a different scale than
-                    // line deltas, so the peer's injector may eventually
-                    // need its own sensitivity for this axis; unconfirmed
-                    // against real trackpad hardware, see Task 13.
-                    (
-                        event.get_integer_value_field(
-                            EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2,
-                        ) as i32,
-                        event.get_integer_value_field(
-                            EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1,
-                        ) as i32,
-                    )
+                    // instead. Point deltas are tens of units per event,
+                    // a different scale entirely from the roughly
+                    // one-per-notch line deltas the non-continuous branch
+                    // below reports, so they are scaled down and
+                    // accumulated across events by `scale_continuous_scroll`
+                    // (IMPORTANT 3's fix from the whole-branch review)
+                    // rather than passed straight through, which would
+                    // send about thirty scroll notches for a single
+                    // trackpad flick once the peer's injector multiplies
+                    // by `WHEEL_DELTA`.
+                    let raw_dx = event
+                        .get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2)
+                        as i32;
+                    let raw_dy = event
+                        .get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1)
+                        as i32;
+                    let mut remainder = lock_recovering(&ctx.scroll_remainder, "scroll_remainder");
+                    let (dx, remainder_x) = scale_continuous_scroll(raw_dx, remainder.0);
+                    let (dy, remainder_y) = scale_continuous_scroll(raw_dy, remainder.1);
+                    *remainder = (remainder_x, remainder_y);
+                    (dx, dy)
                 } else {
+                    // A real wheel mouse already reports one unit per
+                    // notch here; no scaling needed, matching the
+                    // behavior before IMPORTANT 3's fix.
                     (
                         event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2)
                             as i32,
@@ -603,7 +752,7 @@ fn handle_event(event_type: CGEventType, event: &CGEvent, ctx: &CaptureContext) 
         // `HotkeyWatcher` in hop's run.rs, which still runs the sanctioned
         // path (releasing the peer's held keys through `Control`) once
         // the connection loop's next poll tick notices the same key
-        // event via the channel send just below; this is what makes the
+        // event via the queue push just below; this is what makes the
         // local keyboard and mouse come back even when that loop, or
         // `poll`, is not currently running at all, for example because no
         // client has ever connected.
@@ -620,10 +769,26 @@ fn handle_event(event_type: CGEventType, event: &CGEvent, ctx: &CaptureContext) 
     }
 
     if let Some(input_event) = translated {
-        // The receiver only goes away when `MacCapturer` is dropped, at
-        // which point there is nothing useful to do with a send failure;
-        // dropping the event on the floor is the correct response.
-        let _ = ctx.event_tx.send(input_event);
+        // Only queued while focus is actually remote: this is IMPORTANT
+        // 4's fix from the whole-branch review. `pump_server` in
+        // hop-core only forwards these while `control.focus() ==
+        // Focus::Remote` (and drops Key events on the floor via
+        // `Control::on_key` while `Focus::Local`), so an event queued
+        // while local would only ever be drained and discarded, never
+        // acted on. Before this gate, every keystroke and every mouse
+        // motion queued unconditionally, for as long as nobody drains
+        // the queue at all, which is exactly what happens whenever no
+        // client is connected: with the PC off overnight, that grows
+        // without bound and holds the user's entire keystroke history in
+        // process memory. Reading `ctx.remote` here, before the crossing
+        // check below can flip it, also means the one motion event that
+        // itself crosses the edge is not queued (its own local dx/dy
+        // means nothing to the peer); only the `EdgeCrossed` signal
+        // below is, which is what `pump_server` actually acts on to
+        // start forwarding.
+        if ctx.remote.load(Ordering::Relaxed) {
+            ctx.events.push(input_event);
+        }
     }
 
     let is_motion_event = matches!(
@@ -653,31 +818,23 @@ fn handle_event(event_type: CGEventType, event: &CGEvent, ctx: &CaptureContext) 
 
         if is_motion_event {
             let location = event.location();
-            let edge_crossed = crossed(
-                ctx.edge,
-                location.x,
-                location.y,
-                ctx.screen_width,
-                ctx.screen_height,
-            );
+            let edge_crossed = crossed(ctx.edge, location.x, location.y, ctx.bounds);
             if should_begin_crossing(ctx.peer_connected.load(Ordering::Relaxed), edge_crossed) {
-                let landing = nudge_inward(
-                    ctx.edge,
-                    location.x,
-                    location.y,
-                    ctx.screen_width,
-                    ctx.screen_height,
-                );
+                let landing = nudge_inward(ctx.edge, location.x, location.y, ctx.bounds);
                 ctx.park.park(landing);
                 // Set before the final suppression check below runs, so
                 // the very event that crossed the edge is itself already
                 // suppressed rather than leaking one more pixel of local
                 // motion past the boundary.
                 ctx.remote.store(true, Ordering::Relaxed);
-                // Not translated by `translate`, and not the receiver's
-                // problem if nobody is listening; see the comment above
-                // for `input_event`.
-                let _ = ctx.event_tx.send(InputEvent::EdgeCrossed);
+                // Always queued, unlike the gated push above: this is the
+                // one signal `pump_server` needs regardless of focus to
+                // start forwarding at all (see `Control::on_edge_crossed`
+                // in hop-core), and it only ever fires while a peer is
+                // actually connected (`should_begin_crossing` requires
+                // `peer_connected`), so it can never be the source of
+                // unbounded growth IMPORTANT 4 was about.
+                ctx.events.push(InputEvent::EdgeCrossed);
             }
         }
     }
@@ -1138,32 +1295,34 @@ mod tests {
     }
 
     // `crossed` is the pure decision behind edge detection: given where
-    // the cursor is and how big the screen is, has it reached the
-    // configured edge. Everything else this task adds (reading the real
-    // cursor, warping it, hiding it) needs hardware and is out of reach
-    // for an automated test; this is the part that actually is one.
+    // the cursor is and the bounds of the virtual desktop (the union of
+    // every active display; see `cursor::display_bounds`), has it
+    // reached the configured edge. Everything else this task adds
+    // (reading the real cursor, warping it, hiding it) needs hardware
+    // and is out of reach for an automated test; this is the part that
+    // actually is one.
     const SCREEN_W: f64 = 1920.0;
     const SCREEN_H: f64 = 1080.0;
+    const SINGLE_DISPLAY: cursor::Bounds = cursor::Bounds {
+        min_x: 0.0,
+        min_y: 0.0,
+        max_x: SCREEN_W,
+        max_y: SCREEN_H,
+    };
 
     #[test]
     fn top_edge_triggers_exactly_at_y_zero() {
-        assert!(crossed(Edge::Top, 960.0, 0.0, SCREEN_W, SCREEN_H));
+        assert!(crossed(Edge::Top, 960.0, 0.0, SINGLE_DISPLAY));
     }
 
     #[test]
     fn top_edge_does_not_trigger_just_inside() {
-        assert!(!crossed(Edge::Top, 960.0, 5.0, SCREEN_W, SCREEN_H));
+        assert!(!crossed(Edge::Top, 960.0, 5.0, SINGLE_DISPLAY));
     }
 
     #[test]
     fn bottom_edge_triggers_at_the_screen_height_boundary() {
-        assert!(crossed(
-            Edge::Bottom,
-            960.0,
-            SCREEN_H - 1.0,
-            SCREEN_W,
-            SCREEN_H
-        ));
+        assert!(crossed(Edge::Bottom, 960.0, SCREEN_H - 1.0, SINGLE_DISPLAY));
     }
 
     #[test]
@@ -1172,41 +1331,28 @@ mod tests {
             Edge::Bottom,
             960.0,
             SCREEN_H - 6.0,
-            SCREEN_W,
-            SCREEN_H
+            SINGLE_DISPLAY
         ));
     }
 
     #[test]
     fn left_edge_triggers_exactly_at_x_zero() {
-        assert!(crossed(Edge::Left, 0.0, 540.0, SCREEN_W, SCREEN_H));
+        assert!(crossed(Edge::Left, 0.0, 540.0, SINGLE_DISPLAY));
     }
 
     #[test]
     fn left_edge_does_not_trigger_just_inside() {
-        assert!(!crossed(Edge::Left, 5.0, 540.0, SCREEN_W, SCREEN_H));
+        assert!(!crossed(Edge::Left, 5.0, 540.0, SINGLE_DISPLAY));
     }
 
     #[test]
     fn right_edge_triggers_at_the_screen_width_boundary() {
-        assert!(crossed(
-            Edge::Right,
-            SCREEN_W - 1.0,
-            540.0,
-            SCREEN_W,
-            SCREEN_H
-        ));
+        assert!(crossed(Edge::Right, SCREEN_W - 1.0, 540.0, SINGLE_DISPLAY));
     }
 
     #[test]
     fn right_edge_does_not_trigger_just_inside() {
-        assert!(!crossed(
-            Edge::Right,
-            SCREEN_W - 6.0,
-            540.0,
-            SCREEN_W,
-            SCREEN_H
-        ));
+        assert!(!crossed(Edge::Right, SCREEN_W - 6.0, 540.0, SINGLE_DISPLAY));
     }
 
     #[test]
@@ -1216,37 +1362,130 @@ mod tests {
         // it must not be possible for a point on that boundary to also
         // read as having crossed any other edge.
         let (x, y) = (960.0, 0.0);
-        assert!(crossed(Edge::Top, x, y, SCREEN_W, SCREEN_H));
-        assert!(!crossed(Edge::Bottom, x, y, SCREEN_W, SCREEN_H));
-        assert!(!crossed(Edge::Left, x, y, SCREEN_W, SCREEN_H));
-        assert!(!crossed(Edge::Right, x, y, SCREEN_W, SCREEN_H));
+        assert!(crossed(Edge::Top, x, y, SINGLE_DISPLAY));
+        assert!(!crossed(Edge::Bottom, x, y, SINGLE_DISPLAY));
+        assert!(!crossed(Edge::Left, x, y, SINGLE_DISPLAY));
+        assert!(!crossed(Edge::Right, x, y, SINGLE_DISPLAY));
     }
 
     #[test]
     fn only_the_left_edge_triggers_at_the_left_boundary() {
         let (x, y) = (0.0, 540.0);
-        assert!(crossed(Edge::Left, x, y, SCREEN_W, SCREEN_H));
-        assert!(!crossed(Edge::Top, x, y, SCREEN_W, SCREEN_H));
-        assert!(!crossed(Edge::Bottom, x, y, SCREEN_W, SCREEN_H));
-        assert!(!crossed(Edge::Right, x, y, SCREEN_W, SCREEN_H));
+        assert!(crossed(Edge::Left, x, y, SINGLE_DISPLAY));
+        assert!(!crossed(Edge::Top, x, y, SINGLE_DISPLAY));
+        assert!(!crossed(Edge::Bottom, x, y, SINGLE_DISPLAY));
+        assert!(!crossed(Edge::Right, x, y, SINGLE_DISPLAY));
     }
 
     #[test]
     fn only_the_right_edge_triggers_at_the_right_boundary() {
         let (x, y) = (SCREEN_W - 1.0, 540.0);
-        assert!(crossed(Edge::Right, x, y, SCREEN_W, SCREEN_H));
-        assert!(!crossed(Edge::Top, x, y, SCREEN_W, SCREEN_H));
-        assert!(!crossed(Edge::Bottom, x, y, SCREEN_W, SCREEN_H));
-        assert!(!crossed(Edge::Left, x, y, SCREEN_W, SCREEN_H));
+        assert!(crossed(Edge::Right, x, y, SINGLE_DISPLAY));
+        assert!(!crossed(Edge::Top, x, y, SINGLE_DISPLAY));
+        assert!(!crossed(Edge::Bottom, x, y, SINGLE_DISPLAY));
+        assert!(!crossed(Edge::Left, x, y, SINGLE_DISPLAY));
     }
 
     #[test]
     fn only_the_bottom_edge_triggers_at_the_bottom_boundary() {
         let (x, y) = (960.0, SCREEN_H - 1.0);
-        assert!(crossed(Edge::Bottom, x, y, SCREEN_W, SCREEN_H));
-        assert!(!crossed(Edge::Top, x, y, SCREEN_W, SCREEN_H));
-        assert!(!crossed(Edge::Left, x, y, SCREEN_W, SCREEN_H));
-        assert!(!crossed(Edge::Right, x, y, SCREEN_W, SCREEN_H));
+        assert!(crossed(Edge::Bottom, x, y, SINGLE_DISPLAY));
+        assert!(!crossed(Edge::Top, x, y, SINGLE_DISPLAY));
+        assert!(!crossed(Edge::Left, x, y, SINGLE_DISPLAY));
+        assert!(!crossed(Edge::Right, x, y, SINGLE_DISPLAY));
+    }
+
+    // IMPORTANT 1 from the whole-branch review: on a multi-display Mac,
+    // `bounds` is the union of every active display (see
+    // `cursor::display_bounds`), not just the main display's own bounds,
+    // and a display positioned above or to the left of the main one
+    // pushes `min_y`/`min_x` negative. These tests pin the fix: a
+    // multi-display union whose main display still sits at `(0, 0)` in
+    // the middle of the virtual desktop.
+    const ABOVE_MAIN: cursor::Bounds = cursor::Bounds {
+        // Main display 1920x1080 at (0, 0); a second, wider and taller
+        // display centered above it at (-320, -1440).
+        min_x: -320.0,
+        min_y: -1440.0,
+        max_x: 2240.0,
+        max_y: 1080.0,
+    };
+    const BELOW_MAIN: cursor::Bounds = cursor::Bounds {
+        // Main display 1920x1080 at (0, 0); a second 1920x1080 display
+        // below and to the right, at (200, 1080).
+        min_x: 0.0,
+        min_y: 0.0,
+        max_x: 2120.0,
+        max_y: 2160.0,
+    };
+
+    #[test]
+    fn top_edge_does_not_trigger_at_the_main_displays_own_top_when_a_display_sits_above_it() {
+        // This is the exact failure IMPORTANT 1 describes: y = 0 is the
+        // main display's own top edge, but with a second display above
+        // it that point is mid-desktop, not the top of the virtual
+        // desktop, and must not read as a crossing.
+        assert!(!crossed(Edge::Top, 500.0, 0.0, ABOVE_MAIN));
+    }
+
+    #[test]
+    fn top_edge_triggers_at_the_true_top_of_a_display_above_main() {
+        assert!(crossed(Edge::Top, 500.0, ABOVE_MAIN.min_y, ABOVE_MAIN));
+        assert!(!crossed(
+            Edge::Top,
+            500.0,
+            ABOVE_MAIN.min_y + 5.0,
+            ABOVE_MAIN
+        ));
+    }
+
+    #[test]
+    fn bottom_edge_does_not_trigger_at_the_main_displays_own_bottom_when_a_display_sits_below_it() {
+        // Mirror of the top-edge case: 1079 is the main display's own
+        // bottom edge, but with a display below it that point is well
+        // inside the virtual desktop.
+        assert!(!crossed(Edge::Bottom, 500.0, SCREEN_H - 1.0, BELOW_MAIN));
+    }
+
+    #[test]
+    fn bottom_edge_triggers_at_the_true_bottom_of_a_display_below_main() {
+        assert!(crossed(
+            Edge::Bottom,
+            500.0,
+            BELOW_MAIN.max_y - 1.0,
+            BELOW_MAIN
+        ));
+        assert!(!crossed(
+            Edge::Bottom,
+            500.0,
+            BELOW_MAIN.max_y - 6.0,
+            BELOW_MAIN
+        ));
+    }
+
+    #[test]
+    fn each_edge_triggers_at_and_only_at_its_own_boundary_with_negative_origins() {
+        // A virtual desktop that extends into negative territory on both
+        // axes at once, so this cannot pass by accident from an
+        // implementation that only special-cases one negative origin.
+        let bounds = cursor::Bounds {
+            min_x: -500.0,
+            min_y: -300.0,
+            max_x: 1420.0,
+            max_y: 780.0,
+        };
+
+        assert!(crossed(Edge::Top, 0.0, bounds.min_y, bounds));
+        assert!(!crossed(Edge::Top, 0.0, bounds.min_y + 5.0, bounds));
+
+        assert!(crossed(Edge::Bottom, 0.0, bounds.max_y - 1.0, bounds));
+        assert!(!crossed(Edge::Bottom, 0.0, bounds.max_y - 6.0, bounds));
+
+        assert!(crossed(Edge::Left, bounds.min_x, 0.0, bounds));
+        assert!(!crossed(Edge::Left, bounds.min_x + 5.0, 0.0, bounds));
+
+        assert!(crossed(Edge::Right, bounds.max_x - 1.0, 0.0, bounds));
+        assert!(!crossed(Edge::Right, bounds.max_x - 6.0, 0.0, bounds));
     }
 
     // `nudge_inward` is what keeps a restored cursor from sitting exactly
@@ -1255,28 +1494,44 @@ mod tests {
     // so it gets the same direct coverage as `crossed`.
     #[test]
     fn nudge_inward_moves_away_from_each_edge_past_its_own_boundary() {
-        let (_, y) = nudge_inward(Edge::Top, 960.0, 0.0, SCREEN_W, SCREEN_H);
-        assert!(!crossed(Edge::Top, 960.0, y, SCREEN_W, SCREEN_H));
+        let (_, y) = nudge_inward(Edge::Top, 960.0, 0.0, SINGLE_DISPLAY);
+        assert!(!crossed(Edge::Top, 960.0, y, SINGLE_DISPLAY));
 
-        let (_, y) = nudge_inward(Edge::Bottom, 960.0, SCREEN_H - 1.0, SCREEN_W, SCREEN_H);
-        assert!(!crossed(Edge::Bottom, 960.0, y, SCREEN_W, SCREEN_H));
+        let (_, y) = nudge_inward(Edge::Bottom, 960.0, SCREEN_H - 1.0, SINGLE_DISPLAY);
+        assert!(!crossed(Edge::Bottom, 960.0, y, SINGLE_DISPLAY));
 
-        let (x, _) = nudge_inward(Edge::Left, 0.0, 540.0, SCREEN_W, SCREEN_H);
-        assert!(!crossed(Edge::Left, x, 540.0, SCREEN_W, SCREEN_H));
+        let (x, _) = nudge_inward(Edge::Left, 0.0, 540.0, SINGLE_DISPLAY);
+        assert!(!crossed(Edge::Left, x, 540.0, SINGLE_DISPLAY));
 
-        let (x, _) = nudge_inward(Edge::Right, SCREEN_W - 1.0, 540.0, SCREEN_W, SCREEN_H);
-        assert!(!crossed(Edge::Right, x, 540.0, SCREEN_W, SCREEN_H));
+        let (x, _) = nudge_inward(Edge::Right, SCREEN_W - 1.0, 540.0, SINGLE_DISPLAY);
+        assert!(!crossed(Edge::Right, x, 540.0, SINGLE_DISPLAY));
+    }
+
+    #[test]
+    fn nudge_inward_moves_away_from_the_true_edge_on_a_multi_display_union() {
+        // Same property as above, but against a bounds whose top edge is
+        // not at y = 0, so this would fail if `nudge_inward` were still
+        // implicitly assuming a zero origin.
+        let (_, y) = nudge_inward(Edge::Top, 500.0, ABOVE_MAIN.min_y, ABOVE_MAIN);
+        assert!(!crossed(Edge::Top, 500.0, y, ABOVE_MAIN));
     }
 
     #[test]
     fn nudge_inward_clamps_on_a_screen_smaller_than_the_margin() {
         // A screen thinner than `EDGE_MARGIN` must still yield an
-        // in-bounds, non-negative point rather than going negative.
-        let (x, _) = nudge_inward(Edge::Left, 0.0, 5.0, 3.0, 3.0);
-        assert!((0.0..=3.0).contains(&x));
+        // in-bounds point rather than overshooting past the opposite
+        // edge.
+        let tiny = cursor::Bounds {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 3.0,
+            max_y: 3.0,
+        };
+        let (x, _) = nudge_inward(Edge::Left, 0.0, 5.0, tiny);
+        assert!((tiny.min_x..=tiny.max_x).contains(&x));
 
-        let (_, y) = nudge_inward(Edge::Top, 5.0, 0.0, 3.0, 3.0);
-        assert!((0.0..=3.0).contains(&y));
+        let (_, y) = nudge_inward(Edge::Top, 5.0, 0.0, tiny);
+        assert!((tiny.min_y..=tiny.max_y).contains(&y));
     }
 
     // `should_begin_crossing` is the pure decision behind CRITICAL 1: an
@@ -1336,13 +1591,118 @@ mod tests {
         assert!(hotkey_matched(&combo, &held));
     }
 
+    // `scale_continuous_scroll` is the pure decision behind IMPORTANT 3's
+    // fix: given a continuous scroll event's raw point delta and the
+    // remainder left over from the previous event, how many whole
+    // line-delta units should be sent, and what remainder carries
+    // forward.
+    #[test]
+    fn a_single_flick_is_scaled_down_to_a_few_notches_not_thousands_of_units() {
+        // The exact scenario IMPORTANT 3 describes: a 30 point flick.
+        // Before this fix, that became `30 * WHEEL_DELTA` (3600) wheel
+        // units, thirty notches, in one event; scaled down it becomes a
+        // small, plausible number of line-delta units instead.
+        let (units, remainder) = scale_continuous_scroll(30, 0.0);
+        assert_eq!(units, 3);
+        assert_eq!(remainder, 0.0);
+    }
+
+    #[test]
+    fn slow_scrolling_accumulates_across_events_instead_of_being_discarded() {
+        // Individual sub-threshold deltas would truncate to zero every
+        // time under naive integer division; carrying the remainder
+        // forward means they still add up to a whole unit eventually.
+        // 5 points per event divides `CONTINUOUS_SCROLL_POINTS_PER_UNIT`
+        // exactly (0.5), so the running total is exactly representable
+        // in binary floating point at every step and this is not at the
+        // mercy of rounding, unlike a value such as 3 points (0.3 per
+        // event) would be.
+        let mut remainder = 0.0;
+        let mut total_units = 0;
+        for _ in 0..6 {
+            let (units, new_remainder) = scale_continuous_scroll(5, remainder);
+            total_units += units;
+            remainder = new_remainder;
+        }
+        // 6 events of 5 points each is 30 points, the same total as the
+        // single-flick case above, and must add up to the same 3 units
+        // rather than losing everything to per-event truncation (which
+        // would yield 0, since 5 / 10.0 truncates to 0 every time).
+        assert_eq!(total_units, 3);
+        assert_eq!(remainder, 0.0);
+    }
+
+    #[test]
+    fn negative_deltas_scale_and_accumulate_the_same_way() {
+        let (units, remainder) = scale_continuous_scroll(-30, 0.0);
+        assert_eq!(units, -3);
+        assert_eq!(remainder, 0.0);
+
+        let mut remainder = 0.0;
+        let mut total_units = 0;
+        for _ in 0..6 {
+            let (units, new_remainder) = scale_continuous_scroll(-5, remainder);
+            total_units += units;
+            remainder = new_remainder;
+        }
+        assert_eq!(total_units, -3);
+    }
+
+    // A real wheel mouse's non-continuous `ScrollWheel` branch in
+    // `handle_event` never calls `scale_continuous_scroll` at all;
+    // `translate` passes its line-delta dx/dy straight through unscaled,
+    // which `translates_scroll` above already covers, so that behavior
+    // has no separate test here.
+
+    // `EventQueue` is IMPORTANT 4's second line of defence: a cap on how
+    // many events can pile up, with the oldest dropped first once it is
+    // reached. Pure in-memory state, no macOS calls, so unlike
+    // `CursorPark` below it is directly testable.
+    #[test]
+    fn event_queue_pops_in_fifo_order() {
+        let queue = EventQueue::new();
+        queue.push(InputEvent::Mouse { dx: 1, dy: 0 });
+        queue.push(InputEvent::Mouse { dx: 2, dy: 0 });
+        queue.push(InputEvent::Mouse { dx: 3, dy: 0 });
+        assert_eq!(queue.pop(), Some(InputEvent::Mouse { dx: 1, dy: 0 }));
+        assert_eq!(queue.pop(), Some(InputEvent::Mouse { dx: 2, dy: 0 }));
+        assert_eq!(queue.pop(), Some(InputEvent::Mouse { dx: 3, dy: 0 }));
+        assert_eq!(queue.pop(), None);
+    }
+
+    #[test]
+    fn event_queue_drops_the_oldest_event_once_the_cap_is_reached() {
+        let queue = EventQueue::new();
+        for i in 0..MAX_QUEUED_EVENTS {
+            queue.push(InputEvent::Mouse {
+                dx: i as i32,
+                dy: 0,
+            });
+        }
+        // One more push past the cap must evict the oldest (dx: 0), not
+        // grow the queue past `MAX_QUEUED_EVENTS`, and not silently drop
+        // the newest instead.
+        queue.push(InputEvent::Mouse {
+            dx: MAX_QUEUED_EVENTS as i32,
+            dy: 0,
+        });
+        assert_eq!(queue.pop(), Some(InputEvent::Mouse { dx: 1, dy: 0 }));
+        let mut remaining = 1;
+        while queue.pop().is_some() {
+            remaining += 1;
+        }
+        assert_eq!(remaining, MAX_QUEUED_EVENTS);
+    }
+
     // `CursorPark::park`/`hold`/`restore` are deliberately not exercised
     // here: every path through them ends in a real `cursor::hide_cursor`,
-    // `warp_cursor`, or `show_cursor` call, and this workspace's tests run
-    // on real macOS hosts, so calling them from a unit test would actually
-    // hide and warp the developer's cursor as a side effect of `cargo
-    // test`. That is exactly the kind of hardware-dependent behavior this
-    // task's brief calls out as only verifiable by a human, in Task 13;
-    // `crossed` and `nudge_inward` above are the parts of this file that
-    // are actually pure.
+    // `warp_cursor`, `show_cursor`, `cursor::enter_parked_state`, or
+    // `cursor::leave_parked_state` call, and this workspace's tests run
+    // on real macOS hosts, so calling them from a unit test would
+    // actually hide, warp, and disassociate the developer's cursor as a
+    // side effect of `cargo test`. That is exactly the kind of
+    // hardware-dependent behavior this task's brief calls out as only
+    // verifiable by a human, in Task 13; `crossed`, `nudge_inward`,
+    // `scale_continuous_scroll`, and `EventQueue` above are the parts of
+    // this file that are actually pure.
 }
