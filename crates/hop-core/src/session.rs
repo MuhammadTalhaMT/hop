@@ -98,19 +98,32 @@ where
             // every key this client actually holds, not merely decode a
             // message into an event.
             for usage in held.drain_release() {
-                let _ = injector.inject(&InputEvent::Key {
+                let event = InputEvent::Key {
                     usage,
                     pressed: false,
-                });
+                };
+                if let Err(error) = injector.inject(&event) {
+                    // Swallowed deliberately: aborting the receive loop
+                    // over one rejected key-up would be worse than the
+                    // stray key it leaves un-released, but it must not be
+                    // silent, or a platform injector that starts rejecting
+                    // everything looks identical to a healthy connection.
+                    tracing::warn!(?event, %error, "injector rejected event");
+                }
             }
         }
         Message::Key { usage, pressed } => {
             held.record(usage, pressed);
-            let _ = injector.inject(&InputEvent::Key { usage, pressed });
+            let event = InputEvent::Key { usage, pressed };
+            if let Err(error) = injector.inject(&event) {
+                tracing::warn!(?event, %error, "injector rejected event");
+            }
         }
         other => {
             if let Some(event) = message_to_event(&other) {
-                let _ = injector.inject(&event);
+                if let Err(error) = injector.inject(&event) {
+                    tracing::warn!(?event, %error, "injector rejected event");
+                }
             }
         }
     }
@@ -189,5 +202,56 @@ mod tests {
         // message.
         let remap = RemapTable::new();
         assert!(event_to_message(&remap, InputEvent::EdgeCrossed).is_none());
+    }
+
+    #[tokio::test]
+    async fn pump_client_keeps_processing_after_injection_is_rejected() {
+        // A Windows injector that starts rejecting events must not stall
+        // the client: the socket must stay up, and the next message must
+        // still be received and acted on. Silently wedging here, with
+        // heartbeats still flowing and liveness still reporting healthy,
+        // is exactly the failure mode this project exists to prevent.
+        use crate::FailingInjector;
+        use hop_proto::{SessionId, SharedKey};
+        use tokio::io::duplex;
+
+        let (a, b) = duplex(4096);
+        let mut server = Transport::new(a, SharedKey::from_bytes([1u8; 32]), SessionId::ZERO);
+        let mut client = Transport::new(b, SharedKey::from_bytes([1u8; 32]), SessionId::ZERO);
+        let mut injector = FailingInjector;
+        let mut held = HeldKeys::new();
+
+        server
+            .send(&Message::Key {
+                usage: Usage::C,
+                pressed: true,
+            })
+            .await
+            .expect("send first message");
+        server
+            .send(&Message::Key {
+                usage: Usage::A,
+                pressed: true,
+            })
+            .await
+            .expect("send second message");
+
+        // The first pump call injects a rejected event and must still
+        // return Ok, not surface the injector's error to the caller.
+        assert!(pump_client(&mut client, &mut injector, &mut held)
+            .await
+            .is_ok());
+        // A second message must still be received and processed, proving
+        // the earlier rejection did not stall the receive loop.
+        assert!(pump_client(&mut client, &mut injector, &mut held)
+            .await
+            .is_ok());
+
+        // held still records both keys as pressed: pump_client tracks
+        // what it attempted to inject regardless of whether the platform
+        // accepted it, since the alternative (only recording successful
+        // injections) would make ReleaseAllKeys release the wrong set the
+        // moment the platform starts failing.
+        assert_eq!(held.held(), vec![Usage::A, Usage::C]);
     }
 }

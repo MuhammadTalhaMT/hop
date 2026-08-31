@@ -85,6 +85,19 @@ impl Injector for FakeInjector {
     }
 }
 
+/// Always refuses to inject, as though the platform had started rejecting
+/// every event. Exists to pin the behavior this project actually wants
+/// when that happens: the caller logs and keeps going rather than
+/// aborting the receive loop, since a stalled connection with a healthy
+/// looking socket is the exact silent failure this tool exists to avoid.
+pub struct FailingInjector;
+
+impl Injector for FailingInjector {
+    fn inject(&mut self, _event: &InputEvent) -> Result<(), DeviceError> {
+        Err(DeviceError::Rejected("platform refused the event".into()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
