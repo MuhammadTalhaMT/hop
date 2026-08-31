@@ -763,6 +763,20 @@ return_edge = "bottom"
         assert_eq!(config.id.as_deref(), Some("pc"));
         assert_eq!(config.server.as_deref(), Some("192.168.18.90:24810"));
         assert!(config.discovery.enabled);
+        // `%VAR%` expansion is deliberately a no-op off Windows, so the same
+        // config yields a literal path there and a real one on Windows.
+        // Asserting the literal everywhere passed on macOS and failed on the
+        // Windows runner.
+        #[cfg(target_os = "windows")]
+        {
+            let appdata = std::env::var("APPDATA")
+                .expect("APPDATA should be set in the test environment on Windows");
+            assert_eq!(
+                config.security.key_file,
+                PathBuf::from(appdata).join("hop").join("key")
+            );
+        }
+        #[cfg(not(target_os = "windows"))]
         assert_eq!(
             config.security.key_file,
             PathBuf::from("%APPDATA%\\hop\\key")
