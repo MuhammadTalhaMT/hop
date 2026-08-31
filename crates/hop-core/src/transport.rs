@@ -69,6 +69,14 @@ pub struct TransportWriter<W> {
 /// other, and a caller can await `recv` on one task while `send` runs on
 /// another (or on the same task interleaved with a heartbeat timer),
 /// which a single `&mut self` type could never allow.
+///
+/// Dropping only one half does NOT close the underlying connection: the
+/// other half still holds its share of the stream, so no EOF is ever
+/// delivered and a `recv` on the surviving half blocks forever. Tearing a
+/// connection down means dropping BOTH the `TransportReader` and the
+/// `TransportWriter` it was split from. A supervisor that drops only its
+/// writer when it decides a peer is dead will leave its reader task
+/// hanging instead of exiting, and the reconnect loop will never fire.
 pub fn split<S: AsyncRead + AsyncWrite>(
     stream: S,
     key: SharedKey,
@@ -178,6 +186,18 @@ mod tests {
         SessionId([3u8; 32])
     }
 
+    /// A regression that makes `recv` block forever (for example, a future
+    /// change to `split`'s close semantics) must fail the test suite fast
+    /// rather than hang CI indefinitely. Every `recv` call in this module
+    /// goes through this helper for that reason.
+    async fn recv_or_timeout<R: AsyncRead + Unpin>(
+        reader: &mut TransportReader<R>,
+    ) -> Result<Message, TransportError> {
+        tokio::time::timeout(Duration::from_secs(2), reader.recv())
+            .await
+            .expect("recv must not hang")
+    }
+
     #[tokio::test]
     async fn sends_and_receives_a_message() {
         let (a, b) = duplex(4096);
@@ -189,7 +209,7 @@ mod tests {
             pressed: true,
         };
         client.send(&sent).await.expect("send");
-        assert_eq!(server.recv().await.expect("recv"), sent);
+        assert_eq!(recv_or_timeout(&mut server).await.expect("recv"), sent);
     }
 
     #[tokio::test]
@@ -206,7 +226,7 @@ mod tests {
         }
         for i in 0..50 {
             assert_eq!(
-                server.recv().await.unwrap(),
+                recv_or_timeout(&mut server).await.unwrap(),
                 Message::MouseMove { dx: i, dy: -i }
             );
         }
@@ -219,7 +239,10 @@ mod tests {
         let (mut server, _bw) = split(b, SharedKey::from_bytes([2u8; 32]), session());
 
         client.send(&Message::Heartbeat).await.unwrap();
-        assert!(matches!(server.recv().await, Err(TransportError::Crypto)));
+        assert!(matches!(
+            recv_or_timeout(&mut server).await,
+            Err(TransportError::Crypto)
+        ));
     }
 
     #[tokio::test]
@@ -235,27 +258,27 @@ mod tests {
         let (mut server, _bw) = split(b, key(), SessionId([2u8; 32]));
 
         client.send(&Message::Heartbeat).await.unwrap();
-        assert!(matches!(server.recv().await, Err(TransportError::Crypto)));
+        assert!(matches!(
+            recv_or_timeout(&mut server).await,
+            Err(TransportError::Crypto)
+        ));
     }
 
     #[tokio::test]
     async fn reports_closure_when_the_peer_goes_away() {
+        // Dropping only the writer half leaves the reader half still
+        // holding its share of the duplex, so the stream never sees EOF.
+        // Tearing down a connection means dropping BOTH halves, which is
+        // exactly the semantic `split`'s doc comment now calls out.
         let (a, b) = duplex(4096);
-        let (ar, aw) = split(a, key(), session());
+        let (a_reader, a_writer) = split(a, key(), session());
         let (mut server, _bw) = split(b, key(), session());
-
-        // BOTH halves must go. Dropping only the writer leaves the reader
-        // holding its share of the stream, so no EOF is ever delivered and
-        // the peer waits forever.
-        drop(aw);
-        drop(ar);
-
-        // Bounded so a regression fails fast instead of hanging CI with no
-        // message, which is what this test did when it dropped one half.
-        let outcome = tokio::time::timeout(Duration::from_secs(2), server.recv())
-            .await
-            .expect("recv should report closure promptly, not block");
-        assert!(matches!(outcome, Err(TransportError::Closed)));
+        drop(a_reader);
+        drop(a_writer);
+        assert!(matches!(
+            recv_or_timeout(&mut server).await,
+            Err(TransportError::Closed)
+        ));
     }
 
     #[tokio::test]
@@ -274,8 +297,14 @@ mod tests {
         }
         a.flush().await.unwrap();
 
-        assert_eq!(receiver.recv().await.unwrap(), Message::Heartbeat);
-        assert!(matches!(receiver.recv().await, Err(TransportError::Replay)));
+        assert_eq!(
+            recv_or_timeout(&mut receiver).await.unwrap(),
+            Message::Heartbeat
+        );
+        assert!(matches!(
+            recv_or_timeout(&mut receiver).await,
+            Err(TransportError::Replay)
+        ));
     }
 
     #[tokio::test]
@@ -286,7 +315,7 @@ mod tests {
         a.write_all(&u32::MAX.to_be_bytes()).await.unwrap();
         a.flush().await.unwrap();
         assert!(matches!(
-            receiver.recv().await,
+            recv_or_timeout(&mut receiver).await,
             Err(TransportError::FrameTooLarge)
         ));
     }
@@ -306,7 +335,10 @@ mod tests {
         a.write_all(&len.to_be_bytes()).await.unwrap();
         a.write_all(&forged).await.unwrap();
         a.flush().await.unwrap();
-        assert!(matches!(receiver.recv().await, Err(TransportError::Crypto)));
+        assert!(matches!(
+            recv_or_timeout(&mut receiver).await,
+            Err(TransportError::Crypto)
+        ));
 
         // A genuine frame must still be accepted afterwards.
         let real = hop_proto::seal(&key(), session(), 1, &Message::Heartbeat).unwrap();
@@ -314,7 +346,10 @@ mod tests {
         a.write_all(&len.to_be_bytes()).await.unwrap();
         a.write_all(&real).await.unwrap();
         a.flush().await.unwrap();
-        assert_eq!(receiver.recv().await.unwrap(), Message::Heartbeat);
+        assert_eq!(
+            recv_or_timeout(&mut receiver).await.unwrap(),
+            Message::Heartbeat
+        );
     }
 
     #[tokio::test]
@@ -333,7 +368,7 @@ mod tests {
         drop(a);
 
         assert!(matches!(
-            receiver.recv().await,
+            recv_or_timeout(&mut receiver).await,
             Err(TransportError::Truncated)
         ));
     }
@@ -346,7 +381,10 @@ mod tests {
         let (a, b) = duplex(4096);
         let (mut receiver, _bw) = split(b, key(), session());
         drop(a);
-        assert!(matches!(receiver.recv().await, Err(TransportError::Closed)));
+        assert!(matches!(
+            recv_or_timeout(&mut receiver).await,
+            Err(TransportError::Closed)
+        ));
     }
 
     #[tokio::test]
@@ -359,8 +397,8 @@ mod tests {
         let (mut br, mut bw) = split(b, key(), SessionId::ZERO);
 
         let reader = tokio::spawn(async move {
-            let first = ar.recv().await.expect("recv");
-            let second = ar.recv().await.expect("recv");
+            let first = recv_or_timeout(&mut ar).await.expect("recv");
+            let second = recv_or_timeout(&mut ar).await.expect("recv");
             (first, second)
         });
 
@@ -373,7 +411,10 @@ mod tests {
 
         // And the other direction on the same pair still works.
         aw.send(&Message::Heartbeat).await.expect("send");
-        assert_eq!(br.recv().await.expect("recv"), Message::Heartbeat);
+        assert_eq!(
+            recv_or_timeout(&mut br).await.expect("recv"),
+            Message::Heartbeat
+        );
     }
 
     #[tokio::test]
@@ -386,8 +427,8 @@ mod tests {
 
         aw.send(&Message::Heartbeat).await.unwrap();
         bw.send(&Message::Heartbeat).await.unwrap();
-        assert_eq!(br.recv().await.unwrap(), Message::Heartbeat);
-        assert_eq!(ar.recv().await.unwrap(), Message::Heartbeat);
+        assert_eq!(recv_or_timeout(&mut br).await.unwrap(), Message::Heartbeat);
+        assert_eq!(recv_or_timeout(&mut ar).await.unwrap(), Message::Heartbeat);
     }
 
     #[tokio::test]
