@@ -1,6 +1,6 @@
 use crate::{
-    Action, Capturer, Control, HeldKeys, Injector, InputEvent, RemapTable, Transport,
-    TransportError,
+    Action, Capturer, Control, HeldKeys, Injector, InputEvent, RemapTable, TransportError,
+    TransportReader, TransportWriter,
 };
 use hop_proto::Message;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -35,14 +35,14 @@ pub fn message_to_event(message: &Message) -> Option<InputEvent> {
 
 /// Drain the capturer, forwarding whatever the control state machine says
 /// belongs to the peer.
-pub async fn pump_server<S, C>(
-    transport: &mut Transport<S>,
+pub async fn pump_server<W, C>(
+    transport: &mut TransportWriter<W>,
     capturer: &mut C,
     control: &mut Control,
     remap: &RemapTable,
 ) -> Result<(), TransportError>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    W: AsyncWrite + Unpin,
     C: Capturer,
 {
     while let Some(event) = capturer.poll() {
@@ -81,13 +81,13 @@ where
 /// here. A `ReleaseAllKeys` message is answered from this set, never from
 /// anything the peer claims, so the release always matches what is really
 /// down on this keyboard.
-pub async fn pump_client<S, I>(
-    transport: &mut Transport<S>,
+pub async fn pump_client<R, I>(
+    transport: &mut TransportReader<R>,
     injector: &mut I,
     held: &mut HeldKeys,
 ) -> Result<(), TransportError>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
     I: Injector,
 {
     let message = transport.recv().await?;
@@ -136,9 +136,9 @@ where
 /// still usable, for example on an explicit release or the panic hotkey. On a
 /// genuine disconnect the peer is unreachable by definition, so the client
 /// must also release its own keys when it detects a dead connection.
-pub async fn send_release_all<S>(transport: &mut Transport<S>) -> Result<(), TransportError>
+pub async fn send_release_all<W>(transport: &mut TransportWriter<W>) -> Result<(), TransportError>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    W: AsyncWrite + Unpin,
 {
     transport.send(&Message::ReleaseAllKeys).await
 }
@@ -211,13 +211,14 @@ mod tests {
         // still be received and acted on. Silently wedging here, with
         // heartbeats still flowing and liveness still reporting healthy,
         // is exactly the failure mode this project exists to prevent.
+        use crate::transport::split;
         use crate::FailingInjector;
         use hop_proto::{SessionId, SharedKey};
         use tokio::io::duplex;
 
         let (a, b) = duplex(4096);
-        let mut server = Transport::new(a, SharedKey::from_bytes([1u8; 32]), SessionId::ZERO);
-        let mut client = Transport::new(b, SharedKey::from_bytes([1u8; 32]), SessionId::ZERO);
+        let (_ar, mut server) = split(a, SharedKey::from_bytes([1u8; 32]), SessionId::ZERO);
+        let (mut client, _bw) = split(b, SharedKey::from_bytes([1u8; 32]), SessionId::ZERO);
         let mut injector = FailingInjector;
         let mut held = HeldKeys::new();
 

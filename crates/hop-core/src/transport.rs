@@ -1,5 +1,7 @@
 use hop_proto::{open, seal, Message, ReplayWindow, SessionId, SharedKey};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{
+    split as io_split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf,
+};
 
 /// Refuse absurd frames rather than allocating whatever a peer claims.
 const MAX_FRAME: usize = 64 * 1024;
@@ -24,38 +26,81 @@ pub enum TransportError {
     Truncated,
 }
 
-/// A length-prefixed, encrypted message stream over any byte stream.
+/// Convert a raw length prefix into a length we are willing to allocate.
+/// The cap MUST be enforced here, before any buffer is created, so that
+/// a peer cannot make us allocate whatever size it claims.
+fn validated_len(prefix: [u8; 4]) -> Result<usize, TransportError> {
+    let len = u32::from_be_bytes(prefix) as usize;
+    if len > MAX_FRAME {
+        return Err(TransportError::FrameTooLarge);
+    }
+    Ok(len)
+}
+
+/// The receiving half of a split transport. Owns the replay window for its
+/// direction.
 ///
 /// Generic over the stream so tests can drive it through an in-memory
 /// duplex pipe rather than a real socket.
-pub struct Transport<S> {
-    stream: S,
+pub struct TransportReader<R> {
+    stream: R,
     key: SharedKey,
     session: SessionId,
-    send_seq: u64,
     replay: ReplayWindow,
 }
 
-impl<S: AsyncRead + AsyncWrite + Unpin> Transport<S> {
-    pub fn new(stream: S, key: SharedKey, session: SessionId) -> Self {
-        Self {
-            stream,
+/// The sending half of a split transport. Owns the outbound sequence
+/// counter for its direction.
+///
+/// Generic over the stream so tests can drive it through an in-memory
+/// duplex pipe rather than a real socket.
+pub struct TransportWriter<W> {
+    stream: W,
+    key: SharedKey,
+    session: SessionId,
+    send_seq: u64,
+}
+
+/// Split a stream into a reader and a writer half that can be driven from
+/// different tasks.
+///
+/// Each direction keeps its own sequence counter and its own replay
+/// window, so the two directions cannot be mistaken for replays of each
+/// other, and a caller can await `recv` on one task while `send` runs on
+/// another (or on the same task interleaved with a heartbeat timer),
+/// which a single `&mut self` type could never allow.
+pub fn split<S: AsyncRead + AsyncWrite>(
+    stream: S,
+    key: SharedKey,
+    session: SessionId,
+) -> (TransportReader<ReadHalf<S>>, TransportWriter<WriteHalf<S>>) {
+    let (r, w) = io_split(stream);
+    (
+        TransportReader {
+            stream: r,
+            key: key.clone(),
+            session,
+            replay: ReplayWindow::new(),
+        },
+        TransportWriter {
+            stream: w,
             key,
             session,
             send_seq: 0,
-            replay: ReplayWindow::new(),
-        }
-    }
+        },
+    )
+}
 
+impl<W: AsyncWrite + Unpin> TransportWriter<W> {
     /// Note for callers: after any `Err(TransportError::Io(_))` here, a
     /// partial frame may already be sitting on the wire (the length prefix
     /// or part of the frame body may have been written before the write
     /// failed). The stream is desynchronized at that point, so this
-    /// `Transport` must be discarded and the connection re-established, not
-    /// reused. Also note the asymmetry with `recv`: a peer that has gone
-    /// away surfaces from `recv` as `Closed`, but surfaces from `send` as an
-    /// `Io` error, since writing to a dead peer fails at the OS level rather
-    /// than reading a clean EOF.
+    /// `TransportWriter` must be discarded and the connection
+    /// re-established, not reused. Also note the asymmetry with `recv` on
+    /// `TransportReader`: a peer that has gone away surfaces from `recv` as
+    /// `Closed`, but surfaces from `send` as an `Io` error, since writing to
+    /// a dead peer fails at the OS level rather than reading a clean EOF.
     pub async fn send(&mut self, message: &Message) -> Result<(), TransportError> {
         // wrapping_add avoids a debug-build panic on overflow. After
         // wraparound the receiver would reject the reused seq 0 as too old,
@@ -74,18 +119,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Transport<S> {
         self.stream.flush().await?;
         Ok(())
     }
+}
 
-    /// Convert a raw length prefix into a length we are willing to allocate.
-    /// The cap MUST be enforced here, before any buffer is created, so that
-    /// a peer cannot make us allocate whatever size it claims.
-    fn validated_len(prefix: [u8; 4]) -> Result<usize, TransportError> {
-        let len = u32::from_be_bytes(prefix) as usize;
-        if len > MAX_FRAME {
-            return Err(TransportError::FrameTooLarge);
-        }
-        Ok(len)
-    }
-
+impl<R: AsyncRead + Unpin> TransportReader<R> {
     /// Not cancel safe. `read_exact` discards any bytes it already consumed
     /// when its future is dropped, so cancelling this method mid-frame (for
     /// example by racing it in `tokio::select!` against a heartbeat timer)
@@ -106,7 +142,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Transport<S> {
             Err(e) => return Err(TransportError::Io(e)),
         }
 
-        let len = Self::validated_len(len_bytes)?;
+        let len = validated_len(len_bytes)?;
 
         let mut frame = vec![0u8; len];
         match self.stream.read_exact(&mut frame).await {
@@ -144,8 +180,8 @@ mod tests {
     #[tokio::test]
     async fn sends_and_receives_a_message() {
         let (a, b) = duplex(4096);
-        let mut client = Transport::new(a, key(), session());
-        let mut server = Transport::new(b, key(), session());
+        let (_ar, mut client) = split(a, key(), session());
+        let (mut server, _bw) = split(b, key(), session());
 
         let sent = Message::Key {
             usage: Usage::C,
@@ -158,8 +194,8 @@ mod tests {
     #[tokio::test]
     async fn preserves_order_across_many_messages() {
         let (a, b) = duplex(65536);
-        let mut client = Transport::new(a, key(), session());
-        let mut server = Transport::new(b, key(), session());
+        let (_ar, mut client) = split(a, key(), session());
+        let (mut server, _bw) = split(b, key(), session());
 
         for i in 0..50 {
             client
@@ -178,8 +214,8 @@ mod tests {
     #[tokio::test]
     async fn rejects_a_peer_with_the_wrong_key() {
         let (a, b) = duplex(4096);
-        let mut client = Transport::new(a, SharedKey::from_bytes([1u8; 32]), session());
-        let mut server = Transport::new(b, SharedKey::from_bytes([2u8; 32]), session());
+        let (_ar, mut client) = split(a, SharedKey::from_bytes([1u8; 32]), session());
+        let (mut server, _bw) = split(b, SharedKey::from_bytes([2u8; 32]), session());
 
         client.send(&Message::Heartbeat).await.unwrap();
         assert!(matches!(server.recv().await, Err(TransportError::Crypto)));
@@ -190,12 +226,12 @@ mod tests {
         // This is the attack CRITICAL 1 fixes: an attacker who records a
         // typing session and later becomes the client's server (rogue mDNS
         // response, ARP spoofing) can no longer replay the recording into a
-        // fresh session, because a fresh `Transport` for a different
-        // session rejects frames sealed under the earlier one even though
-        // the shared key and every AEAD tag would otherwise be valid.
+        // fresh session, because a fresh transport for a different session
+        // rejects frames sealed under the earlier one even though the
+        // shared key and every AEAD tag would otherwise be valid.
         let (a, b) = duplex(4096);
-        let mut client = Transport::new(a, key(), SessionId([1u8; 32]));
-        let mut server = Transport::new(b, key(), SessionId([2u8; 32]));
+        let (_ar, mut client) = split(a, key(), SessionId([1u8; 32]));
+        let (mut server, _bw) = split(b, key(), SessionId([2u8; 32]));
 
         client.send(&Message::Heartbeat).await.unwrap();
         assert!(matches!(server.recv().await, Err(TransportError::Crypto)));
@@ -204,8 +240,8 @@ mod tests {
     #[tokio::test]
     async fn reports_closure_when_the_peer_goes_away() {
         let (a, b) = duplex(4096);
-        let client = Transport::new(a, key(), session());
-        let mut server = Transport::new(b, key(), session());
+        let (_ar, client) = split(a, key(), session());
+        let (mut server, _bw) = split(b, key(), session());
         drop(client);
         assert!(matches!(server.recv().await, Err(TransportError::Closed)));
     }
@@ -215,7 +251,7 @@ mod tests {
         // Capturing a frame and sending it twice must not deliver it twice,
         // or an attacker could re-inject a captured keystroke.
         let (mut a, b) = duplex(4096);
-        let mut receiver = Transport::new(b, key(), session());
+        let (mut receiver, _bw) = split(b, key(), session());
 
         // Build one frame by hand so it can be sent twice verbatim.
         let frame = hop_proto::seal(&key(), session(), 1, &Message::Heartbeat).unwrap();
@@ -234,7 +270,7 @@ mod tests {
     async fn refuses_an_oversized_declared_length() {
         // A peer claiming a huge frame must be refused before we allocate.
         let (mut a, b) = duplex(4096);
-        let mut receiver = Transport::new(b, key(), session());
+        let (mut receiver, _bw) = split(b, key(), session());
         a.write_all(&u32::MAX.to_be_bytes()).await.unwrap();
         a.flush().await.unwrap();
         assert!(matches!(
@@ -249,7 +285,7 @@ mod tests {
         // frame authenticates. Otherwise one forged frame claiming a huge
         // seq pins the window and permanently rejects genuine traffic.
         let (mut a, b) = duplex(4096);
-        let mut receiver = Transport::new(b, key(), session());
+        let (mut receiver, _bw) = split(b, key(), session());
 
         let mut forged = Vec::new();
         forged.extend_from_slice(&u64::MAX.to_be_bytes());
@@ -275,7 +311,7 @@ mod tests {
         // limiting, not a graceful shutdown, so it must not be conflated
         // with `Closed`.
         let (mut a, b) = duplex(4096);
-        let mut receiver = Transport::new(b, key(), session());
+        let (mut receiver, _bw) = split(b, key(), session());
 
         let frame = hop_proto::seal(&key(), session(), 1, &Message::Heartbeat).unwrap();
         let len = u32::try_from(frame.len()).unwrap();
@@ -296,9 +332,50 @@ mod tests {
         // arriving (a clean close between frames) is different from a
         // partial frame arriving (a truncation).
         let (a, b) = duplex(4096);
-        let mut receiver = Transport::new(b, key(), session());
+        let (mut receiver, _bw) = split(b, key(), session());
         drop(a);
         assert!(matches!(receiver.recv().await, Err(TransportError::Closed)));
+    }
+
+    #[tokio::test]
+    async fn reader_and_writer_work_concurrently() {
+        // The supervisor must be able to wait on incoming frames while a
+        // heartbeat timer fires on the same connection. That is impossible
+        // with a single &mut self type, which is why this split exists.
+        let (a, b) = duplex(65536);
+        let (mut ar, mut aw) = split(a, key(), SessionId::ZERO);
+        let (mut br, mut bw) = split(b, key(), SessionId::ZERO);
+
+        let reader = tokio::spawn(async move {
+            let first = ar.recv().await.expect("recv");
+            let second = ar.recv().await.expect("recv");
+            (first, second)
+        });
+
+        bw.send(&Message::Heartbeat).await.expect("send");
+        bw.send(&Message::Release).await.expect("send");
+
+        let (first, second) = reader.await.expect("join");
+        assert_eq!(first, Message::Heartbeat);
+        assert_eq!(second, Message::Release);
+
+        // And the other direction on the same pair still works.
+        aw.send(&Message::Heartbeat).await.expect("send");
+        assert_eq!(br.recv().await.expect("recv"), Message::Heartbeat);
+    }
+
+    #[tokio::test]
+    async fn each_direction_has_its_own_sequence_space() {
+        // Both sides start at seq 1. If they shared a replay window, the
+        // second direction's first frame would look like a replay.
+        let (a, b) = duplex(65536);
+        let (mut ar, mut aw) = split(a, key(), SessionId::ZERO);
+        let (mut br, mut bw) = split(b, key(), SessionId::ZERO);
+
+        aw.send(&Message::Heartbeat).await.unwrap();
+        bw.send(&Message::Heartbeat).await.unwrap();
+        assert_eq!(br.recv().await.unwrap(), Message::Heartbeat);
+        assert_eq!(ar.recv().await.unwrap(), Message::Heartbeat);
     }
 
     #[tokio::test]

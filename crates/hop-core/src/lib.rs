@@ -12,7 +12,7 @@ pub mod control;
 pub use control::{Action, Control, Focus};
 
 pub mod transport;
-pub use transport::{Transport, TransportError};
+pub use transport::{split, TransportError, TransportReader, TransportWriter};
 
 pub mod liveness;
 pub use liveness::Liveness;
