@@ -9,6 +9,9 @@ use clap::{Parser, Subcommand};
 
 mod run;
 
+#[cfg(target_os = "macos")]
+mod menubar;
+
 #[derive(Parser)]
 #[command(
     name = "hop",
@@ -42,6 +45,13 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Show a menu bar item for starting and stopping hop (macOS only).
+    #[cfg(target_os = "macos")]
+    Menubar {
+        /// Path to the TOML config file hop will be started with.
+        #[arg(long)]
+        config: PathBuf,
+    },
 }
 
 fn init_logging() {
@@ -61,6 +71,8 @@ async fn main() -> ExitCode {
             run::keygen(config.as_deref(), out.as_deref(), force)
         }
         Command::Run { config } => run::run(&config).await,
+        #[cfg(target_os = "macos")]
+        Command::Menubar { config } => menubar::run(config),
     };
 
     match result {
