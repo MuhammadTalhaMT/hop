@@ -35,10 +35,10 @@ impl SessionId {
 pub struct SharedKey([u8; 32]);
 
 impl SharedKey {
-    pub fn generate() -> SharedKey {
+    pub fn generate() -> Result<SharedKey, CryptoError> {
         let mut bytes = [0u8; 32];
-        getrandom::fill(&mut bytes).expect("system RNG unavailable");
-        SharedKey(bytes)
+        getrandom::fill(&mut bytes).map_err(|_| CryptoError::Random)?;
+        Ok(SharedKey(bytes))
     }
 
     pub fn from_bytes(bytes: [u8; 32]) -> SharedKey {
@@ -164,7 +164,7 @@ mod tests {
 
     #[test]
     fn seals_and_opens_round_trip() {
-        let key = SharedKey::generate();
+        let key = SharedKey::generate().unwrap();
         let sealed = seal(&key, session(), 7, &sample()).expect("seal");
         let (seq, message) = open(&key, session(), &sealed).expect("open");
         assert_eq!(seq, 7);
@@ -173,13 +173,13 @@ mod tests {
 
     #[test]
     fn rejects_wrong_key() {
-        let sealed = seal(&SharedKey::generate(), session(), 1, &sample()).unwrap();
-        assert!(open(&SharedKey::generate(), session(), &sealed).is_err());
+        let sealed = seal(&SharedKey::generate().unwrap(), session(), 1, &sample()).unwrap();
+        assert!(open(&SharedKey::generate().unwrap(), session(), &sealed).is_err());
     }
 
     #[test]
     fn rejects_tampered_ciphertext() {
-        let key = SharedKey::generate();
+        let key = SharedKey::generate().unwrap();
         let mut sealed = seal(&key, session(), 1, &sample()).unwrap();
         let last = sealed.len() - 1;
         sealed[last] ^= 0x01;
@@ -188,7 +188,7 @@ mod tests {
 
     #[test]
     fn rejects_tampered_sequence_number() {
-        let key = SharedKey::generate();
+        let key = SharedKey::generate().unwrap();
         let mut sealed = seal(&key, session(), 1, &sample()).unwrap();
         sealed[0] ^= 0xFF; // seq is authenticated, so this must fail the tag
         assert!(open(&key, session(), &sealed).is_err());
@@ -196,7 +196,7 @@ mod tests {
 
     #[test]
     fn rejects_short_frame() {
-        let key = SharedKey::generate();
+        let key = SharedKey::generate().unwrap();
         assert!(open(&key, session(), &[]).is_err());
         assert!(open(&key, session(), &[0u8; 8]).is_err());
         assert!(open(&key, session(), &[0u8; MIN_FRAME - 1]).is_err());
@@ -204,7 +204,7 @@ mod tests {
 
     #[test]
     fn nonces_differ_between_messages() {
-        let key = SharedKey::generate();
+        let key = SharedKey::generate().unwrap();
         let a = seal(&key, session(), 1, &sample()).unwrap();
         let b = seal(&key, session(), 1, &sample()).unwrap();
         // Compare the nonce field itself (bytes 8..32), not the whole
@@ -219,7 +219,7 @@ mod tests {
 
     #[test]
     fn ciphertext_does_not_contain_the_plaintext() {
-        let key = SharedKey::generate();
+        let key = SharedKey::generate().unwrap();
         let plaintext = encode(&sample()).expect("encode");
         let sealed = seal(&key, session(), 1, &sample()).unwrap();
         assert!(
@@ -237,7 +237,7 @@ mod tests {
         // server, via rogue mDNS or ARP spoofing) must not authenticate
         // under a different session, even with the correct shared key and
         // a fresh replay window.
-        let key = SharedKey::generate();
+        let key = SharedKey::generate().unwrap();
         let sealed = seal(&key, SessionId([1u8; 32]), 1, &sample()).unwrap();
         assert!(matches!(
             open(&key, SessionId([2u8; 32]), &sealed),
