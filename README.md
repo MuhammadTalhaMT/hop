@@ -13,7 +13,7 @@ by itself for as long as it takes.
 ## Status
 
 Under construction. The protocol and control core are implemented and
-tested (76 tests passing across the workspace): wire encoding, encryption
+tested (81 tests passing across the workspace): wire encoding, encryption
 and replay protection, key remapping, held-key tracking, the focus state
 machine, framed transport, and liveness and backoff all exist and are
 exercised by tests, including an end to end path that drives capture
@@ -30,6 +30,12 @@ built and what is not.
 Input is encrypted and authenticated with XChaCha20-Poly1305 under a
 pre-shared key, with replay protection. hop is designed for a local
 network and should not be exposed to the internet.
+
+That replay protection currently covers a single connection only. Frames
+are bound to a session, but until the handshake exists both peers use
+`SessionId::ZERO`, so traffic recorded from one connection would still be
+accepted by a later one. Implementing the handshake is what makes this
+real, and it is the first item in `ARCHITECTURE.md`'s handoff list.
 
 Frame lengths and timing are not padded or masked, so an observer on the
 network can learn typing rhythm and can distinguish some keystroke
