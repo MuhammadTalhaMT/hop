@@ -11,8 +11,8 @@
 //! logs every transition.
 
 use crate::{
-    client_handshake, message_to_event, Backoff, Clipboard, ClipboardSync, HeldKeys, Injector,
-    InputEvent, Liveness, TransportError, TransportWriter,
+    client_handshake, message_to_event, send_local_change, Backoff, Clipboard, ClipboardSync,
+    FileReceive, HeldKeys, Injector, InputEvent, Liveness, TransportError, TransportWriter,
 };
 use hop_proto::{Message, SharedKey};
 use std::time::{Duration, Instant};
@@ -108,12 +108,15 @@ impl Default for ReconnectPolicy {
 /// edge that hands focus back. See that method's doc comment for why
 /// this function, not the injector itself, is what turns a `true` answer
 /// into a sent `Message::Release`: only this function has the writer.
+#[allow(clippy::too_many_arguments)]
 async fn apply_message<I: Injector, C: Clipboard, W: AsyncWrite + Unpin>(
     message: Message,
     injector: &mut I,
     held: &mut HeldKeys,
     clipboard: &mut C,
     clipboard_sync: &mut ClipboardSync,
+    staging: &std::path::Path,
+    incoming: &mut Option<FileReceive>,
     writer: &mut TransportWriter<W>,
 ) -> Result<(), TransportError> {
     match message {
@@ -122,6 +125,48 @@ async fn apply_message<I: Injector, C: Clipboard, W: AsyncWrite + Unpin>(
             // never reach a log.
             tracing::debug!(bytes = text.len(), "applying the peer's clipboard");
             clipboard_sync.apply_remote(clipboard, &text);
+        }
+        Message::FileOffer { name, size } => {
+            // Everything the peer says here is validated by FileReceive
+            // before any of it is believed, including the name.
+            match FileReceive::begin(staging, &name, size) {
+                Ok(rx) => {
+                    tracing::info!(bytes = size, "receiving a file from the peer");
+                    *incoming = Some(rx);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "refused the peer's file offer");
+                    *incoming = None;
+                }
+            }
+        }
+        Message::FileChunk(bytes) => {
+            if let Some(rx) = incoming.as_mut() {
+                if let Err(error) = rx.chunk(&bytes) {
+                    tracing::warn!(%error, "abandoning the peer's file");
+                    *incoming = None;
+                }
+            }
+        }
+        Message::FileEnd => {
+            if let Some(rx) = incoming.take() {
+                if rx.is_complete() {
+                    finish_incoming_file(rx, clipboard, clipboard_sync);
+                } else {
+                    // Never publish a partial file: the user would paste
+                    // something that looks whole and is not.
+                    tracing::warn!(
+                        received = rx.received(),
+                        expected = rx.expected(),
+                        "file ended early; discarding it"
+                    );
+                }
+            }
+        }
+        Message::FileAbort => {
+            if incoming.take().is_some() {
+                tracing::info!("the peer abandoned its file transfer");
+            }
         }
         Message::ReleaseAllKeys => {
             for usage in held.drain_release() {
@@ -259,6 +304,12 @@ impl ClientSupervisor {
         clipboard_sync: &mut ClipboardSync,
         policy: &mut ReconnectPolicy,
     ) {
+        // Received files land here before being put on the clipboard, so
+        // the user pastes them wherever they want and the OS does the
+        // final copy. hop never needs to know the destination.
+        let staging = staging_dir();
+        let mut incoming: Option<FileReceive> = None;
+
         let (reader, mut writer, session) =
             match client_handshake(stream, &self.key, &self.peer_id).await {
                 Ok(v) => v,
@@ -329,6 +380,8 @@ impl ClientSupervisor {
                                 held,
                                 clipboard,
                                 clipboard_sync,
+                                &staging,
+                                &mut incoming,
                                 &mut writer,
                             )
                             .await
@@ -351,9 +404,8 @@ impl ClientSupervisor {
                     // Neither platform can notify us that the clipboard
                     // changed, so noticing a copy means polling a counter.
                     // Riding the existing tick keeps it off the input path.
-                    if let Some(text) = clipboard_sync.poll_local_change(clipboard) {
-                        tracing::debug!(bytes = text.len(), "forwarding a local copy to the peer");
-                        if let Err(error) = writer.send(&Message::ClipboardText(text)).await {
+                    if let Some(change) = clipboard_sync.poll_local_change(clipboard) {
+                        if let Err(error) = send_local_change(&mut writer, change).await {
                             tracing::warn!(%error, "failed to send clipboard; disconnecting");
                             break;
                         }
@@ -395,6 +447,50 @@ impl ClientSupervisor {
         let _ = reader_task.await;
         drop(writer);
     }
+}
+
+/// Write a completed file into the staging directory and put it on the
+/// clipboard, so pasting in the file manager copies it wherever the user
+/// pastes. Failures are logged rather than propagated: a file that does
+/// not arrive is a disappointment, not a reason to drop the connection.
+fn finish_incoming_file<C: Clipboard>(
+    rx: FileReceive,
+    clipboard: &mut C,
+    clipboard_sync: &mut ClipboardSync,
+) {
+    let destination = rx.destination();
+    if let Some(parent) = destination.parent() {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            tracing::warn!(%error, "could not create the staging directory");
+            return;
+        }
+    }
+    let bytes = rx.into_bytes();
+    if let Err(error) = std::fs::write(&destination, &bytes) {
+        tracing::warn!(%error, "could not write the received file");
+        return;
+    }
+    match destination.to_str() {
+        Some(path) => {
+            tracing::info!(
+                bytes = bytes.len(),
+                "received a file; it is on the clipboard"
+            );
+            clipboard_sync.apply_remote_file(clipboard, path);
+        }
+        None => tracing::warn!("received file path is not valid unicode"),
+    }
+}
+
+/// Where received files are written before being published to the
+/// clipboard. Under the user's own cache directory rather than a temp
+/// directory the OS may clear while the clipboard still points at it.
+fn staging_dir() -> std::path::PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join(".hop").join("received")
 }
 
 #[cfg(test)]
@@ -514,6 +610,8 @@ mod tests {
             &mut held,
             &mut clipboard,
             &mut clipboard_sync,
+            std::path::Path::new("/tmp/hop-test-staging"),
+            &mut None,
             &mut client_writer,
         )
         .await
@@ -554,6 +652,8 @@ mod tests {
             &mut held,
             &mut clipboard,
             &mut clipboard_sync,
+            std::path::Path::new("/tmp/hop-test-staging"),
+            &mut None,
             &mut client_writer,
         )
         .await
@@ -601,6 +701,8 @@ mod tests {
             &mut held,
             &mut clipboard,
             &mut clipboard_sync,
+            std::path::Path::new("/tmp/hop-test-staging"),
+            &mut None,
             &mut client_writer,
         )
         .await

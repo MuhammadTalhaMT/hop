@@ -37,4 +37,7 @@ pub mod supervisor;
 pub use supervisor::{release_everything, ClientSupervisor, ReconnectPolicy};
 
 pub mod clipboard;
-pub use clipboard::{Clipboard, ClipboardSync, MAX_CLIPBOARD_BYTES};
+pub use clipboard::{Clipboard, ClipboardSync, LocalChange, MAX_CLIPBOARD_BYTES};
+
+pub mod filetransfer;
+pub use filetransfer::{send_local_change, FileError, FileReceive, CHUNK_BYTES, MAX_FILE_BYTES};

@@ -125,6 +125,12 @@ fn message_kind(message: &Message) -> &'static str {
         // Names the kind only. The text it carries is the user's
         // clipboard, so it must never reach a log.
         Message::ClipboardText(_) => "ClipboardText",
+        // Names the kind only. The offered name is peer-controlled and
+        // the chunk is file content; neither belongs in a log.
+        Message::FileOffer { .. } => "FileOffer",
+        Message::FileChunk(_) => "FileChunk",
+        Message::FileEnd => "FileEnd",
+        Message::FileAbort => "FileAbort",
         Message::Unknown => "Unknown",
     }
 }

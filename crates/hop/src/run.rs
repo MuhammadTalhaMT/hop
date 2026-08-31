@@ -591,6 +591,11 @@ async fn handle_client(
     // keeps it off the input path entirely.
     let mut clipboard = hop_platform::macos::clipboard::MacClipboard;
     let mut clipboard_sync = hop_core::ClipboardSync::new();
+    // Received files land here before being published to the clipboard,
+    // so the user pastes them wherever they want and the OS does the
+    // final copy.
+    let staging = staging_dir();
+    let mut incoming: Option<hop_core::FileReceive> = None;
 
     'connection: loop {
         tokio::select! {
@@ -614,6 +619,42 @@ async fn handle_client(
                                 tracing::debug!(bytes = text.len(), "applying the peer's clipboard");
                                 clipboard_sync.apply_remote(&mut clipboard, &text);
                             }
+                            hop_proto::Message::FileOffer { name, size } => {
+                                match hop_core::FileReceive::begin(&staging, &name, size) {
+                                    Ok(rx) => {
+                                        tracing::info!(bytes = size, "receiving a file from the peer");
+                                        incoming = Some(rx);
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(%error, "refused the peer's file offer");
+                                        incoming = None;
+                                    }
+                                }
+                            }
+                            hop_proto::Message::FileChunk(bytes) => {
+                                if let Some(rx) = incoming.as_mut() {
+                                    if let Err(error) = rx.chunk(&bytes) {
+                                        tracing::warn!(%error, "abandoning the peer's file");
+                                        incoming = None;
+                                    }
+                                }
+                            }
+                            hop_proto::Message::FileEnd => {
+                                if let Some(rx) = incoming.take() {
+                                    if rx.is_complete() {
+                                        finish_incoming_file(rx, &mut clipboard, &mut clipboard_sync);
+                                    } else {
+                                        tracing::warn!(
+                                            received = rx.received(),
+                                            expected = rx.expected(),
+                                            "file ended early; discarding it"
+                                        );
+                                    }
+                                }
+                            }
+                            hop_proto::Message::FileAbort if incoming.take().is_some() => {
+                                tracing::info!("the peer abandoned its file transfer");
+                            }
                             _ => {}
                         }
                     }
@@ -633,9 +674,8 @@ async fn handle_client(
                 }
             }
             _ = poll_ticker.tick() => {
-                if let Some(text) = clipboard_sync.poll_local_change(&clipboard) {
-                    tracing::debug!(bytes = text.len(), "forwarding a local copy to the peer");
-                    if let Err(error) = writer.send(&hop_proto::Message::ClipboardText(text)).await {
+                if let Some(change) = clipboard_sync.poll_local_change(&clipboard) {
+                    if let Err(error) = hop_core::send_local_change(&mut writer, change).await {
                         tracing::warn!(%error, "failed to send clipboard; disconnecting");
                         break 'connection;
                     }
@@ -677,6 +717,52 @@ async fn handle_client(
     reader_task.abort();
     let _ = reader_task.await;
     drop(writer);
+}
+
+/// Write a completed file into staging and put it on the clipboard, so
+/// pasting in Finder copies it wherever the user pastes. Failures are
+/// logged rather than propagated: a file that does not arrive is a
+/// disappointment, not a reason to drop the connection.
+#[cfg(target_os = "macos")]
+fn finish_incoming_file(
+    rx: hop_core::FileReceive,
+    clipboard: &mut impl hop_core::Clipboard,
+    clipboard_sync: &mut hop_core::ClipboardSync,
+) {
+    let destination = rx.destination();
+    if let Some(parent) = destination.parent() {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            tracing::warn!(%error, "could not create the staging directory");
+            return;
+        }
+    }
+    let bytes = rx.into_bytes();
+    if let Err(error) = std::fs::write(&destination, &bytes) {
+        tracing::warn!(%error, "could not write the received file");
+        return;
+    }
+    match destination.to_str() {
+        Some(path) => {
+            tracing::info!(
+                bytes = bytes.len(),
+                "received a file; it is on the clipboard"
+            );
+            clipboard_sync.apply_remote_file(clipboard, path);
+        }
+        None => tracing::warn!("received file path is not valid unicode"),
+    }
+}
+
+/// Where received files are written before being published to the
+/// clipboard. Under the user's own home rather than a temp directory the
+/// OS may clear while the clipboard still points at it.
+#[cfg(target_os = "macos")]
+fn staging_dir() -> std::path::PathBuf {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(".hop")
+        .join("received")
 }
 
 #[cfg(test)]

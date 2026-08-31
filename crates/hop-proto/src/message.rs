@@ -46,11 +46,30 @@ pub enum Message {
     /// notices its own clipboard changed, so a copy on one machine can be
     /// pasted on the other.
     ///
-    /// Text only. Images and files are deliberately not carried: they are
-    /// unbounded in size where text realistically is not, and the frame
-    /// cap in `hop-core`'s transport is what keeps a peer from making us
+    /// Text only. Images are deliberately not carried here; files have
+    /// their own chunked messages below, because a file does not fit in
+    /// one frame and the frame cap is what keeps a peer from making us
     /// allocate arbitrarily.
     ClipboardText(String),
+    /// Start of a file the peer has copied. Followed by `FileChunk`s and
+    /// then `FileEnd`.
+    ///
+    /// `name` is a bare file name, never a path: it is used to name a file
+    /// written on this machine, so accepting a path would let a peer
+    /// choose where to write. The receiver validates this rather than
+    /// trusting it.
+    FileOffer {
+        name: String,
+        size: u64,
+    },
+    /// One piece of the file currently being offered. Sized by the sender
+    /// to fit within the transport's frame cap.
+    FileChunk(Vec<u8>),
+    /// The file is complete and can be put on the clipboard.
+    FileEnd,
+    /// The sender gave up part way through, so the receiver should discard
+    /// what it has rather than leaving a truncated file behind.
+    FileAbort,
     /// A variant this build does not understand. Decoding produces this
     /// instead of failing, so a newer peer can add message types without
     /// breaking an older one.
@@ -71,6 +90,10 @@ const TAG_RELEASE_ALL_KEYS: u16 = 6;
 const TAG_HEARTBEAT: u16 = 7;
 const TAG_RELEASE: u16 = 8;
 const TAG_CLIPBOARD_TEXT: u16 = 9;
+const TAG_FILE_OFFER: u16 = 10;
+const TAG_FILE_CHUNK: u16 = 11;
+const TAG_FILE_END: u16 = 12;
+const TAG_FILE_ABORT: u16 = 13;
 
 #[derive(Serialize, Deserialize)]
 struct Frame {
@@ -117,6 +140,10 @@ pub fn encode(message: &Message) -> Result<Vec<u8>, CodecError> {
         Message::Heartbeat => encode_raw(TAG_HEARTBEAT, &()),
         Message::Release => encode_raw(TAG_RELEASE, &()),
         Message::ClipboardText(text) => encode_raw(TAG_CLIPBOARD_TEXT, text),
+        Message::FileOffer { name, size } => encode_raw(TAG_FILE_OFFER, &(name.clone(), *size)),
+        Message::FileChunk(bytes) => encode_raw(TAG_FILE_CHUNK, bytes),
+        Message::FileEnd => encode_raw(TAG_FILE_END, &()),
+        Message::FileAbort => encode_raw(TAG_FILE_ABORT, &()),
         Message::Unknown => Err(CodecError::UnknownNotEncodable),
     }
 }
@@ -156,6 +183,16 @@ pub fn decode(bytes: &[u8]) -> Result<Message, CodecError> {
             let text: String = postcard::from_bytes(&frame.body)?;
             Message::ClipboardText(text)
         }
+        TAG_FILE_OFFER => {
+            let (name, size) = postcard::from_bytes(&frame.body)?;
+            Message::FileOffer { name, size }
+        }
+        TAG_FILE_CHUNK => {
+            let bytes: Vec<u8> = postcard::from_bytes(&frame.body)?;
+            Message::FileChunk(bytes)
+        }
+        TAG_FILE_END => Message::FileEnd,
+        TAG_FILE_ABORT => Message::FileAbort,
         _ => Message::Unknown,
     };
     Ok(message)

@@ -17,7 +17,8 @@ use windows_sys::Win32::System::DataExchange::{
     SetClipboardData,
 };
 use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
-use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
+use windows_sys::Win32::System::Ole::{CF_HDROP, CF_UNICODETEXT};
+use windows_sys::Win32::UI::Shell::{DragQueryFileW, DROPFILES, HDROP};
 
 /// Guard that closes the clipboard however the caller leaves the scope.
 ///
@@ -162,5 +163,120 @@ impl hop_core::Clipboard for WindowsClipboard {
     }
     fn set_text(&mut self, text: &str) -> bool {
         set_text(text)
+    }
+    fn get_file_paths(&self) -> Vec<String> {
+        get_file_paths()
+    }
+    fn set_file_path(&mut self, path: &str) -> bool {
+        set_file_path(path)
+    }
+}
+
+/// Paths of files currently on the clipboard, if it holds files rather
+/// than text. Empty when it holds something else, which is the common
+/// case.
+pub fn get_file_paths() -> Vec<String> {
+    let Some(_guard) = ClipboardGuard::open() else {
+        return Vec::new();
+    };
+
+    // SAFETY: the handle belongs to the clipboard and must not be freed.
+    // It stays valid while the clipboard is open, which the guard holds
+    // for this whole scope.
+    let handle = unsafe { GetClipboardData(CF_HDROP as u32) };
+    if handle.is_null() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    // SAFETY: DragQueryFileW with an index of u32::MAX returns the count
+    // rather than writing anything, which is how the API is specified.
+    let count = unsafe { DragQueryFileW(handle as HDROP, u32::MAX, std::ptr::null_mut(), 0) };
+    for index in 0..count {
+        // SAFETY: asking for the length first, then filling a buffer of
+        // exactly that size plus the terminator, so the write is bounded.
+        let len = unsafe { DragQueryFileW(handle as HDROP, index, std::ptr::null_mut(), 0) };
+        if len == 0 {
+            continue;
+        }
+        let mut buf = vec![0u16; len as usize + 1];
+        // SAFETY: buf has room for len characters plus the null.
+        let written =
+            unsafe { DragQueryFileW(handle as HDROP, index, buf.as_mut_ptr(), buf.len() as u32) };
+        if written == 0 {
+            continue;
+        }
+        buf.truncate(written as usize);
+        if let Ok(path) = String::from_utf16(&buf) {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// Put a file on the clipboard, so pasting in Explorer copies it wherever
+/// the user pastes.
+///
+/// The file must already exist at `path`: the clipboard holds a reference,
+/// not the contents, which is what lets the user choose the destination by
+/// choosing where to paste.
+pub fn set_file_path(path: &str) -> bool {
+    // CF_HDROP is a DROPFILES header followed by a double null terminated
+    // list of wide paths. One file means one path plus the extra
+    // terminator that ends the list.
+    let mut wide: Vec<u16> = path.encode_utf16().collect();
+    wide.push(0); // end of this path
+    wide.push(0); // end of the list
+
+    let header = std::mem::size_of::<DROPFILES>();
+    let bytes = header + std::mem::size_of_val(wide.as_slice());
+
+    let Some(_guard) = ClipboardGuard::open() else {
+        return false;
+    };
+    // SAFETY: valid while the clipboard is open, which the guard holds.
+    unsafe {
+        EmptyClipboard();
+    }
+
+    // SAFETY: allocating moveable global memory of a size computed from
+    // owned buffers. A null return means nothing was allocated.
+    let handle = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes) };
+    if handle.is_null() {
+        return false;
+    }
+
+    // SAFETY: the lock yields a pointer to at least `bytes` bytes. The
+    // header is written first and the path list immediately after it, so
+    // every write stays inside that allocation.
+    unsafe {
+        let base = GlobalLock(handle) as *mut u8;
+        if base.is_null() {
+            GlobalFree(handle);
+            return false;
+        }
+        let drop_files = base as *mut DROPFILES;
+        (*drop_files).pFiles = header as u32;
+        (*drop_files).pt.x = 0;
+        (*drop_files).pt.y = 0;
+        (*drop_files).fNC = 0;
+        // Wide paths, matching the UTF-16 written below.
+        (*drop_files).fWide = 1;
+        std::ptr::copy_nonoverlapping(
+            wide.as_ptr() as *const u8,
+            base.add(header),
+            std::mem::size_of_val(wide.as_slice()),
+        );
+        GlobalUnlock(handle);
+
+        // On success the clipboard owns the handle and it must not be
+        // freed here; on failure it does not, and it must be.
+        let set = SetClipboardData(CF_HDROP as u32, handle);
+        if set.is_null() {
+            GlobalFree(handle);
+            false
+        } else {
+            true
+        }
     }
 }

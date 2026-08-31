@@ -175,4 +175,89 @@ impl hop_core::Clipboard for MacClipboard {
     fn set_text(&mut self, text: &str) -> bool {
         set_text(text)
     }
+    fn get_file_paths(&self) -> Vec<String> {
+        get_file_paths()
+    }
+    fn set_file_path(&mut self, path: &str) -> bool {
+        set_file_path(path)
+    }
+}
+
+/// Paths of files currently on the clipboard, if it holds files rather
+/// than text.
+///
+/// Reads `NSPasteboardTypeFileURL` and, for the multiple-file case, the
+/// pasteboard's item list. Returns an empty vector when the clipboard
+/// holds something else, which is the common case.
+pub fn get_file_paths() -> Vec<String> {
+    unsafe {
+        let pb = general_pasteboard();
+        if pb.is_null() {
+            return Vec::new();
+        }
+        // propertyListForType: NSFilenamesPboardType returns an NSArray of
+        // NSString paths. It is the long standing type for this and is
+        // still what Finder puts on the pasteboard for a copied file.
+        let Some(kind) = ns_string_from("NSFilenamesPboardType") else {
+            return Vec::new();
+        };
+        let send: extern "C" fn(Id, Id, Id) -> Id = std::mem::transmute(objc_msgSend as *const ());
+        let array = send(pb, selector("propertyListForType:"), kind);
+        if array.is_null() {
+            return Vec::new();
+        }
+        let count_of: extern "C" fn(Id, Id) -> usize =
+            std::mem::transmute(objc_msgSend as *const ());
+        let count = count_of(array, selector("count"));
+        let at: extern "C" fn(Id, Id, usize) -> Id = std::mem::transmute(objc_msgSend as *const ());
+        let mut out = Vec::new();
+        for i in 0..count {
+            let item = at(array, selector("objectAtIndex:"), i);
+            if item.is_null() {
+                continue;
+            }
+            if let Some(path) = rust_string_from(item) {
+                out.push(path);
+            }
+        }
+        out
+    }
+}
+
+/// Put a file on the clipboard, so pasting in Finder copies it wherever
+/// the user pastes.
+///
+/// The file must already exist at `path`: the clipboard holds a reference,
+/// not the contents, which is exactly what makes "paste it where I want
+/// it" work without hop needing to know the destination.
+pub fn set_file_path(path: &str) -> bool {
+    unsafe {
+        let pb = general_pasteboard();
+        if pb.is_null() {
+            return false;
+        }
+        let clear: extern "C" fn(Id, Id) -> i64 = std::mem::transmute(objc_msgSend as *const ());
+        clear(pb, selector("clearContents"));
+
+        let Some(kind) = ns_string_from("NSFilenamesPboardType") else {
+            return false;
+        };
+        let Some(path_string) = ns_string_from(path) else {
+            return false;
+        };
+        // NSFilenamesPboardType wants an array of paths even for one file.
+        let array_cls = class("NSArray");
+        if array_cls.is_null() {
+            return false;
+        }
+        let with_object: extern "C" fn(Id, Id, Id) -> Id =
+            std::mem::transmute(objc_msgSend as *const ());
+        let array = with_object(array_cls, selector("arrayWithObject:"), path_string);
+        if array.is_null() {
+            return false;
+        }
+        let set: extern "C" fn(Id, Id, Id, Id) -> bool =
+            std::mem::transmute(objc_msgSend as *const ());
+        set(pb, selector("setPropertyList:forType:"), array, kind)
+    }
 }

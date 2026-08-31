@@ -22,6 +22,21 @@ pub trait Clipboard {
     /// Replace the contents. Returns whether it worked; a failure means
     /// one copy does not cross, which is not worth an error.
     fn set_text(&mut self, text: &str) -> bool;
+
+    /// Paths of files on the clipboard, empty when it holds something
+    /// else. Returning paths rather than contents is what lets the
+    /// receiving side decide when and whether to read them.
+    fn get_file_paths(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Put an existing file on the clipboard by reference, so pasting in
+    /// the file manager copies it wherever the user pastes. That is the
+    /// whole reason a file is staged on disk before being published:
+    /// hop never has to know the destination.
+    fn set_file_path(&mut self, _path: &str) -> bool {
+        false
+    }
 }
 
 /// The largest clipboard text hop will send.
@@ -32,6 +47,16 @@ pub trait Clipboard {
 /// larger selection simply does not sync, with a log line saying so,
 /// rather than silently truncating text the user believes crossed intact.
 pub const MAX_CLIPBOARD_BYTES: usize = 56 * 1024;
+
+/// What a local clipboard change should cause hop to send.
+#[derive(Debug, PartialEq)]
+pub enum LocalChange {
+    /// Forward this text.
+    Text(String),
+    /// Send this file, by path. The caller reads and chunks it, because
+    /// this module deliberately does no I/O.
+    File(String),
+}
 
 /// Tracks a clipboard well enough to forward local copies without
 /// echoing back what the peer sent.
@@ -54,7 +79,7 @@ impl ClipboardSync {
     /// The first call never reports a change: at startup the clipboard
     /// already holds whatever the user copied before hop ran, and pushing
     /// that at the peer would overwrite their clipboard out of nowhere.
-    pub fn poll_local_change<C: Clipboard>(&mut self, clipboard: &C) -> Option<String> {
+    pub fn poll_local_change<C: Clipboard>(&mut self, clipboard: &C) -> Option<LocalChange> {
         let count = clipboard.change_count();
         let first_look = !self.started;
         self.started = true;
@@ -67,6 +92,20 @@ impl ClipboardSync {
             return None;
         }
 
+        // Files take precedence: a file copy also puts a text
+        // representation on some clipboards, and sending the path as text
+        // would paste a meaningless string on the far machine.
+        let files = clipboard.get_file_paths();
+        if let Some(first) = files.first() {
+            if files.len() > 1 {
+                tracing::debug!(
+                    count = files.len(),
+                    "several files copied; sending only the first"
+                );
+            }
+            return Some(LocalChange::File(first.clone()));
+        }
+
         let text = clipboard.get_text()?;
         if text.len() > MAX_CLIPBOARD_BYTES {
             tracing::debug!(
@@ -76,7 +115,18 @@ impl ClipboardSync {
             );
             return None;
         }
-        Some(text)
+        Some(LocalChange::Text(text))
+    }
+
+    /// Publish a received file on the local clipboard, and remember the
+    /// change so it is never sent back.
+    pub fn apply_remote_file<C: Clipboard>(&mut self, clipboard: &mut C, path: &str) {
+        if !clipboard.set_file_path(path) {
+            tracing::warn!("could not put the received file on the clipboard");
+            return;
+        }
+        self.last_seen = clipboard.change_count();
+        self.started = true;
     }
 
     /// Apply text received from the peer, and remember the change it
@@ -103,6 +153,7 @@ impl Default for ClipboardSync {
 #[derive(Default)]
 pub struct FakeClipboard {
     pub text: Option<String>,
+    pub files: Vec<String>,
     pub count: i64,
 }
 
@@ -111,9 +162,17 @@ impl FakeClipboard {
         Self::default()
     }
 
-    /// Simulate the user copying something on this machine.
+    /// Simulate the user copying text on this machine.
     pub fn user_copies(&mut self, text: &str) {
         self.text = Some(text.to_string());
+        self.files.clear();
+        self.count += 1;
+    }
+
+    /// Simulate the user copying a file on this machine.
+    pub fn user_copies_file(&mut self, path: &str) {
+        self.files = vec![path.to_string()];
+        self.text = None;
         self.count += 1;
     }
 }
@@ -127,6 +186,16 @@ impl Clipboard for FakeClipboard {
     }
     fn set_text(&mut self, text: &str) -> bool {
         self.text = Some(text.to_string());
+        self.files.clear();
+        self.count += 1;
+        true
+    }
+    fn get_file_paths(&self) -> Vec<String> {
+        self.files.clone()
+    }
+    fn set_file_path(&mut self, path: &str) -> bool {
+        self.files = vec![path.to_string()];
+        self.text = None;
         self.count += 1;
         true
     }
@@ -153,7 +222,10 @@ mod tests {
         sync.poll_local_change(&clip);
 
         clip.user_copies("hello");
-        assert_eq!(sync.poll_local_change(&clip), Some("hello".to_string()));
+        assert_eq!(
+            sync.poll_local_change(&clip),
+            Some(LocalChange::Text("hello".to_string()))
+        );
         // Polling again with nothing new must stay quiet.
         assert_eq!(sync.poll_local_change(&clip), None);
     }
@@ -187,7 +259,7 @@ mod tests {
         clip.user_copies("something I copied myself");
         assert_eq!(
             sync.poll_local_change(&clip),
-            Some("something I copied myself".to_string())
+            Some(LocalChange::Text("something I copied myself".to_string()))
         );
     }
 
@@ -205,8 +277,57 @@ mod tests {
         clip.user_copies("small again");
         assert_eq!(
             sync.poll_local_change(&clip),
-            Some("small again".to_string())
+            Some(LocalChange::Text("small again".to_string()))
         );
+    }
+
+    #[test]
+    fn a_copied_file_is_reported_as_a_file() {
+        let mut sync = ClipboardSync::new();
+        let mut clip = FakeClipboard::new();
+        sync.poll_local_change(&clip);
+
+        clip.user_copies_file("/Users/talha/Desktop/notes.txt");
+        assert_eq!(
+            sync.poll_local_change(&clip),
+            Some(LocalChange::File(
+                "/Users/talha/Desktop/notes.txt".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_file_wins_over_any_text_representation() {
+        // Copying a file in Finder can leave a text form on the clipboard
+        // too. Sending that would paste a meaningless path string on the
+        // far machine instead of the file.
+        let mut sync = ClipboardSync::new();
+        let mut clip = FakeClipboard::new();
+        sync.poll_local_change(&clip);
+
+        clip.files = vec!["/tmp/a.txt".to_string()];
+        clip.text = Some("/tmp/a.txt".to_string());
+        clip.count += 1;
+        assert_eq!(
+            sync.poll_local_change(&clip),
+            Some(LocalChange::File("/tmp/a.txt".to_string()))
+        );
+    }
+
+    #[test]
+    fn publishing_a_received_file_is_never_echoed_back() {
+        // Same trap as text: putting the file on our clipboard is itself
+        // a local change, and forwarding it would send the file back.
+        let mut sync = ClipboardSync::new();
+        let mut clip = FakeClipboard::new();
+        sync.poll_local_change(&clip);
+
+        sync.apply_remote_file(&mut clip, "/tmp/staging/from-peer.txt");
+        assert_eq!(
+            clip.get_file_paths(),
+            vec!["/tmp/staging/from-peer.txt".to_string()]
+        );
+        assert_eq!(sync.poll_local_change(&clip), None);
     }
 
     #[test]
