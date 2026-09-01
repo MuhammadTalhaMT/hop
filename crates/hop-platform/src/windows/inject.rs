@@ -221,13 +221,41 @@ pub struct WindowsInjector {
     /// fixed (only the panic hotkey or a dead link bring focus home).
     return_edge: Option<ReturnEdge>,
     suppress_release_until: Option<Instant>,
+    /// Multiplier applied to incoming mouse deltas.
+    ///
+    /// macOS has already applied its own pointer acceleration to the
+    /// deltas the tap reports, and Windows applies its acceleration again
+    /// when they are injected, so the same hand movement travels further
+    /// here than it did on the Mac. Scaling below 1.0 cancels the second
+    /// helping.
+    mouse_scale: f64,
+    /// Sub-pixel remainder carried between events.
+    ///
+    /// Without it, scaling truncates every delta towards zero, so slow
+    /// deliberate movement (a stream of one pixel events) would scale to
+    /// zero and the cursor would simply not move.
+    scale_remainder: (f64, f64),
+}
+
+/// Apply `scale` to a delta, carrying the sub-pixel remainder so slow
+/// movement is not rounded away.
+pub(crate) fn scale_delta(dx: i32, dy: i32, scale: f64, remainder: &mut (f64, f64)) -> (i32, i32) {
+    let wanted_x = dx as f64 * scale + remainder.0;
+    let wanted_y = dy as f64 * scale + remainder.1;
+    let out_x = wanted_x.trunc();
+    let out_y = wanted_y.trunc();
+    remainder.0 = wanted_x - out_x;
+    remainder.1 = wanted_y - out_y;
+    (out_x as i32, out_y as i32)
 }
 
 impl WindowsInjector {
-    pub fn new(return_edge: Option<ReturnEdge>) -> Self {
+    pub fn new(return_edge: Option<ReturnEdge>, mouse_scale: f64) -> Self {
         let injector = Self {
             return_edge,
             suppress_release_until: None,
+            mouse_scale,
+            scale_remainder: (0.0, 0.0),
         };
         injector.release_all_modifiers();
         injector
@@ -279,7 +307,15 @@ impl Injector for WindowsInjector {
             // Capture-side signal that a peer's edge was crossed; never
             // itself replayed as input.
             InputEvent::EdgeCrossed => Ok(()),
-            InputEvent::Mouse { dx, dy } => send_inputs(&[mouse_move_input(dx, dy)]),
+            InputEvent::Mouse { dx, dy } => {
+                let (dx, dy) = scale_delta(dx, dy, self.mouse_scale, &mut self.scale_remainder);
+                if dx == 0 && dy == 0 {
+                    // Scaled away to nothing this time; the remainder
+                    // carries it into a later event rather than losing it.
+                    return Ok(());
+                }
+                send_inputs(&[mouse_move_input(dx, dy)])
+            }
             InputEvent::Button { button, pressed } => send_inputs(&[button_input(button, pressed)]),
             InputEvent::Scroll { dx, dy } => send_inputs(&scroll_inputs(dx, dy)),
             InputEvent::Key { usage, pressed } => match key_input(usage, pressed) {
@@ -318,6 +354,57 @@ impl Injector for WindowsInjector {
 
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
+    #[test]
+    fn scaling_reduces_a_delta() {
+        let mut rem = (0.0, 0.0);
+        assert_eq!(scale_delta(10, 10, 0.5, &mut rem), (5, 5));
+    }
+
+    #[test]
+    fn a_scale_of_one_changes_nothing() {
+        let mut rem = (0.0, 0.0);
+        assert_eq!(scale_delta(7, -3, 1.0, &mut rem), (7, -3));
+    }
+
+    #[test]
+    fn slow_movement_is_not_rounded_away_to_nothing() {
+        // A stream of one pixel events at half sensitivity truncates to
+        // zero every time without a carried remainder, and the cursor
+        // would simply never move.
+        let mut rem = (0.0, 0.0);
+        let mut moved = 0;
+        for _ in 0..10 {
+            let (dx, _) = scale_delta(1, 0, 0.5, &mut rem);
+            moved += dx;
+        }
+        assert_eq!(moved, 5, "ten one pixel steps at 0.5 should travel five");
+    }
+
+    #[test]
+    fn the_remainder_does_not_accumulate_error_over_time() {
+        // Whatever the scale, total distance should track the input.
+        let mut rem = (0.0, 0.0);
+        let mut moved = 0;
+        for _ in 0..100 {
+            let (dx, _) = scale_delta(3, 0, 0.7, &mut rem);
+            moved += dx;
+        }
+        let expected = (100.0 * 3.0 * 0.7) as i32;
+        assert!(
+            (moved - expected).abs() <= 1,
+            "drifted: moved {moved}, expected about {expected}"
+        );
+    }
+
+    #[test]
+    fn negative_deltas_scale_symmetrically() {
+        let mut a = (0.0, 0.0);
+        let mut b = (0.0, 0.0);
+        let (px, _) = scale_delta(10, 0, 0.6, &mut a);
+        let (nx, _) = scale_delta(-10, 0, 0.6, &mut b);
+        assert_eq!(px, -nx);
+    }
+
     use super::*;
 
     /// SAFETY: test-only read of the union arm the function under test just

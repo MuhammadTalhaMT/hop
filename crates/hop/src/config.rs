@@ -114,7 +114,7 @@ pub struct SecurityConfig {
 }
 
 /// `[input]`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct InputConfig {
     /// Required for `role = "server"` (see
     /// [`ConfigError::ServerMissingPanicHotkey`]): the emergency escape
@@ -136,6 +136,28 @@ pub struct InputConfig {
     /// this pairing cannot be checked at load time; get it backwards and
     /// focus crosses over but has no automatic way back.
     pub return_edge: Option<String>,
+    /// Client only: multiplier applied to incoming mouse movement.
+    ///
+    /// macOS has already applied its own pointer acceleration to the
+    /// deltas it sends, and Windows applies its acceleration again on
+    /// injection, so the same hand movement travels further on the PC
+    /// than it did on the Mac. Values below 1.0 cancel the second
+    /// helping; 0.6 is a reasonable starting point. Defaults to 1.0,
+    /// which changes nothing.
+    pub mouse_scale: f64,
+}
+
+impl Default for InputConfig {
+    fn default() -> Self {
+        Self {
+            panic_hotkey: None,
+            return_edge: None,
+            // 1.0 means "leave movement exactly as the peer sent it",
+            // which is the right default: a scale is a correction for a
+            // mismatch, not something every setup needs.
+            mouse_scale: 1.0,
+        }
+    }
 }
 
 /// A fully validated `hop` configuration, covering both the server and
@@ -304,6 +326,7 @@ struct RawSecurity {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawInput {
+    mouse_scale: Option<f64>,
     panic_hotkey: Option<String>,
     return_edge: Option<String>,
 }
@@ -376,10 +399,24 @@ impl Config {
         };
 
         let input = match raw.input {
-            Some(raw_input) => InputConfig {
-                panic_hotkey: raw_input.panic_hotkey,
-                return_edge: raw_input.return_edge,
-            },
+            Some(raw_input) => {
+                // A scale of zero would freeze the cursor entirely, and a
+                // negative one would invert it. Both are far more likely
+                // to be a typo than an intent, so they are refused with a
+                // message rather than silently obeyed.
+                let mouse_scale = raw_input.mouse_scale.unwrap_or(1.0);
+                if !(mouse_scale.is_finite() && mouse_scale > 0.0) {
+                    return Err(ConfigError::InvalidValue {
+                        field: "input.mouse_scale".to_string(),
+                        value: mouse_scale.to_string(),
+                    });
+                }
+                InputConfig {
+                    panic_hotkey: raw_input.panic_hotkey,
+                    return_edge: raw_input.return_edge,
+                    mouse_scale,
+                }
+            }
             None => InputConfig::default(),
         };
 
@@ -751,6 +788,32 @@ return_edge = "bottom"
             config.input.panic_hotkey.as_deref(),
             Some("LeftCtrl+LeftAlt+Escape")
         );
+    }
+
+    #[test]
+    fn mouse_scale_defaults_to_unchanged_movement() {
+        // A scale is a correction for a mismatch, not something every
+        // setup needs, so leaving it out must change nothing.
+        let path = write_config(CLIENT_CONFIG);
+        let config = Config::load(&path).expect("valid client config should load");
+        fs::remove_file(&path).ok();
+        assert_eq!(config.input.mouse_scale, 1.0);
+    }
+
+    #[test]
+    fn a_zero_or_negative_mouse_scale_is_refused() {
+        // Zero freezes the cursor and a negative inverts it. Both are far
+        // more likely to be a typo than an intent.
+        for bad in ["0.0", "-0.5"] {
+            let toml = CLIENT_CONFIG.replace(
+                "return_edge = \"bottom\"",
+                &format!("return_edge = \"bottom\"\nmouse_scale = {bad}"),
+            );
+            let path = write_config(&toml);
+            let result = Config::load(&path);
+            fs::remove_file(&path).ok();
+            assert!(result.is_err(), "mouse_scale = {bad} should be refused");
+        }
     }
 
     #[test]

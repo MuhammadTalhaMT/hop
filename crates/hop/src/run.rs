@@ -303,7 +303,8 @@ async fn run_client(config: Config, key: SharedKey) -> Result<(), RunError> {
             field: "input.return_edge",
         })?;
 
-    let mut injector = hop_platform::windows::WindowsInjector::new(Some(return_edge));
+    let mut injector =
+        hop_platform::windows::WindowsInjector::new(Some(return_edge), config.input.mouse_scale);
     let mut supervisor = hop_core::ClientSupervisor::new(server.clone(), key, id);
 
     tracing::info!(

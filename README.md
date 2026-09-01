@@ -78,6 +78,7 @@ key_file = "%APPDATA%\\hop\\key"
 
 [input]
 return_edge = "bottom"             # mirrors the server's top edge
+mouse_scale = 1.0                  # lower this if the PC feels too fast
 ```
 
 Two settings deserve attention:
@@ -86,6 +87,13 @@ Two settings deserve attention:
 input ever gets stuck on the peer, pressing it returns control to the Mac
 immediately. It is handled inside the event tap itself, so it works even
 when the network connection is wedged.
+
+`mouse_scale` on the client corrects pointer speed. macOS applies its own
+acceleration to the movement it sends, and Windows applies its own again
+on arrival, so the same hand movement can travel further on the PC. Lower
+the value until the two feel the same; 0.6 is a reasonable starting
+point. Sub-pixel remainders are carried between events, so slow
+deliberate movement still works rather than being rounded away.
 
 `return_edge` on the client must be the mirror of the server's `[layout]`
 edge: `top` pairs with `bottom`, `left` with `right`. The two files live
