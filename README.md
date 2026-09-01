@@ -22,19 +22,21 @@ What is missing:
 - Peer discovery. Addresses are configured by hand in the config file.
 - PC to Mac input. Only macOS capture and Windows injection exist, so the
   Mac's keyboard and mouse drive the PC, not the other way around.
-- Clipboard images and files. Text only.
-- File transfer.
+- Clipboard images. Text and single files only.
+- Directories. One file at a time.
 
 ## What it does
 
 - Share one keyboard and mouse between a Mac and a Windows PC
 - Command acts as Control on the PC, so Cmd+C copies there
 - Clipboard sync: copy text on one machine, paste on the other
+- File copy and paste: copy a file on one machine, paste it on the other,
+  and it lands wherever you paste it
 - A menu bar item on the Mac for starting and stopping it
 - Recovers by itself from lock, sleep and network loss
 
 Not yet: peer discovery (addresses are configured by hand), driving the
-Mac from the PC's keyboard, and clipboard images or files.
+Mac from the PC's keyboard, clipboard images, and directories.
 
 ## Setup
 
@@ -120,6 +122,29 @@ Worth knowing: everything you copy is sent to the other machine,
 including passwords copied from a password manager. It travels encrypted
 and only your paired machine can read it, and clipboard contents are
 never written to logs, but it does leave the machine you copied on.
+
+## Files
+
+Copying a file makes it available to paste on the other machine, and it
+arrives wherever you paste it: copy on the Windows desktop, paste on the
+Mac desktop, and it appears on the Mac desktop.
+
+It works by transferring the file into a staging folder (`~/.hop/received`)
+and putting a reference to it on the clipboard, so the file manager does
+the final copy to wherever you paste. That is why hop never needs to know
+the destination.
+
+One file at a time, up to 100 MB. Directories are not supported. A larger
+file is skipped with a log line rather than transferring in the
+background.
+
+The receiving side treats the sender as untrusted, because a peer asking
+to write files to your disk is the most dangerous thing this protocol
+does. A name containing a path separator, a `..` component, a drive
+prefix or a null byte is refused rather than cleaned up. The offered size
+is a cap rather than a promise, so a small offer cannot smuggle a large
+file. A transfer that ends early is discarded rather than published, so
+you never paste a file that looks complete and is not.
 
 ## Security
 
