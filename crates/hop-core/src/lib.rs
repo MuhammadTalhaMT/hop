@@ -20,6 +20,9 @@ pub use liveness::Liveness;
 pub mod backoff;
 pub use backoff::Backoff;
 
+pub mod warp;
+pub use warp::WarpDebt;
+
 pub mod screen;
 pub use screen::{Rect, Screen, Segment, Side};
 

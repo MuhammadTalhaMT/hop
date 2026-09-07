@@ -159,9 +159,16 @@ pub fn display_screen() -> Screen {
     Screen::new(monitors, primary)
 }
 
-/// Moves the cursor to `(x, y)` without generating a motion event, so the
-/// warp itself is never mistaken for user input by this project's own
-/// event tap.
+/// Moves the cursor to `(x, y)` without generating a motion event of its
+/// own.
+///
+/// It does NOT follow that the warp is invisible to the event tap, and
+/// reading it that way caused a real bug. macOS folds the displacement
+/// into the delta fields of the NEXT motion event the tap sees, so a
+/// warp performed while hop is forwarding motion to a peer arrives there
+/// as a hand movement of half a screen. Any caller that warps while
+/// forwarding must record the debt; see `hop_core::WarpDebt` and
+/// `CursorPark::park`.
 pub fn warp_cursor(x: f64, y: f64) {
     // `warp_mouse_cursor_position` only fails if Quartz itself rejects the
     // point (a `CGError` from an invalid display state); there is nothing

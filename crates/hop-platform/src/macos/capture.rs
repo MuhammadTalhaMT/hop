@@ -45,7 +45,7 @@ use core_graphics::event::{
     CGEvent, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
     CallbackResult, EventField,
 };
-use hop_core::{Screen, Side};
+use hop_core::{Screen, Side, WarpDebt};
 use hop_proto::{Button, Usage};
 
 use crate::macos::cursor;
@@ -204,17 +204,28 @@ impl CursorPark {
     /// highlighted for as long as focus is on the PC, because no mouse
     /// leave event ever follows a hand that is on another machine. See
     /// `Screen::resting_point`.
-    fn park(&self, at: (f64, f64), rest: Option<(f64, f64)>) {
+    fn park(&self, at: (f64, f64), rest: Option<(f64, f64)>, debt: &Mutex<WarpDebt>) {
         let mut origin = lock_recovering(&self.origin, "cursor_park_origin");
         if origin.is_none() {
             *origin = Some(at);
             // Hide first, so the move to the resting point is never seen
             // as the cursor flicking across the screen.
             cursor::hide_cursor();
+            // Disassociate and zero the suppression interval BEFORE
+            // warping, not after. A warp performed while the default
+            // quarter second suppression interval is still in force has
+            // its own local events suppressed, which is the last thing
+            // wanted on the one warp that has to take effect immediately.
+            cursor::enter_parked_state();
             if let Some((x, y)) = rest {
                 cursor::warp_cursor(x, y);
+                // macOS reports this displacement as the delta of the
+                // NEXT motion event the tap sees. hop forwards deltas, so
+                // without recording the debt here the warp arrives on the
+                // peer as a hand movement of half a screen. See
+                // `hop_core::WarpDebt`.
+                lock_recovering(debt, "warp_debt").note_warp();
             }
-            cursor::enter_parked_state();
         }
     }
 
@@ -532,6 +543,10 @@ struct CaptureContext {
     /// the seam between two displays is not.
     screen: Arc<Screen>,
     park: Arc<CursorPark>,
+    /// Set when hop moves the cursor itself, so the motion event that
+    /// carries the warp's displacement is not forwarded to the peer as
+    /// though the user had made it. See `hop_core::WarpDebt`.
+    warp_debt: Mutex<WarpDebt>,
     /// Set only while a peer is actually connected; see
     /// `MacCapturer::peer_connected_flag` and `should_begin_crossing`.
     peer_connected: Arc<AtomicBool>,
@@ -596,6 +611,7 @@ fn run_capture_thread(
         panic_combo,
         held_usages: Mutex::new(HashSet::new()),
         scroll_remainder: Mutex::new((0.0, 0.0)),
+        warp_debt: Mutex::new(WarpDebt::new()),
     };
 
     let events_of_interest = vec![
@@ -852,7 +868,15 @@ fn handle_event(event_type: CGEventType, event: &CGEvent, ctx: &CaptureContext) 
         // below is, which is what `pump_server` actually acts on to
         // start forwarding.
         if ctx.remote.load(Ordering::Relaxed) {
-            ctx.events.push(input_event);
+            // Drop the one motion event that carries a warp hop performed
+            // itself. Its deltas are the OS reconciling the cursor's
+            // position, not the user's hand, and forwarding them moves
+            // the peer's cursor by half a screen.
+            let is_motion = matches!(input_event, InputEvent::Mouse { .. });
+            let absorbed = is_motion && lock_recovering(&ctx.warp_debt, "warp_debt").absorb();
+            if !absorbed {
+                ctx.events.push(input_event);
+            }
         }
     }
 
@@ -899,7 +923,8 @@ fn handle_event(event_type: CGEventType, event: &CGEvent, ctx: &CaptureContext) 
                     .screen
                     .landing(side, along, EDGE_MARGIN)
                     .unwrap_or((location.x, location.y));
-                ctx.park.park(landing, ctx.screen.resting_point());
+                ctx.park
+                    .park(landing, ctx.screen.resting_point(), &ctx.warp_debt);
                 // Set before the final suppression check below runs, so
                 // the very event that crossed the edge is itself already
                 // suppressed rather than leaking one more pixel of local
