@@ -33,6 +33,9 @@ pub enum RunError {
     #[error(transparent)]
     Config(#[from] ConfigError),
 
+    #[error(transparent)]
+    Update(#[from] crate::update::UpdateError),
+
     #[error(
         "keygen needs either --out <path> or --config <path> pointing at a config with [security] key_file set"
     )]

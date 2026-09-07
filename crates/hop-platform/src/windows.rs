@@ -19,3 +19,9 @@ pub mod inject;
 
 #[cfg(target_os = "windows")]
 pub use inject::WindowsInjector;
+
+// The one network call hop makes that is not its own protocol: the
+// self-updater fetching a release from GitHub. It lives here because it
+// is FFI, and this is the only crate allowed any.
+#[cfg(target_os = "windows")]
+pub mod http;
