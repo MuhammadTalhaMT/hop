@@ -33,3 +33,8 @@ pub mod tray;
 
 #[cfg(target_os = "windows")]
 pub mod console;
+
+// Hiding the PC's own cursor while focus is on the Mac, the counterpart
+// to what macos::cursor already does in the other direction.
+#[cfg(target_os = "windows")]
+pub mod cursor;

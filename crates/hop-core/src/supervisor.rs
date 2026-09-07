@@ -29,6 +29,11 @@ use tokio::sync::mpsc;
 /// died stays physically down on the far machine forever: the worst
 /// outcome this tool can produce.
 pub fn release_everything<I: Injector>(injector: &mut I, held: &mut HeldKeys) {
+    // Undo anything the platform changed about this machine while focus
+    // was away, before releasing keys: if one of the key-ups below were
+    // to fail, the user must still get their cursor back.
+    injector.focus_returned();
+
     for usage in held.drain_release() {
         let event = InputEvent::Key {
             usage,
@@ -508,6 +513,44 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio::io::duplex;
     use tokio::net::TcpListener;
+
+    /// An `Injector` that records whether `focus_returned` was called,
+    /// so the disconnect path's obligation to undo what the platform
+    /// changed is pinned rather than assumed.
+    #[derive(Default)]
+    struct FocusInjector {
+        inner: FakeInjector,
+        focus_returned: bool,
+    }
+
+    impl Injector for FocusInjector {
+        fn inject(&mut self, event: &InputEvent) -> Result<(), crate::device::DeviceError> {
+            self.inner.inject(event)
+        }
+
+        fn focus_returned(&mut self) {
+            self.focus_returned = true;
+        }
+    }
+
+    // A link that dies while focus is on the peer leaves this machine
+    // altered: on Windows the cursor is hidden. Nothing else runs on a
+    // disconnect, so if this sweep does not undo it, the user is left
+    // with no visible pointer until hop is restarted.
+    #[test]
+    fn a_disconnect_gives_this_machine_back_whatever_the_platform_changed() {
+        let mut injector = FocusInjector::default();
+        let mut held = HeldKeys::new();
+        held.record(Usage::LEFT_CTRL, true);
+
+        release_everything(&mut injector, &mut held);
+
+        assert!(
+            injector.focus_returned,
+            "a disconnect must undo what the platform changed while focus was away"
+        );
+        assert!(held.is_empty(), "and still release the keys it was holding");
+    }
 
     /// An `Injector` wrapping `FakeInjector`, with `return_crossing`'s
     /// answer controlled by the test rather than by a real cursor. Lets

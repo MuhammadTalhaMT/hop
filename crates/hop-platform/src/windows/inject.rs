@@ -28,6 +28,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WHEEL_DELTA,
 };
 
+use crate::windows::cursor;
 use crate::windows::keymap::usage_to_scancode;
 use crate::windows::return_edge::{return_crossing, CursorSource, ReturnEdge};
 
@@ -409,6 +410,11 @@ impl WindowsInjector {
             scale_remainder: (0.0, 0.0),
         };
         injector.release_all_modifiers();
+        // Repair a previous run that died while the cursor was hidden.
+        // Same reasoning as releasing the modifiers above: nothing in a
+        // process that is gone can clean up after itself, so the next
+        // start does it. See `windows::cursor`.
+        cursor::restore();
         injector
     }
 
@@ -521,6 +527,9 @@ impl Injector for WindowsInjector {
                 // past the end of this machine's edge clamps to the
                 // nearest corner.
                 self.refresh_screen();
+                // Focus has arrived, so the user is looking at this
+                // machine again and needs to see the pointer.
+                cursor::restore();
                 let side = Side::from(self.return_edge.unwrap_or(ReturnEdge::Bottom));
                 let target = f64::from(along) + self.screen.anchor(side, self.anchor);
                 let Some((x, y)) = self.screen.landing(side, target, ENTRY_MARGIN) else {
@@ -549,6 +558,10 @@ impl Injector for WindowsInjector {
         }
     }
 
+    fn focus_returned(&mut self) {
+        cursor::restore();
+    }
+
     fn return_crossing(&mut self) -> Option<f32> {
         let edge = self.return_edge?;
         if let Some(until) = self.suppress_release_until {
@@ -560,15 +573,22 @@ impl Injector for WindowsInjector {
         let along = return_crossing(edge, self.anchor, &WindowsCursorSource)?;
         self.suppress_release_until = Some(Instant::now() + RELEASE_SUPPRESS_WINDOW);
 
+        // Hide the pointer: the user is about to be looking at the Mac,
+        // and an arrow sitting on the Windows desktop the whole time
+        // they are working elsewhere is exactly as odd as it sounds. The
+        // Mac already does this in the other direction.
+        cursor::hide();
+
         // Move the cursor off the edge it is leaving through before focus
         // goes back to the Mac.
         //
-        // That edge is the taskbar. A cursor left sitting on it keeps
-        // whatever is under it hovered for as long as focus is elsewhere,
-        // and no mouse leave event ever follows, because the hand is on
-        // another machine: the thumbnail preview of whatever window was
-        // under the pointer stays open on an unattended screen until the
-        // user comes back and nudges it.
+        // Hiding is not enough on its own: an invisible cursor still
+        // hovers. That edge is the taskbar, so a cursor left sitting on
+        // it keeps whatever is under it hovered for as long as focus is
+        // elsewhere, and no mouse leave event ever follows, because the
+        // hand is on another machine. The thumbnail preview of whatever
+        // window was under the pointer stays open on an unattended
+        // screen until the user comes back and nudges it.
         //
         // Injected rather than warped with `SetCursorPos` precisely
         // because it goes through the input stack: that is what makes

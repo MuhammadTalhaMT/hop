@@ -325,6 +325,10 @@ async fn run_client(config: Config, key: SharedKey) -> Result<(), RunError> {
     );
     let mut clipboard = hop_platform::windows::clipboard::WindowsClipboard;
 
+    // Puts the cursor back even if the supervisor panics and unwinds,
+    // which no other path below covers.
+    let _restore_cursor = hop_platform::windows::cursor::RestoreOnDrop;
+
     // Race the supervisor against Ctrl-C so a deliberate stop releases
     // whatever is held rather than leaving a modifier down on this
     // machine with no key-up ever sent. `run` never returns, so the
@@ -337,6 +341,8 @@ async fn run_client(config: Config, key: SharedKey) -> Result<(), RunError> {
                 Err(error) => tracing::warn!(%error, "could not listen for Ctrl-C"),
             }
             injector.release_all_modifiers();
+            // Never walk away leaving the PC with no visible cursor.
+            hop_platform::windows::cursor::restore();
             Ok(())
         }
     }

@@ -75,6 +75,20 @@ pub trait Injector {
     fn return_crossing(&mut self) -> Option<f32> {
         None
     }
+
+    /// Called whenever this machine has its input back for certain: the
+    /// link died, the peer released focus, or hop is shutting down.
+    ///
+    /// A platform that changed something about the local machine while
+    /// focus was away undoes it here. On Windows that is the hidden
+    /// cursor: without this, a Mac that goes to sleep mid-session leaves
+    /// the PC with no visible pointer until hop is restarted, which is
+    /// the same class of problem as a modifier left held down.
+    ///
+    /// Must be safe to call when nothing was changed and when it has
+    /// already been called, since several paths lead here and none of
+    /// them knows what the others did.
+    fn focus_returned(&mut self) {}
 }
 
 /// Replays a fixed script of events. Lets the whole input path be tested

@@ -32,6 +32,7 @@ What is missing:
 - Clipboard sync: copy text on one machine, paste on the other
 - File copy and paste: copy a file on one machine, paste it on the other,
   and it lands wherever you paste it
+- The cursor disappears from whichever machine you are not using
 - A menu bar item on the Mac and a notification area icon on the PC
 - The PC updates itself from the newest release
 - Recovers by itself from lock, sleep and network loss
