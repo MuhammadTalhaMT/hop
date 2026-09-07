@@ -134,11 +134,18 @@ fn entry_point(
 /// desktop, which is what `MOUSEEVENTF_VIRTUALDESK` selects.
 fn mouse_move_absolute_input(x: i32, y: i32, screen: (i32, i32, i32, i32)) -> INPUT {
     let (left, top, width, height) = screen;
-    // Guard against a zero sized desktop rather than dividing by it.
-    let width = width.max(1) as f64;
-    let height = height.max(1) as f64;
-    let nx = ((x - left) as f64 * 65535.0 / width).round() as i32;
-    let ny = ((y - top) as f64 * 65535.0 / height).round() as i32;
+    // Divide by width MINUS ONE, not width.
+    //
+    // The normalised range is inclusive at both ends: 0 is the first pixel
+    // and 65535 is the last. Dividing by the full width maps the last
+    // pixel to 65474 on a 1080 high screen, which Windows converts back to
+    // the second to last pixel. The cursor could then never actually reach
+    // the bottom row, so the return edge never triggered and focus was
+    // stuck on the PC.
+    let span_x = (width - 1).max(1) as f64;
+    let span_y = (height - 1).max(1) as f64;
+    let nx = ((x - left) as f64 * 65535.0 / span_x).round() as i32;
+    let ny = ((y - top) as f64 * 65535.0 / span_y).round() as i32;
     mouse_input(
         nx.clamp(0, 65535),
         ny.clamp(0, 65535),
@@ -427,6 +434,19 @@ impl Injector for WindowsInjector {
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
     #[test]
+    fn the_last_pixel_maps_to_the_end_of_the_range() {
+        // Dividing by the full width instead of width-1 lands the last
+        // pixel short, Windows rounds it back one, and the cursor can then
+        // never reach the return edge: focus gets stuck on the PC.
+        let screen = (0, 0, 1920, 1080);
+        let last = mouse_move_absolute_input(1919, 1079, screen);
+        unsafe {
+            assert_eq!(last.Anonymous.mi.dx, 65535);
+            assert_eq!(last.Anonymous.mi.dy, 65535);
+        }
+    }
+
+    #[test]
     fn absolute_coordinates_span_the_whole_virtual_desktop() {
         // 0 and 65535 are the ends of the normalised range, whatever the
         // real pixel size. Getting this wrong compresses all movement
@@ -437,8 +457,8 @@ mod tests {
         unsafe {
             assert_eq!(top_left.Anonymous.mi.dx, 0);
             assert_eq!(top_left.Anonymous.mi.dy, 0);
-            assert!(bottom_right.Anonymous.mi.dx > 65000);
-            assert!(bottom_right.Anonymous.mi.dy > 65000);
+            assert_eq!(bottom_right.Anonymous.mi.dx, 65535);
+            assert_eq!(bottom_right.Anonymous.mi.dy, 65535);
         }
     }
 
