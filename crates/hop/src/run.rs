@@ -36,6 +36,11 @@ pub enum RunError {
     #[error(transparent)]
     Update(#[from] crate::update::UpdateError),
 
+    /// Only ever constructed on Windows, where the tray lives.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    #[error("{0}")]
+    Tray(String),
+
     #[error(
         "keygen needs either --out <path> or --config <path> pointing at a config with [security] key_file set"
     )]

@@ -25,3 +25,11 @@ pub use inject::WindowsInjector;
 // is FFI, and this is the only crate allowed any.
 #[cfg(target_os = "windows")]
 pub mod http;
+
+// The notification area icon, the Windows counterpart to hop's macOS menu
+// bar item.
+#[cfg(target_os = "windows")]
+pub mod tray;
+
+#[cfg(target_os = "windows")]
+pub mod console;
