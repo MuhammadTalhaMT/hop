@@ -36,6 +36,8 @@ const MAX_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024;
 pub enum UpdateError {
     #[error("could not reach GitHub: {0}")]
     Network(String),
+    #[error("refusing to download from {0}, which is not a GitHub release host")]
+    UnexpectedHost(String),
     #[error("GitHub's reply was not what this build expects: {0}")]
     Malformed(String),
     #[error("this release has no {0} build attached to it")]
@@ -110,11 +112,48 @@ pub fn asset_name() -> &'static str {
     }
 }
 
+/// Hosts hop will fetch from. Anything else is refused before a
+/// connection is opened.
+///
+/// GitHub redirects a release download to its own storage host, so both
+/// appear here. WinHTTP follows that redirect itself, which means only
+/// the FIRST host is checked against this list; the rest of the chain is
+/// GitHub redirecting to GitHub, validated by TLS. Pinning the first hop
+/// is what stops a URL from somewhere else being followed at all.
+const ALLOWED_HOSTS: &[&str] = &[
+    "api.github.com",
+    "github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+];
+
 /// A release, reduced to the two things hop cares about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Release {
     pub version: Version,
-    pub download_url: String,
+    /// The tag, kept so the download URL can be BUILT rather than taken
+    /// from the reply. See `asset_url`.
+    pub tag: String,
+}
+
+/// Where this platform's binary for `tag` lives.
+///
+/// Constructed from the repository, the tag and the platform, never
+/// taken from GitHub's JSON, even though the JSON offers exactly this
+/// URL. hop is about to overwrite its own executable with whatever comes
+/// back, and a `browser_download_url` is a value from a reply telling hop
+/// where to fetch the thing it will then RUN. Building it here means the
+/// only host hop can ever be pointed at is the one compiled in.
+pub fn asset_url(tag: &str) -> String {
+    format!(
+        "https://github.com/{REPO}/releases/download/{tag}/{}",
+        asset_name()
+    )
+}
+
+/// Whether hop is willing to open a connection to `host`.
+pub fn is_allowed_host(host: &str) -> bool {
+    ALLOWED_HOSTS.contains(&host)
 }
 
 /// Pulls this platform's release out of GitHub's JSON.
@@ -133,24 +172,27 @@ pub fn release_from_json(body: &str, asset: &str) -> Result<Release, UpdateError
     let version = Version::parse(tag)
         .ok_or_else(|| UpdateError::Malformed(format!("tag {tag} is not a version")))?;
 
-    let download_url = value
+    // The asset list is read only to confirm this platform's build is
+    // actually attached, so hop fails with a clear message instead of
+    // fetching a URL that 404s. The URL itself is built, not read.
+    let has_asset = value
         .get("assets")
         .and_then(|a| a.as_array())
         .ok_or_else(|| UpdateError::Malformed("no assets".into()))?
         .iter()
-        .find(|a| a.get("name").and_then(|n| n.as_str()) == Some(asset))
-        .and_then(|a| a.get("browser_download_url"))
-        .and_then(|u| u.as_str())
-        .ok_or(UpdateError::NoAssetForPlatform(if cfg!(windows) {
+        .any(|a| a.get("name").and_then(|n| n.as_str()) == Some(asset));
+
+    if !has_asset {
+        return Err(UpdateError::NoAssetForPlatform(if cfg!(windows) {
             "Windows"
         } else {
             "macOS"
-        }))?
-        .to_string();
+        }));
+    }
 
     Ok(Release {
         version,
-        download_url,
+        tag: tag.to_string(),
     })
 }
 
@@ -187,6 +229,9 @@ pub fn split_https_url(url: &str) -> Option<(String, String)> {
 fn http_get(url: &str, limit: usize) -> Result<Vec<u8>, UpdateError> {
     let (host, path) =
         split_https_url(url).ok_or_else(|| UpdateError::Malformed(format!("bad url {url}")))?;
+    if !is_allowed_host(&host) {
+        return Err(UpdateError::UnexpectedHost(host));
+    }
     hop_platform::windows::http::get(&host, &path, "hop-updater", limit)
         .map_err(UpdateError::Network)
 }
@@ -302,7 +347,7 @@ pub fn update(check_only: bool) -> Result<Option<Version>, UpdateError> {
         return Ok(Some(release.version));
     }
 
-    let bytes = download(&release.download_url)?;
+    let bytes = download(&asset_url(&release.tag))?;
     let target = std::env::current_exe().map_err(UpdateError::NoInstallPath)?;
     replace_executable(&target, &bytes)?;
     Ok(Some(release.version))
@@ -418,15 +463,47 @@ mod tests {
     }"#;
 
     #[test]
-    fn picks_this_platforms_asset_out_of_the_release() {
+    fn reads_the_version_and_confirms_this_platforms_build_exists() {
         let release = release_from_json(RELEASE_JSON, "hop.exe").expect("should parse");
         assert_eq!(release.version, Version::parse("0.2.0").unwrap());
-        assert_eq!(release.download_url, "https://example.invalid/hop.exe");
+        assert_eq!(release.tag, "v0.2.0");
+    }
 
-        // The two assets differ only by name, so picking the wrong one is
-        // a real possibility worth pinning: a Mac binary on a PC.
-        let mac = release_from_json(RELEASE_JSON, "hop").expect("should parse");
-        assert_eq!(mac.download_url, "https://example.invalid/hop");
+    // The reply offers a download URL and hop must not use it. Everything
+    // downloaded here is about to be executed, so the host is compiled
+    // in rather than taken from a reply that names where to fetch it.
+    #[test]
+    fn the_download_url_is_built_here_not_taken_from_the_reply() {
+        let release = release_from_json(RELEASE_JSON, "hop.exe").expect("should parse");
+        let url = asset_url(&release.tag);
+        assert!(
+            !url.contains("example.invalid"),
+            "the URL from the reply must never be followed: {url}"
+        );
+        assert_eq!(
+            url,
+            format!(
+                "https://github.com/{REPO}/releases/download/v0.2.0/{}",
+                asset_name()
+            )
+        );
+        let (host, _) = split_https_url(&url).expect("built url should parse");
+        assert!(is_allowed_host(&host));
+    }
+
+    #[test]
+    fn only_github_release_hosts_are_ever_contacted() {
+        assert!(is_allowed_host("api.github.com"));
+        assert!(is_allowed_host("objects.githubusercontent.com"));
+        for bad in [
+            "evil.invalid",
+            "github.com.evil.invalid",
+            "raw.githubusercontent.com",
+            "",
+            "GitHub.com",
+        ] {
+            assert!(!is_allowed_host(bad), "{bad} should not be contacted");
+        }
     }
 
     #[test]
