@@ -54,6 +54,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # --repo because this job never checks the repository out, so
+          # gh has no git remote to infer it from.
           gh release create "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes \
             ./artifacts/windows/hop.exe \
             ./artifacts/macos/hop
