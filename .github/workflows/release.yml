@@ -35,6 +35,10 @@ jobs:
   create-release:
     needs: [build-windows, build-macos]
     runs-on: ubuntu-latest
+    # Needed to create the release. Without it the default token is read
+    # only on a public repository and `gh release create` fails.
+    permissions:
+      contents: write
     steps:
       - name: Download Windows artifact
         uses: actions/download-artifact@v4

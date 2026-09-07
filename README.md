@@ -32,7 +32,8 @@ What is missing:
 - Clipboard sync: copy text on one machine, paste on the other
 - File copy and paste: copy a file on one machine, paste it on the other,
   and it lands wherever you paste it
-- A menu bar item on the Mac for starting and stopping it
+- A menu bar item on the Mac and a notification area icon on the PC
+- The PC updates itself from the newest release
 - Recovers by itself from lock, sleep and network loss
 
 Not yet: peer discovery (addresses are configured by hand), driving the
@@ -126,19 +127,50 @@ On macOS, whatever runs `hop` needs Accessibility permission (System
 Settings, Privacy and Security, Accessibility). Without it the event tap
 cannot be created at all and `hop run` will say so.
 
+## Installing
+
+Download the newest `hop.exe` (Windows) and `hop` (macOS) from the
+[releases page](https://github.com/MuhammadTalhaMT/hop/releases).
+
+On the PC, that is the last download you need to do by hand. hop checks
+for a newer release when it starts, installs it, and restarts into it,
+so keeping up to date means starting hop. `--no-update` skips the check
+and `hop update --check` asks without installing.
+
+The Mac deliberately does not update itself. macOS ties Accessibility
+permission to the signing identity, and a binary built by CI is not
+signed with your certificate, so replacing it would silently break input
+capture. Build it locally instead:
+
+    ./update-mac.sh
+
+Worth knowing before you rely on the updater: hop verifies that the
+download came from GitHub over TLS, but does not yet check a signature
+over the binary itself. The trust root is the repository. That is the
+same trust you extend by downloading a release and running it, but it
+now happens without you watching.
+
 ## Running it
 
-    hop run --config ~/.config/hop/config.toml
+On the PC, double click `hop.exe`. A hop icon appears in the
+notification area by the clock, with Start, Stop and Quit, and hop starts
+straight away. There is no console window at any point. It reads
+`%APPDATA%\hop\config.toml` unless you pass `--config`.
 
-Or, on the Mac, put it in the menu bar instead:
+On the Mac, put it in the menu bar:
 
     hop menubar --config ~/.config/hop/config.toml
 
 The menu bar item shows `hop ●` while running and `hop ○` while stopped,
-with Start, Stop and Quit. It launches `hop run` as a separate process,
-so a problem in hop cannot take the menu bar item down with it, and Quit
-always stops the engine rather than leaving it orphaned holding your
-input.
+with Start, Stop and Quit.
+
+Either way, the icon launches `hop run` as a separate process, so a
+problem in hop cannot take the icon down with it, and Quit always stops
+the engine rather than leaving it orphaned holding your input.
+
+From a terminal, on either machine:
+
+    hop run --config <path to config.toml>
 
 ## Clipboard
 
