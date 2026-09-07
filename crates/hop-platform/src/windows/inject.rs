@@ -559,6 +559,27 @@ impl Injector for WindowsInjector {
         }
         let along = return_crossing(edge, self.anchor, &WindowsCursorSource)?;
         self.suppress_release_until = Some(Instant::now() + RELEASE_SUPPRESS_WINDOW);
+
+        // Move the cursor off the edge it is leaving through before focus
+        // goes back to the Mac.
+        //
+        // That edge is the taskbar. A cursor left sitting on it keeps
+        // whatever is under it hovered for as long as focus is elsewhere,
+        // and no mouse leave event ever follows, because the hand is on
+        // another machine: the thumbnail preview of whatever window was
+        // under the pointer stays open on an unattended screen until the
+        // user comes back and nudges it.
+        //
+        // Injected rather than warped with `SetCursorPos` precisely
+        // because it goes through the input stack: that is what makes
+        // the taskbar see the pointer leave and dismiss the preview.
+        if let Some((x, y)) = self.screen.resting_point() {
+            let _ = send_inputs(&[mouse_move_absolute_input(
+                x.round() as i32,
+                y.round() as i32,
+                WindowsCursorSource.virtual_screen(),
+            )]);
+        }
         Some(along)
     }
 }

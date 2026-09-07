@@ -352,6 +352,30 @@ impl Screen {
             .unwrap_or((x, y))
     }
 
+    /// Where to leave the real cursor while focus is on the peer.
+    ///
+    /// The cursor has to be left SOMEWHERE, and wherever it is left, the
+    /// OS goes on treating it as hovering whatever is under it. No mouse
+    /// leave event ever follows, because the hand is on the other
+    /// machine, so the hover latches: a taskbar thumbnail preview stays
+    /// open on the PC, a menu bar item stays highlighted on the Mac.
+    ///
+    /// Leaving it at the edge it crossed through is the worst possible
+    /// choice, and is what hop used to do. On both machines the crossing
+    /// edge is the OS's most hover-sensitive strip: the PC's bottom edge
+    /// is the taskbar, the Mac's top edge is the menu bar, and a corner
+    /// is a macOS hot corner. The centre of the primary monitor is away
+    /// from all of them. It can still be over an ordinary window, but a
+    /// button highlight nobody can see is a world away from a preview
+    /// popup sitting open on an unattended screen.
+    pub fn resting_point(&self) -> Option<(f64, f64)> {
+        let m = self
+            .monitors
+            .get(self.primary)
+            .or_else(|| self.monitors.first())?;
+        Some(((m.min_x + m.max_x) / 2.0, (m.min_y + m.max_y) / 2.0))
+    }
+
     /// The monitor containing `(x, y)`, or the nearest one. Nearest
     /// rather than `None` because the OS can report a cursor position in
     /// a dead zone between monitors, and a crossing decision still has to
@@ -670,6 +694,35 @@ mod tests {
         let screen = Screen::new(vec![Rect::new(0.0, 0.0, 100.0, 8.0)], 0);
         let (x, y) = screen.landing(Side::Bottom, 50.0, 12.0).unwrap();
         assert_eq!((x, y), (50.0, 0.0));
+    }
+
+    #[test]
+    fn the_resting_point_is_the_centre_of_the_primary_monitor() {
+        assert_eq!(pc().resting_point(), Some((960.0, 540.0)));
+        assert_eq!(mac().resting_point(), Some((735.0, 478.0)));
+    }
+
+    // The whole point of the resting point: it must not be on the edge
+    // the cursor crossed through, because that edge is the taskbar on the
+    // PC and the menu bar on the Mac, and a cursor left there leaves a
+    // hover latched open with nobody watching.
+    #[test]
+    fn the_resting_point_is_clear_of_every_edge() {
+        for screen in [pc(), mac()] {
+            let (x, y) = screen.resting_point().expect("has a monitor");
+            for side in [Side::Top, Side::Bottom, Side::Left, Side::Right] {
+                assert_eq!(
+                    screen.at_outer_edge(side, x, y),
+                    None,
+                    "resting point sits on the {side:?} edge"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_screen_with_no_monitors_has_no_resting_point() {
+        assert_eq!(Screen::new(Vec::new(), 0).resting_point(), None);
     }
 
     #[test]

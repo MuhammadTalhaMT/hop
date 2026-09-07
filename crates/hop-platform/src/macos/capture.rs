@@ -189,17 +189,31 @@ impl CursorPark {
         }
     }
 
-    /// Records `at` as the point to come back to, hides the cursor, and
-    /// disconnects hardware mouse movement from the cursor (see
-    /// `cursor::enter_parked_state`, IMPORTANT 2's fix), but only the
-    /// first time this is called after a crossing: a no-op if already
-    /// parked, so it is safe to call on every remote motion event rather
-    /// than only the first.
-    fn park(&self, at: (f64, f64)) {
+    /// Records `at` as the point to come back to, hides the cursor, moves
+    /// it to `rest`, and disconnects hardware mouse movement from the
+    /// cursor (see `cursor::enter_parked_state`, IMPORTANT 2's fix), but
+    /// only the first time this is called after a crossing: a no-op if
+    /// already parked, so it is safe to call on every remote motion event
+    /// rather than only the first.
+    ///
+    /// `rest` is separate from `at` because the two want opposite things.
+    /// `at` is where the cursor should come BACK to if the link dies, so
+    /// it is the point the hand left through. `rest` is where the cursor
+    /// sits in the meantime, and leaving it at `at` means leaving it on
+    /// the Mac's top edge, which is the menu bar: the item under it stays
+    /// highlighted for as long as focus is on the PC, because no mouse
+    /// leave event ever follows a hand that is on another machine. See
+    /// `Screen::resting_point`.
+    fn park(&self, at: (f64, f64), rest: Option<(f64, f64)>) {
         let mut origin = lock_recovering(&self.origin, "cursor_park_origin");
         if origin.is_none() {
             *origin = Some(at);
+            // Hide first, so the move to the resting point is never seen
+            // as the cursor flicking across the screen.
             cursor::hide_cursor();
+            if let Some((x, y)) = rest {
+                cursor::warp_cursor(x, y);
+            }
             cursor::enter_parked_state();
         }
     }
@@ -885,7 +899,7 @@ fn handle_event(event_type: CGEventType, event: &CGEvent, ctx: &CaptureContext) 
                     .screen
                     .landing(side, along, EDGE_MARGIN)
                     .unwrap_or((location.x, location.y));
-                ctx.park.park(landing);
+                ctx.park.park(landing, ctx.screen.resting_point());
                 // Set before the final suppression check below runs, so
                 // the very event that crossed the edge is itself already
                 // suppressed rather than leaking one more pixel of local
