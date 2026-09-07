@@ -76,7 +76,7 @@ async fn captured_input_arrives_injected_on_the_far_side() {
     let mut injector = FakeInjector::new();
     let mut held = HeldKeys::new();
 
-    pump_server(&mut server_side, &mut capturer, &mut control, &remap)
+    pump_server(&mut server_side, &mut capturer, &mut control, &remap, None)
         .await
         .expect("server pump");
 
@@ -124,7 +124,7 @@ async fn input_before_the_edge_is_not_forwarded() {
     let mut injector = FakeInjector::new();
     let mut held = HeldKeys::new();
 
-    pump_server(&mut server_side, &mut capturer, &mut control, &remap)
+    pump_server(&mut server_side, &mut capturer, &mut control, &remap, None)
         .await
         .expect("server pump");
     server_side.send(&Message::Heartbeat).await.unwrap();
@@ -162,7 +162,7 @@ async fn local_pointer_and_click_activity_does_not_cross_the_wire() {
     let mut injector = FakeInjector::new();
     let mut held = HeldKeys::new();
 
-    pump_server(&mut server_side, &mut capturer, &mut control, &remap)
+    pump_server(&mut server_side, &mut capturer, &mut control, &remap, None)
         .await
         .expect("server pump");
     // Give the client something to receive so a missing focus gate (which
@@ -205,7 +205,7 @@ async fn explicit_release_clears_keys_held_on_the_peer() {
     let mut injector = FakeInjector::new();
     let mut held = HeldKeys::new();
 
-    pump_server(&mut server_side, &mut capturer, &mut control, &remap)
+    pump_server(&mut server_side, &mut capturer, &mut control, &remap, None)
         .await
         .expect("server pump");
 
@@ -285,7 +285,7 @@ async fn a_peer_with_the_wrong_key_gets_nothing() {
     let mut control = Control::new();
     let remap = RemapTable::new();
 
-    pump_server(&mut server_side, &mut capturer, &mut control, &remap)
+    pump_server(&mut server_side, &mut capturer, &mut control, &remap, None)
         .await
         .expect("server pump");
 

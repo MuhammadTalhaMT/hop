@@ -17,7 +17,10 @@ pub fn event_to_message(remap: &RemapTable, event: InputEvent) -> Option<Message
             usage: remap.apply(usage),
             pressed,
         }),
-        InputEvent::EdgeCrossed => None,
+        // Both are control signals about focus, not input to replay, so
+        // neither becomes a message here. EdgeCrossed is handled by the
+        // state machine and Enter is sent explicitly alongside it.
+        InputEvent::EdgeCrossed | InputEvent::Enter { .. } => None,
     }
 }
 
@@ -29,6 +32,7 @@ pub fn message_to_event(message: &Message) -> Option<InputEvent> {
         Message::Scroll { dx, dy } => Some(InputEvent::Scroll { dx, dy }),
         Message::MouseButton { button, pressed } => Some(InputEvent::Button { button, pressed }),
         Message::Key { usage, pressed } => Some(InputEvent::Key { usage, pressed }),
+        Message::Enter { fraction } => Some(InputEvent::Enter { fraction }),
         _ => None,
     }
 }
@@ -77,6 +81,7 @@ pub async fn pump_server<W, C>(
     capturer: &mut C,
     control: &mut Control,
     remap: &RemapTable,
+    entry_fraction: Option<f32>,
 ) -> Result<(), TransportError>
 where
     W: AsyncWrite + Unpin,
@@ -91,6 +96,13 @@ where
         match event {
             InputEvent::EdgeCrossed => {
                 control.on_edge_crossed();
+                // Tell the peer WHERE along the edge the cursor left, so
+                // it enters at the same relative point instead of
+                // resuming wherever its pointer happened to be. Without
+                // this the cursor teleports on every crossing.
+                if let Some(fraction) = entry_fraction {
+                    transport.send(&Message::Enter { fraction }).await?;
+                }
             }
             InputEvent::Key { usage, pressed } => {
                 if let Action::Forward(usage, pressed) = control.on_key(usage, pressed) {

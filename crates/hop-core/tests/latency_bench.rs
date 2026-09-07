@@ -61,9 +61,15 @@ async fn measure(nodelay: bool) -> Duration {
     let remap = RemapTable::new();
 
     let start = Instant::now();
-    pump_server(&mut server_writer, &mut capturer, &mut control, &remap)
-        .await
-        .expect("pump_server should not fail on a live loopback socket");
+    pump_server(
+        &mut server_writer,
+        &mut capturer,
+        &mut control,
+        &remap,
+        None,
+    )
+    .await
+    .expect("pump_server should not fail on a live loopback socket");
 
     let mut total_dx = 0i32;
     let mut frames = 0u32;

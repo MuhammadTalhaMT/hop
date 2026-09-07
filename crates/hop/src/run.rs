@@ -477,12 +477,14 @@ async fn drain_and_forward<W, C>(
     remap: &hop_core::RemapTable,
     remote_flag: &Arc<AtomicBool>,
     triggered: &Arc<AtomicBool>,
+    entry_fraction: Option<f32>,
 ) -> Result<(), ()>
 where
     W: tokio::io::AsyncWrite + Unpin,
     C: Capturer,
 {
-    if let Err(error) = hop_core::pump_server(writer, watched, control, remap).await {
+    if let Err(error) = hop_core::pump_server(writer, watched, control, remap, entry_fraction).await
+    {
         tracing::warn!(%error, "failed to forward input; disconnecting");
         return Err(());
     }
@@ -670,7 +672,19 @@ async fn handle_client(
                 }
             }
             _ = notify.notified() => {
-                if drain_and_forward(&mut writer, &mut watched, &mut control, &remap, &remote_flag, &triggered).await.is_err() {
+                let entry = Some(watched.inner.last_crossing_fraction());
+                if drain_and_forward(
+                    &mut writer,
+                    &mut watched,
+                    &mut control,
+                    &remap,
+                    &remote_flag,
+                    &triggered,
+                    entry,
+                )
+                .await
+                .is_err()
+                {
                     break 'connection;
                 }
             }
@@ -688,7 +702,19 @@ async fn handle_client(
                     break 'connection;
                 }
 
-                if drain_and_forward(&mut writer, &mut watched, &mut control, &remap, &remote_flag, &triggered).await.is_err() {
+                let entry = Some(watched.inner.last_crossing_fraction());
+                if drain_and_forward(
+                    &mut writer,
+                    &mut watched,
+                    &mut control,
+                    &remap,
+                    &remote_flag,
+                    &triggered,
+                    entry,
+                )
+                .await
+                .is_err()
+                {
                     break 'connection;
                 }
 

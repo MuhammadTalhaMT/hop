@@ -131,6 +131,7 @@ fn message_kind(message: &Message) -> &'static str {
         Message::FileChunk(_) => "FileChunk",
         Message::FileEnd => "FileEnd",
         Message::FileAbort => "FileAbort",
+        Message::Enter { .. } => "Enter",
         Message::Unknown => "Unknown",
     }
 }

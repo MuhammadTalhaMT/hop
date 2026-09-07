@@ -14,9 +14,10 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{GetLastError, POINT};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
-    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
-    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
-    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT,
+    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
+    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
+    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
+    MOUSEEVENTF_WHEEL, MOUSEINPUT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
@@ -93,6 +94,57 @@ fn mouse_input(dx: i32, dy: i32, mouse_data: i32, flags: u32) -> INPUT {
 /// protocol's own relative deltas.
 fn mouse_move_input(dx: i32, dy: i32) -> INPUT {
     mouse_input(dx, dy, 0, MOUSEEVENTF_MOVE)
+}
+
+/// Where the cursor should appear when focus arrives, given how far along
+/// the peer's edge it left.
+///
+/// The entry edge is the OPPOSITE of this machine's return edge: if the
+/// cursor leaves here through the bottom, it must arrive at the top.
+/// `fraction` runs 0.0 to 1.0 along that edge, so the same relative point
+/// is used on machines of different resolutions.
+fn entry_point(
+    return_edge: Option<ReturnEdge>,
+    fraction: f32,
+    screen: (i32, i32, i32, i32),
+) -> (i32, i32) {
+    let (left, top, width, height) = screen;
+    let f = fraction.clamp(0.0, 1.0) as f64;
+    let along_x = left + ((width - 1).max(0) as f64 * f).round() as i32;
+    let along_y = top + ((height - 1).max(0) as f64 * f).round() as i32;
+    match return_edge {
+        // Leaves through the bottom, so arrives at the top.
+        Some(ReturnEdge::Bottom) | None => (along_x, top),
+        Some(ReturnEdge::Top) => (along_x, top + (height - 1).max(0)),
+        Some(ReturnEdge::Right) => (left, along_y),
+        Some(ReturnEdge::Left) => (left + (width - 1).max(0), along_y),
+    }
+}
+
+/// Builds the `INPUT` for moving the cursor to an absolute position.
+///
+/// Absolute movement is what makes pointer speed match the Mac. A
+/// relative `MOUSEEVENTF_MOVE` is put through Windows pointer
+/// acceleration, on top of the acceleration macOS already applied before
+/// sending the delta, so the same hand movement travelled further here.
+/// Absolute coordinates bypass that curve entirely, so the cursor lands
+/// exactly where the Mac's motion says it should.
+///
+/// Coordinates are normalised to 0..=65535 across the whole virtual
+/// desktop, which is what `MOUSEEVENTF_VIRTUALDESK` selects.
+fn mouse_move_absolute_input(x: i32, y: i32, screen: (i32, i32, i32, i32)) -> INPUT {
+    let (left, top, width, height) = screen;
+    // Guard against a zero sized desktop rather than dividing by it.
+    let width = width.max(1) as f64;
+    let height = height.max(1) as f64;
+    let nx = ((x - left) as f64 * 65535.0 / width).round() as i32;
+    let ny = ((y - top) as f64 * 65535.0 / height).round() as i32;
+    mouse_input(
+        nx.clamp(0, 65535),
+        ny.clamp(0, 65535),
+        0,
+        MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+    )
 }
 
 /// Builds the `INPUT` for a mouse button press or release.
@@ -314,7 +366,27 @@ impl Injector for WindowsInjector {
                     // carries it into a later event rather than losing it.
                     return Ok(());
                 }
-                send_inputs(&[mouse_move_input(dx, dy)])
+                // Track the position ourselves and move absolutely, so
+                // Windows pointer acceleration never applies a second
+                // curve on top of the one macOS already applied. That is
+                // what makes pointer speed match between the machines.
+                let screen = WindowsCursorSource.virtual_screen();
+                let Some((cx, cy)) = WindowsCursorSource.cursor_position() else {
+                    return send_inputs(&[mouse_move_input(dx, dy)]);
+                };
+                let (left, top, width, height) = screen;
+                let x = (cx + dx).clamp(left, left + width - 1);
+                let y = (cy + dy).clamp(top, top + height - 1);
+                send_inputs(&[mouse_move_absolute_input(x, y, screen)])
+            }
+            InputEvent::Enter { fraction } => {
+                // Place the cursor at the same relative point on this
+                // machine's entry edge that it left the peer's edge from,
+                // so the movement reads as one continuous motion instead
+                // of the pointer jumping to wherever it was left.
+                let screen = WindowsCursorSource.virtual_screen();
+                let (x, y) = entry_point(self.return_edge, fraction, screen);
+                send_inputs(&[mouse_move_absolute_input(x, y, screen)])
             }
             InputEvent::Button { button, pressed } => send_inputs(&[button_input(button, pressed)]),
             InputEvent::Scroll { dx, dy } => send_inputs(&scroll_inputs(dx, dy)),
@@ -354,6 +426,43 @@ impl Injector for WindowsInjector {
 
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
+    #[test]
+    fn absolute_coordinates_span_the_whole_virtual_desktop() {
+        // 0 and 65535 are the ends of the normalised range, whatever the
+        // real pixel size. Getting this wrong compresses all movement
+        // into a corner of the screen.
+        let screen = (0, 0, 1920, 1080);
+        let top_left = mouse_move_absolute_input(0, 0, screen);
+        let bottom_right = mouse_move_absolute_input(1919, 1079, screen);
+        unsafe {
+            assert_eq!(top_left.Anonymous.mi.dx, 0);
+            assert_eq!(top_left.Anonymous.mi.dy, 0);
+            assert!(bottom_right.Anonymous.mi.dx > 65000);
+            assert!(bottom_right.Anonymous.mi.dy > 65000);
+        }
+    }
+
+    #[test]
+    fn absolute_coordinates_handle_a_negative_origin() {
+        // A monitor left of or above the primary pushes the virtual
+        // desktop origin negative; the normalisation must be relative to
+        // that origin, not to zero.
+        let screen = (-1920, -1080, 3840, 2160);
+        let at_origin = mouse_move_absolute_input(-1920, -1080, screen);
+        unsafe {
+            assert_eq!(at_origin.Anonymous.mi.dx, 0);
+            assert_eq!(at_origin.Anonymous.mi.dy, 0);
+        }
+    }
+
+    #[test]
+    fn a_zero_sized_desktop_does_not_divide_by_zero() {
+        let input = mouse_move_absolute_input(0, 0, (0, 0, 0, 0));
+        unsafe {
+            assert_eq!(input.Anonymous.mi.dx, 0);
+        }
+    }
+
     #[test]
     fn scaling_reduces_a_delta() {
         let mut rem = (0.0, 0.0);

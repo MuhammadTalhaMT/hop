@@ -2,7 +2,7 @@ use hop_proto::{Button, Usage};
 
 /// A single input event, in this tool's own vocabulary rather than any
 /// platform's.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum InputEvent {
     Mouse {
         dx: i32,
@@ -22,6 +22,11 @@ pub enum InputEvent {
     },
     /// The cursor reached the edge that hands control to the peer.
     EdgeCrossed,
+    /// Focus has arrived from the peer, entering `fraction` of the way
+    /// along this machine's entry edge.
+    Enter {
+        fraction: f32,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]

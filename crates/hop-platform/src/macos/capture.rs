@@ -30,7 +30,7 @@
 //! early exit can never leave the pointer invisible.
 
 use std::collections::{HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
@@ -150,6 +150,25 @@ fn should_begin_crossing(peer_connected: bool, edge_crossed: bool) -> bool {
 /// check also has to live here rather than only there.
 fn hotkey_matched(combo: &HashSet<Usage>, held: &HashSet<Usage>) -> bool {
     !combo.is_empty() && combo.is_subset(held)
+}
+
+/// How far along `edge` a crossing at `(x, y)` happened, from 0.0 at the
+/// left or top end to 1.0 at the right or bottom.
+///
+/// A fraction rather than a pixel offset because the two machines have
+/// different resolutions and the point is to enter the peer at the same
+/// RELATIVE place the cursor left from, so the movement reads as
+/// continuous.
+fn crossing_fraction(edge: Edge, x: f64, y: f64, bounds: cursor::Bounds) -> f32 {
+    let width = (bounds.max_x - bounds.min_x).max(1.0);
+    let height = (bounds.max_y - bounds.min_y).max(1.0);
+    let fraction = match edge {
+        // Crossing the top or bottom edge varies along x.
+        Edge::Top | Edge::Bottom => (x - bounds.min_x) / width,
+        // Crossing the left or right edge varies along y.
+        Edge::Left | Edge::Right => (y - bounds.min_y) / height,
+    };
+    fraction.clamp(0.0, 1.0) as f32
 }
 
 /// Nudges a point that just crossed `edge` back inside `bounds` by
@@ -367,6 +386,11 @@ pub struct MacCapturer {
     events: Arc<EventQueue>,
     remote: Arc<AtomicBool>,
     park: Arc<CursorPark>,
+    /// Where along the edge the last crossing happened, as an f32
+    /// fraction stored in its bit pattern (an `AtomicU32` because the
+    /// callback cannot take a lock cheaply and there is no atomic float).
+    /// 0.0 is the left or top end of the edge, 1.0 the right or bottom.
+    crossing_fraction: Arc<AtomicU32>,
     peer_connected: Arc<AtomicBool>,
 }
 
@@ -390,6 +414,8 @@ impl MacCapturer {
         cursor::allow_background_cursor_hiding();
         let park = Arc::new(CursorPark::new());
         let park_for_thread = Arc::clone(&park);
+        let crossing_fraction = Arc::new(AtomicU32::new(0));
+        let crossing_fraction_for_thread = Arc::clone(&crossing_fraction);
         let peer_connected = Arc::new(AtomicBool::new(false));
         let peer_connected_for_thread = Arc::clone(&peer_connected);
 
@@ -400,6 +426,7 @@ impl MacCapturer {
                     events_for_thread,
                     remote_for_thread,
                     park_for_thread,
+                    crossing_fraction_for_thread,
                     peer_connected_for_thread,
                     edge,
                     panic_combo,
@@ -413,6 +440,7 @@ impl MacCapturer {
                 events,
                 remote,
                 park,
+                crossing_fraction,
                 peer_connected,
             }),
             Ok(Err(err)) => Err(err),
@@ -437,6 +465,13 @@ impl MacCapturer {
     /// this machine's own keyboard and mouse with nothing to hand them to
     /// and no way to get them back short of SSH or a forced power-off.
     /// This is CRITICAL 1 from the whole-branch review.
+    /// Where along the edge the last crossing happened, 0.0 to 1.0. The
+    /// server sends this to the peer so its cursor enters at the same
+    /// relative point rather than resuming wherever it was left.
+    pub fn last_crossing_fraction(&self) -> f32 {
+        f32::from_bits(self.crossing_fraction.load(Ordering::Relaxed))
+    }
+
     pub fn peer_connected_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.peer_connected)
     }
@@ -509,6 +544,11 @@ struct CaptureContext {
     /// of the main display's bounds alone.
     bounds: cursor::Bounds,
     park: Arc<CursorPark>,
+    /// Where along the edge the last crossing happened, as an f32
+    /// fraction stored in its bit pattern (an `AtomicU32` because the
+    /// callback cannot take a lock cheaply and there is no atomic float).
+    /// 0.0 is the left or top end of the edge, 1.0 the right or bottom.
+    crossing_fraction: Arc<AtomicU32>,
     /// Set only while a peer is actually connected; see
     /// `MacCapturer::peer_connected_flag` and `should_begin_crossing`.
     peer_connected: Arc<AtomicBool>,
@@ -534,10 +574,12 @@ struct CaptureContext {
 /// run loop on this thread, starts the watchdog, and then blocks forever
 /// pumping that run loop. Reports success or failure back through
 /// `ready_tx` once the tap is enabled (or definitely is not going to be).
+#[allow(clippy::too_many_arguments)]
 fn run_capture_thread(
     events: Arc<EventQueue>,
     remote: Arc<AtomicBool>,
     park: Arc<CursorPark>,
+    crossing_fraction: Arc<AtomicU32>,
     peer_connected: Arc<AtomicBool>,
     edge: Edge,
     panic_combo: HashSet<Usage>,
@@ -567,6 +609,7 @@ fn run_capture_thread(
     let bounds = cursor::display_bounds();
 
     let ctx = CaptureContext {
+        crossing_fraction,
         events,
         remote,
         held_modifiers: Mutex::new(HashSet::new()),
@@ -594,7 +637,17 @@ fn run_capture_thread(
         CGEventType::RightMouseDragged,
         CGEventType::OtherMouseDown,
         CGEventType::OtherMouseUp,
+        // Middle button drags. Without this, holding the middle button
+        // and moving while focus is on the peer leaks straight through to
+        // this machine, because the tap only ever sees event types in
+        // this mask.
+        CGEventType::OtherMouseDragged,
         CGEventType::ScrollWheel,
+        // Not translated into input, but included so they are SUPPRESSED
+        // while focus is remote. Anything left out of this mask reaches
+        // the Mac regardless of focus.
+        CGEventType::TabletPointer,
+        CGEventType::TabletProximity,
         // `TapDisabledByTimeout` and `TapDisabledByUserInput` are
         // deliberately NOT listed here, and must never be added back.
         // `CGEventTap::new` folds this list into a mask with
@@ -721,7 +774,8 @@ fn handle_event(event_type: CGEventType, event: &CGEvent, ctx: &CaptureContext) 
         let (dx, dy) = match event_type {
             CGEventType::MouseMoved
             | CGEventType::LeftMouseDragged
-            | CGEventType::RightMouseDragged => (
+            | CGEventType::RightMouseDragged
+            | CGEventType::OtherMouseDragged => (
                 event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_X) as i32,
                 event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y) as i32,
             ),
@@ -871,7 +925,14 @@ fn handle_event(event_type: CGEventType, event: &CGEvent, ctx: &CaptureContext) 
                 // actually connected (`should_begin_crossing` requires
                 // `peer_connected`), so it can never be the source of
                 // unbounded growth IMPORTANT 4 was about.
+                // Where along the edge the crossing happened, as a
+                // fraction of that edge's length. The peer enters at the
+                // same relative point so the motion looks continuous
+                // rather than resuming wherever its pointer was left.
+                let fraction = crossing_fraction(ctx.edge, location.x, location.y, ctx.bounds);
                 ctx.events.push(InputEvent::EdgeCrossed);
+                ctx.crossing_fraction
+                    .store(fraction.to_bits(), Ordering::Relaxed);
             }
         }
     }

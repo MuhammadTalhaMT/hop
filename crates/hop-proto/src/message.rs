@@ -12,7 +12,7 @@ pub enum Button {
     Middle,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Message {
     Handshake {
         version: u16,
@@ -42,6 +42,18 @@ pub enum Message {
     Heartbeat,
     /// The client is handing control back to the server.
     Release,
+    /// Focus has just crossed onto the peer, entering at `fraction` along
+    /// the entry edge, where 0.0 is the left or top end and 1.0 the right
+    /// or bottom end.
+    ///
+    /// A fraction rather than a pixel coordinate because the two machines
+    /// have different resolutions: what matters is that the cursor appears
+    /// at the same relative point it left from, so the motion looks
+    /// continuous rather than jumping to wherever the pointer happened to
+    /// be left last time.
+    Enter {
+        fraction: f32,
+    },
     /// The sender's clipboard now holds this text. Sent when either side
     /// notices its own clipboard changed, so a copy on one machine can be
     /// pasted on the other.
@@ -94,6 +106,7 @@ const TAG_FILE_OFFER: u16 = 10;
 const TAG_FILE_CHUNK: u16 = 11;
 const TAG_FILE_END: u16 = 12;
 const TAG_FILE_ABORT: u16 = 13;
+const TAG_ENTER: u16 = 14;
 
 #[derive(Serialize, Deserialize)]
 struct Frame {
@@ -144,6 +157,7 @@ pub fn encode(message: &Message) -> Result<Vec<u8>, CodecError> {
         Message::FileChunk(bytes) => encode_raw(TAG_FILE_CHUNK, bytes),
         Message::FileEnd => encode_raw(TAG_FILE_END, &()),
         Message::FileAbort => encode_raw(TAG_FILE_ABORT, &()),
+        Message::Enter { fraction } => encode_raw(TAG_ENTER, fraction),
         Message::Unknown => Err(CodecError::UnknownNotEncodable),
     }
 }
@@ -193,6 +207,10 @@ pub fn decode(bytes: &[u8]) -> Result<Message, CodecError> {
         }
         TAG_FILE_END => Message::FileEnd,
         TAG_FILE_ABORT => Message::FileAbort,
+        TAG_ENTER => {
+            let fraction: f32 = postcard::from_bytes(&frame.body)?;
+            Message::Enter { fraction }
+        }
         _ => Message::Unknown,
     };
     Ok(message)
