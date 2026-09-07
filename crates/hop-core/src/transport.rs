@@ -525,11 +525,13 @@ mod tests {
         });
 
         bw.send(&Message::Heartbeat).await.expect("send");
-        bw.send(&Message::Release).await.expect("send");
+        bw.send(&Message::Release { along: 0.0 })
+            .await
+            .expect("send");
 
         let (first, second) = reader.await.expect("join");
         assert_eq!(first, Message::Heartbeat);
-        assert_eq!(second, Message::Release);
+        assert_eq!(second, Message::Release { along: 0.0 });
 
         // And the other direction on the same pair still works.
         aw.send(&Message::Heartbeat).await.expect("send");
@@ -576,7 +578,7 @@ mod tests {
             },
             Message::ReleaseAllKeys,
             Message::Heartbeat,
-            Message::Release,
+            Message::Release { along: 0.0 },
         ];
         for message in cases {
             let frame =

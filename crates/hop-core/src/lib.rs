@@ -20,6 +20,9 @@ pub use liveness::Liveness;
 pub mod backoff;
 pub use backoff::Backoff;
 
+pub mod screen;
+pub use screen::{Rect, Screen, Segment, Side};
+
 pub mod device;
 pub use device::{
     Capturer, DeviceError, FailingInjector, FakeCapturer, FakeInjector, Injector, InputEvent,

@@ -22,6 +22,7 @@ use core_graphics::display::CGDisplay;
 use core_graphics::event::CGEvent;
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::{CGPoint, CGRect};
+use hop_core::{Rect, Screen};
 
 /// Reads the current cursor position in global display coordinates
 /// (origin at the top-left, y increasing downward).
@@ -121,6 +122,41 @@ pub fn display_bounds() -> Bounds {
             max_y: bounds.origin.y + bounds.size.height,
         }
     })
+}
+
+/// Every active display as its own rectangle, with the main display
+/// marked primary, in the global display coordinates
+/// `CGEvent::location()` reports.
+///
+/// Per display rather than as one union rectangle (which is what
+/// `display_bounds` above returns, and all edge decisions used to use):
+/// the union's edges are not real edges. With two displays of different
+/// heights the union's bottom row lies below the shorter display
+/// entirely, so a cursor pressed against that display's bottom is not at
+/// the union's bottom and no crossing ever registers there.
+///
+/// Read once, when the capture thread starts, for the reason
+/// `display_bounds` documents. Falls back to a single monitor covering
+/// `display_bounds`, which is exactly the old model, so a failed
+/// enumeration degrades to the previous behaviour rather than to no edge
+/// at all.
+pub fn display_screen() -> Screen {
+    let ids = CGDisplay::active_displays().unwrap_or_default();
+    let main = CGDisplay::main().id;
+    let primary = ids.iter().position(|id| *id == main).unwrap_or(0);
+    let monitors: Vec<Rect> = ids
+        .iter()
+        .map(|id| {
+            let b = CGDisplay::new(*id).bounds();
+            Rect::from_origin_size(b.origin.x, b.origin.y, b.size.width, b.size.height)
+        })
+        .collect();
+
+    if monitors.is_empty() {
+        let b = display_bounds();
+        return Screen::single(Rect::new(b.min_x, b.min_y, b.max_x, b.max_y));
+    }
+    Screen::new(monitors, primary)
 }
 
 /// Moves the cursor to `(x, y)` without generating a motion event, so the

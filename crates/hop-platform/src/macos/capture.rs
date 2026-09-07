@@ -30,7 +30,7 @@
 //! early exit can never leave the pointer invisible.
 
 use std::collections::{HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
@@ -45,6 +45,7 @@ use core_graphics::event::{
     CGEvent, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
     CallbackResult, EventField,
 };
+use hop_core::{Screen, Side};
 use hop_proto::{Button, Usage};
 
 use crate::macos::cursor;
@@ -95,6 +96,17 @@ pub enum Edge {
     Right,
 }
 
+impl From<Edge> for Side {
+    fn from(edge: Edge) -> Self {
+        match edge {
+            Edge::Top => Side::Top,
+            Edge::Bottom => Side::Bottom,
+            Edge::Left => Side::Left,
+            Edge::Right => Side::Right,
+        }
+    }
+}
+
 /// How far inside the screen, in points, a parked or restored cursor is
 /// placed away from the edge it crossed. Without this, restoring the
 /// cursor to the exact point it crossed at (which is by definition on the
@@ -102,31 +114,6 @@ pub enum Edge {
 /// crossing on the very next reported motion, bouncing focus straight
 /// back to the peer the instant it returned to local.
 const EDGE_MARGIN: f64 = 12.0;
-
-/// Whether cursor position `(x, y)`, in global display coordinates, has
-/// reached `edge` of `bounds`, the union of every active display (see
-/// `cursor::display_bounds`). Pure and side effect free, so it is the
-/// part of edge detection that can actually be unit tested without
-/// hardware; see the `tests` module below.
-///
-/// This is IMPORTANT 1's fix from the whole-branch review: comparing
-/// against `bounds`, rather than assuming the screen starts at `(0, 0)`,
-/// is what makes this correct on a multi-display Mac. A display
-/// positioned above or to the left of the main one gives `bounds` a
-/// negative `min_y` or `min_x`; comparing against that instead of a
-/// hardcoded `0.0` is the whole fix. Global display coordinates on macOS
-/// put the origin at the main display's top-left with y increasing
-/// downward, so the top edge is `y <= bounds.min_y` and the bottom edge
-/// is `y >= bounds.max_y - 1.0`; left and right are the same idea on the
-/// x axis.
-fn crossed(edge: Edge, x: f64, y: f64, bounds: cursor::Bounds) -> bool {
-    match edge {
-        Edge::Top => y <= bounds.min_y,
-        Edge::Bottom => y >= bounds.max_y - 1.0,
-        Edge::Left => x <= bounds.min_x,
-        Edge::Right => x >= bounds.max_x - 1.0,
-    }
-}
 
 /// Whether a motion event that has crossed `edge`, while focus is local,
 /// should actually start a crossing into the peer. Pure: the whole
@@ -150,40 +137,6 @@ fn should_begin_crossing(peer_connected: bool, edge_crossed: bool) -> bool {
 /// check also has to live here rather than only there.
 fn hotkey_matched(combo: &HashSet<Usage>, held: &HashSet<Usage>) -> bool {
     !combo.is_empty() && combo.is_subset(held)
-}
-
-/// How far along `edge` a crossing at `(x, y)` happened, from 0.0 at the
-/// left or top end to 1.0 at the right or bottom.
-///
-/// A fraction rather than a pixel offset because the two machines have
-/// different resolutions and the point is to enter the peer at the same
-/// RELATIVE place the cursor left from, so the movement reads as
-/// continuous.
-fn crossing_fraction(edge: Edge, x: f64, y: f64, bounds: cursor::Bounds) -> f32 {
-    let width = (bounds.max_x - bounds.min_x).max(1.0);
-    let height = (bounds.max_y - bounds.min_y).max(1.0);
-    let fraction = match edge {
-        // Crossing the top or bottom edge varies along x.
-        Edge::Top | Edge::Bottom => (x - bounds.min_x) / width,
-        // Crossing the left or right edge varies along y.
-        Edge::Left | Edge::Right => (y - bounds.min_y) / height,
-    };
-    fraction.clamp(0.0, 1.0) as f32
-}
-
-/// Nudges a point that just crossed `edge` back inside `bounds` by
-/// `EDGE_MARGIN`, clamping so a display smaller than the margin still
-/// yields an in-bounds point rather than one that overshoots past the
-/// opposite edge. Bounds-relative for the same reason `crossed` is: on a
-/// multi-display Mac the screen this point is nudged back into does not
-/// start at `(0, 0)`.
-fn nudge_inward(edge: Edge, x: f64, y: f64, bounds: cursor::Bounds) -> (f64, f64) {
-    match edge {
-        Edge::Top => (x, (bounds.min_y + EDGE_MARGIN).min(bounds.max_y)),
-        Edge::Bottom => (x, (bounds.max_y - 1.0 - EDGE_MARGIN).max(bounds.min_y)),
-        Edge::Left => ((bounds.min_x + EDGE_MARGIN).min(bounds.max_x), y),
-        Edge::Right => ((bounds.max_x - 1.0 - EDGE_MARGIN).max(bounds.min_x), y),
-    }
 }
 
 /// How many continuous-scroll points (the unit trackpads and Magic Mice
@@ -272,8 +225,17 @@ impl CursorPark {
     /// both the callback and `Drop` call it unconditionally rather than
     /// tracking their own "did we already restore this" flag.
     fn restore(&self) {
+        self.restore_at(None)
+    }
+
+    /// `restore`, but placing the cursor at `at` instead of where it left,
+    /// for the case where the peer told us where the hand came back
+    /// through. Still a no-op when nothing is parked, so a stray
+    /// `Release` cannot warp a cursor that is already local.
+    fn restore_at(&self, at: Option<(f64, f64)>) {
         let mut origin = lock_recovering(&self.origin, "cursor_park_origin");
-        if let Some((x, y)) = origin.take() {
+        if let Some(parked) = origin.take() {
+            let (x, y) = at.unwrap_or(parked);
             // Put the cursor back at the edge it left through BEFORE
             // re-associating. Warping afterwards loses the race with
             // macOS's own re-sync, which drops the cursor wherever it
@@ -386,12 +348,12 @@ pub struct MacCapturer {
     events: Arc<EventQueue>,
     remote: Arc<AtomicBool>,
     park: Arc<CursorPark>,
-    /// Where along the edge the last crossing happened, as an f32
-    /// fraction stored in its bit pattern (an `AtomicU32` because the
-    /// callback cannot take a lock cheaply and there is no atomic float).
-    /// 0.0 is the left or top end of the edge, 1.0 the right or bottom.
-    crossing_fraction: Arc<AtomicU32>,
     peer_connected: Arc<AtomicBool>,
+    /// This machine's displays and the edge that hands focus over, kept
+    /// so a `Release` carrying a position can be turned into the point to
+    /// put the cursor back at.
+    screen: Arc<Screen>,
+    edge: Edge,
 }
 
 impl MacCapturer {
@@ -414,8 +376,8 @@ impl MacCapturer {
         cursor::allow_background_cursor_hiding();
         let park = Arc::new(CursorPark::new());
         let park_for_thread = Arc::clone(&park);
-        let crossing_fraction = Arc::new(AtomicU32::new(0));
-        let crossing_fraction_for_thread = Arc::clone(&crossing_fraction);
+        let screen = Arc::new(cursor::display_screen());
+        let screen_for_thread = Arc::clone(&screen);
         let peer_connected = Arc::new(AtomicBool::new(false));
         let peer_connected_for_thread = Arc::clone(&peer_connected);
 
@@ -426,7 +388,7 @@ impl MacCapturer {
                     events_for_thread,
                     remote_for_thread,
                     park_for_thread,
-                    crossing_fraction_for_thread,
+                    screen_for_thread,
                     peer_connected_for_thread,
                     edge,
                     panic_combo,
@@ -440,8 +402,9 @@ impl MacCapturer {
                 events,
                 remote,
                 park,
-                crossing_fraction,
                 peer_connected,
+                screen,
+                edge,
             }),
             Ok(Err(err)) => Err(err),
             Err(_) => Err(CaptureError::ThreadExitedEarly),
@@ -465,11 +428,22 @@ impl MacCapturer {
     /// this machine's own keyboard and mouse with nothing to hand them to
     /// and no way to get them back short of SSH or a forced power-off.
     /// This is CRITICAL 1 from the whole-branch review.
-    /// Where along the edge the last crossing happened, 0.0 to 1.0. The
-    /// server sends this to the peer so its cursor enters at the same
-    /// relative point rather than resuming wherever it was left.
-    pub fn last_crossing_fraction(&self) -> f32 {
-        f32::from_bits(self.crossing_fraction.load(Ordering::Relaxed))
+    /// Gives the cursor back, placing it where the peer says the hand
+    /// left its own edge.
+    ///
+    /// `along` is the peer's position relative to the PEER's anchor, so
+    /// adding this machine's anchor puts it on the corresponding point of
+    /// this machine's edge; `Screen::landing` clamps it to a real display
+    /// and nudges it inward so it does not immediately cross back. `None`
+    /// (a disconnect, a wake, the panic hotkey) falls back to the point
+    /// the cursor left from, which is all that is known in those cases.
+    pub fn return_focus(&self, along: Option<f32>) {
+        let side = Side::from(self.edge);
+        let point = along.and_then(|along| {
+            let target = f64::from(along) + self.screen.anchor(side, None);
+            self.screen.landing(side, target, EDGE_MARGIN)
+        });
+        self.park.restore_at(point);
     }
 
     pub fn peer_connected_flag(&self) -> Arc<AtomicBool> {
@@ -538,17 +512,12 @@ struct CaptureContext {
     tap_port: Arc<Mutex<Option<usize>>>,
     /// The screen edge that hands focus to the peer.
     edge: Edge,
-    /// The union of every active display's bounds; see
-    /// `cursor::display_bounds`. IMPORTANT 1's fix from the whole-branch
-    /// review: `crossed` and `nudge_inward` compare against this instead
-    /// of the main display's bounds alone.
-    bounds: cursor::Bounds,
+    /// Every active display as its own rectangle; see
+    /// `cursor::display_screen`. Per display rather than as one union
+    /// rectangle, so the top of a shorter side display is a real edge and
+    /// the seam between two displays is not.
+    screen: Arc<Screen>,
     park: Arc<CursorPark>,
-    /// Where along the edge the last crossing happened, as an f32
-    /// fraction stored in its bit pattern (an `AtomicU32` because the
-    /// callback cannot take a lock cheaply and there is no atomic float).
-    /// 0.0 is the left or top end of the edge, 1.0 the right or bottom.
-    crossing_fraction: Arc<AtomicU32>,
     /// Set only while a peer is actually connected; see
     /// `MacCapturer::peer_connected_flag` and `should_begin_crossing`.
     peer_connected: Arc<AtomicBool>,
@@ -579,7 +548,7 @@ fn run_capture_thread(
     events: Arc<EventQueue>,
     remote: Arc<AtomicBool>,
     park: Arc<CursorPark>,
-    crossing_fraction: Arc<AtomicU32>,
+    screen: Arc<Screen>,
     peer_connected: Arc<AtomicBool>,
     edge: Edge,
     panic_combo: HashSet<Usage>,
@@ -600,23 +569,14 @@ fn run_capture_thread(
     let tap_port: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
     let tap_port_for_callback = Arc::clone(&tap_port);
 
-    // Read once, up front, rather than on every event: display bounds do
-    // not change often enough to justify recomputing them (a
-    // `CGDisplay::active_displays()` call plus one `bounds()` per
-    // display) on every mouse move, and a display being hot-plugged,
-    // unplugged, or rearranged mid session is an accepted limitation here
-    // (see Task 13 and `cursor::display_bounds`'s doc comment).
-    let bounds = cursor::display_bounds();
-
     let ctx = CaptureContext {
-        crossing_fraction,
+        screen,
         events,
         remote,
         held_modifiers: Mutex::new(HashSet::new()),
         last_seen: last_seen_for_callback,
         tap_port: tap_port_for_callback,
         edge,
-        bounds,
         park,
         peer_connected,
         panic_combo,
@@ -909,9 +869,22 @@ fn handle_event(event_type: CGEventType, event: &CGEvent, ctx: &CaptureContext) 
 
         if is_motion_event {
             let location = event.location();
-            let edge_crossed = crossed(ctx.edge, location.x, location.y, ctx.bounds);
-            if should_begin_crossing(ctx.peer_connected.load(Ordering::Relaxed), edge_crossed) {
-                let landing = nudge_inward(ctx.edge, location.x, location.y, ctx.bounds);
+            let side = Side::from(ctx.edge);
+            // Per display, and only on the part of the edge that faces
+            // the peer: a cursor on a seam between two of this Mac's own
+            // displays is just moving between them, not leaving.
+            let crossing = ctx.screen.at_outer_edge(side, location.x, location.y);
+            if should_begin_crossing(
+                ctx.peer_connected.load(Ordering::Relaxed),
+                crossing.is_some(),
+            ) {
+                let Some(along) = crossing else {
+                    return CallbackResult::Keep;
+                };
+                let landing = ctx
+                    .screen
+                    .landing(side, along, EDGE_MARGIN)
+                    .unwrap_or((location.x, location.y));
                 ctx.park.park(landing);
                 // Set before the final suppression check below runs, so
                 // the very event that crossed the edge is itself already
@@ -925,14 +898,21 @@ fn handle_event(event_type: CGEventType, event: &CGEvent, ctx: &CaptureContext) 
                 // actually connected (`should_begin_crossing` requires
                 // `peer_connected`), so it can never be the source of
                 // unbounded growth IMPORTANT 4 was about.
-                // Where along the edge the crossing happened, as a
-                // fraction of that edge's length. The peer enters at the
-                // same relative point so the motion looks continuous
-                // rather than resuming wherever its pointer was left.
-                let fraction = crossing_fraction(ctx.edge, location.x, location.y, ctx.bounds);
-                ctx.events.push(InputEvent::EdgeCrossed);
-                ctx.crossing_fraction
-                    .store(fraction.to_bits(), Ordering::Relaxed);
+                // Where along the edge the crossing happened, in points
+                // relative to this machine's anchor. The peer adds its
+                // own anchor to get the matching point on its own edge, so
+                // the two desktops line up at one-to-one scale instead of
+                // one being stretched onto the other.
+                //
+                // Carried in the event rather than in a side channel the
+                // connection loop reads separately: that side channel was
+                // an atomic this callback wrote and the loop read on
+                // waking, which raced and could send the previous
+                // crossing's position.
+                let anchor = ctx.screen.anchor(side, None);
+                ctx.events.push(InputEvent::EdgeCrossed {
+                    along: (along - anchor) as f32,
+                });
             }
         }
     }
@@ -1173,6 +1153,7 @@ fn spawn_watchdog(last_seen: Arc<Mutex<Instant>>, tap_port: Arc<Mutex<Option<usi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hop_core::Rect;
 
     use hop_proto::Usage;
 
@@ -1393,244 +1374,134 @@ mod tests {
         assert!(held.is_empty());
     }
 
-    // `crossed` is the pure decision behind edge detection: given where
-    // the cursor is and the bounds of the virtual desktop (the union of
-    // every active display; see `cursor::display_bounds`), has it
-    // reached the configured edge. Everything else this task adds
-    // (reading the real cursor, warping it, hiding it) needs hardware
-    // and is out of reach for an automated test; this is the part that
-    // actually is one.
+    // Edge detection is now `Screen::at_outer_edge` and `Screen::landing`
+    // in hop-core, where the arithmetic is tested exhaustively and on
+    // every host. What these tests pin is the macOS side of it: that
+    // `Edge` maps onto `Side` the right way round, and that the display
+    // arrangements this file actually has to cope with behave the way
+    // the callback assumes.
     const SCREEN_W: f64 = 1920.0;
     const SCREEN_H: f64 = 1080.0;
-    const SINGLE_DISPLAY: cursor::Bounds = cursor::Bounds {
-        min_x: 0.0,
-        min_y: 0.0,
-        max_x: SCREEN_W,
-        max_y: SCREEN_H,
-    };
 
-    #[test]
-    fn top_edge_triggers_exactly_at_y_zero() {
-        assert!(crossed(Edge::Top, 960.0, 0.0, SINGLE_DISPLAY));
+    fn single_display() -> Screen {
+        Screen::new(vec![Rect::new(0.0, 0.0, SCREEN_W, SCREEN_H)], 0)
+    }
+
+    /// Main display 1920x1080 at the origin, with a wider, taller display
+    /// centred above it. The one that used to be a union rectangle.
+    fn display_above_main() -> Screen {
+        Screen::new(
+            vec![
+                Rect::new(0.0, 0.0, SCREEN_W, SCREEN_H),
+                Rect::new(-320.0, -1440.0, 2240.0, 0.0),
+            ],
+            0,
+        )
+    }
+
+    fn crossed(screen: &Screen, edge: Edge, x: f64, y: f64) -> bool {
+        screen.at_outer_edge(Side::from(edge), x, y).is_some()
     }
 
     #[test]
-    fn top_edge_does_not_trigger_just_inside() {
-        assert!(!crossed(Edge::Top, 960.0, 5.0, SINGLE_DISPLAY));
+    fn each_edge_triggers_at_and_only_at_its_own_boundary() {
+        let screen = single_display();
+        for (edge, x, y) in [
+            (Edge::Top, 960.0, 0.0),
+            (Edge::Bottom, 960.0, SCREEN_H - 1.0),
+            (Edge::Left, 0.0, 540.0),
+            (Edge::Right, SCREEN_W - 1.0, 540.0),
+        ] {
+            assert!(crossed(&screen, edge, x, y), "{edge:?} should trigger");
+            for other in [Edge::Top, Edge::Bottom, Edge::Left, Edge::Right] {
+                if other != edge {
+                    assert!(
+                        !crossed(&screen, other, x, y),
+                        "{other:?} must not trigger at {edge:?}'s boundary"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
-    fn bottom_edge_triggers_at_the_screen_height_boundary() {
-        assert!(crossed(Edge::Bottom, 960.0, SCREEN_H - 1.0, SINGLE_DISPLAY));
+    fn an_edge_does_not_trigger_just_inside_itself() {
+        let screen = single_display();
+        assert!(!crossed(&screen, Edge::Top, 960.0, 5.0));
+        assert!(!crossed(&screen, Edge::Bottom, 960.0, SCREEN_H - 6.0));
+        assert!(!crossed(&screen, Edge::Left, 5.0, 540.0));
+        assert!(!crossed(&screen, Edge::Right, SCREEN_W - 6.0, 540.0));
     }
-
-    #[test]
-    fn bottom_edge_does_not_trigger_just_inside() {
-        assert!(!crossed(
-            Edge::Bottom,
-            960.0,
-            SCREEN_H - 6.0,
-            SINGLE_DISPLAY
-        ));
-    }
-
-    #[test]
-    fn left_edge_triggers_exactly_at_x_zero() {
-        assert!(crossed(Edge::Left, 0.0, 540.0, SINGLE_DISPLAY));
-    }
-
-    #[test]
-    fn left_edge_does_not_trigger_just_inside() {
-        assert!(!crossed(Edge::Left, 5.0, 540.0, SINGLE_DISPLAY));
-    }
-
-    #[test]
-    fn right_edge_triggers_at_the_screen_width_boundary() {
-        assert!(crossed(Edge::Right, SCREEN_W - 1.0, 540.0, SINGLE_DISPLAY));
-    }
-
-    #[test]
-    fn right_edge_does_not_trigger_just_inside() {
-        assert!(!crossed(Edge::Right, SCREEN_W - 6.0, 540.0, SINGLE_DISPLAY));
-    }
-
-    #[test]
-    fn only_the_top_edge_triggers_at_the_top_boundary() {
-        // The deployment this project ships for: the PC's monitors sit
-        // above the Mac, so `top` is the edge that actually matters, and
-        // it must not be possible for a point on that boundary to also
-        // read as having crossed any other edge.
-        let (x, y) = (960.0, 0.0);
-        assert!(crossed(Edge::Top, x, y, SINGLE_DISPLAY));
-        assert!(!crossed(Edge::Bottom, x, y, SINGLE_DISPLAY));
-        assert!(!crossed(Edge::Left, x, y, SINGLE_DISPLAY));
-        assert!(!crossed(Edge::Right, x, y, SINGLE_DISPLAY));
-    }
-
-    #[test]
-    fn only_the_left_edge_triggers_at_the_left_boundary() {
-        let (x, y) = (0.0, 540.0);
-        assert!(crossed(Edge::Left, x, y, SINGLE_DISPLAY));
-        assert!(!crossed(Edge::Top, x, y, SINGLE_DISPLAY));
-        assert!(!crossed(Edge::Bottom, x, y, SINGLE_DISPLAY));
-        assert!(!crossed(Edge::Right, x, y, SINGLE_DISPLAY));
-    }
-
-    #[test]
-    fn only_the_right_edge_triggers_at_the_right_boundary() {
-        let (x, y) = (SCREEN_W - 1.0, 540.0);
-        assert!(crossed(Edge::Right, x, y, SINGLE_DISPLAY));
-        assert!(!crossed(Edge::Top, x, y, SINGLE_DISPLAY));
-        assert!(!crossed(Edge::Bottom, x, y, SINGLE_DISPLAY));
-        assert!(!crossed(Edge::Left, x, y, SINGLE_DISPLAY));
-    }
-
-    #[test]
-    fn only_the_bottom_edge_triggers_at_the_bottom_boundary() {
-        let (x, y) = (960.0, SCREEN_H - 1.0);
-        assert!(crossed(Edge::Bottom, x, y, SINGLE_DISPLAY));
-        assert!(!crossed(Edge::Top, x, y, SINGLE_DISPLAY));
-        assert!(!crossed(Edge::Left, x, y, SINGLE_DISPLAY));
-        assert!(!crossed(Edge::Right, x, y, SINGLE_DISPLAY));
-    }
-
-    // IMPORTANT 1 from the whole-branch review: on a multi-display Mac,
-    // `bounds` is the union of every active display (see
-    // `cursor::display_bounds`), not just the main display's own bounds,
-    // and a display positioned above or to the left of the main one
-    // pushes `min_y`/`min_x` negative. These tests pin the fix: a
-    // multi-display union whose main display still sits at `(0, 0)` in
-    // the middle of the virtual desktop.
-    const ABOVE_MAIN: cursor::Bounds = cursor::Bounds {
-        // Main display 1920x1080 at (0, 0); a second, wider and taller
-        // display centered above it at (-320, -1440).
-        min_x: -320.0,
-        min_y: -1440.0,
-        max_x: 2240.0,
-        max_y: 1080.0,
-    };
-    const BELOW_MAIN: cursor::Bounds = cursor::Bounds {
-        // Main display 1920x1080 at (0, 0); a second 1920x1080 display
-        // below and to the right, at (200, 1080).
-        min_x: 0.0,
-        min_y: 0.0,
-        max_x: 2120.0,
-        max_y: 2160.0,
-    };
 
     #[test]
     fn top_edge_does_not_trigger_at_the_main_displays_own_top_when_a_display_sits_above_it() {
-        // This is the exact failure IMPORTANT 1 describes: y = 0 is the
-        // main display's own top edge, but with a second display above
-        // it that point is mid-desktop, not the top of the virtual
-        // desktop, and must not read as a crossing.
-        assert!(!crossed(Edge::Top, 500.0, 0.0, ABOVE_MAIN));
+        // y = 0 is the main display's own top, but with a display above
+        // it that is a seam between two of this Mac's displays, not a
+        // boundary with the peer.
+        let screen = display_above_main();
+        assert!(!crossed(&screen, Edge::Top, 500.0, 0.0));
     }
 
     #[test]
     fn top_edge_triggers_at_the_true_top_of_a_display_above_main() {
-        assert!(crossed(Edge::Top, 500.0, ABOVE_MAIN.min_y, ABOVE_MAIN));
-        assert!(!crossed(
-            Edge::Top,
-            500.0,
-            ABOVE_MAIN.min_y + 5.0,
-            ABOVE_MAIN
-        ));
+        let screen = display_above_main();
+        assert!(crossed(&screen, Edge::Top, 500.0, -1440.0));
+        assert!(!crossed(&screen, Edge::Top, 500.0, -1435.0));
     }
 
     #[test]
-    fn bottom_edge_does_not_trigger_at_the_main_displays_own_bottom_when_a_display_sits_below_it() {
-        // Mirror of the top-edge case: 1079 is the main display's own
-        // bottom edge, but with a display below it that point is well
-        // inside the virtual desktop.
-        assert!(!crossed(Edge::Bottom, 500.0, SCREEN_H - 1.0, BELOW_MAIN));
+    fn the_uncovered_part_of_the_main_displays_top_is_still_an_edge() {
+        // The display above is offset left, so the right end of the main
+        // display's top edge faces the peer even though its middle does
+        // not. Under the old union model this was uncrossable.
+        let screen = Screen::new(
+            vec![
+                Rect::new(0.0, 0.0, SCREEN_W, SCREEN_H),
+                Rect::new(-960.0, -1080.0, 960.0, 0.0),
+            ],
+            0,
+        );
+        assert!(crossed(&screen, Edge::Top, 1400.0, 0.0));
+        assert!(!crossed(&screen, Edge::Top, 500.0, 0.0));
     }
 
     #[test]
-    fn bottom_edge_triggers_at_the_true_bottom_of_a_display_below_main() {
-        assert!(crossed(
-            Edge::Bottom,
-            500.0,
-            BELOW_MAIN.max_y - 1.0,
-            BELOW_MAIN
-        ));
-        assert!(!crossed(
-            Edge::Bottom,
-            500.0,
-            BELOW_MAIN.max_y - 6.0,
-            BELOW_MAIN
-        ));
+    fn edges_trigger_correctly_with_negative_origins() {
+        // A display left of and above the main one puts the desktop into
+        // negative coordinates on both axes at once.
+        let screen = Screen::new(vec![Rect::new(-500.0, -300.0, 1420.0, 780.0)], 0);
+        assert!(crossed(&screen, Edge::Top, 0.0, -300.0));
+        assert!(!crossed(&screen, Edge::Top, 0.0, -295.0));
+        assert!(crossed(&screen, Edge::Left, -500.0, 0.0));
+        assert!(!crossed(&screen, Edge::Left, -495.0, 0.0));
+        assert!(crossed(&screen, Edge::Bottom, 0.0, 779.0));
+        assert!(crossed(&screen, Edge::Right, 1419.0, 0.0));
+    }
+
+    // A landing must never itself be a crossing point, or focus bounces
+    // straight back to the peer on the next reported motion.
+    #[test]
+    fn a_landing_never_sits_on_the_edge_it_came_through() {
+        for screen in [single_display(), display_above_main()] {
+            for edge in [Edge::Top, Edge::Bottom, Edge::Left, Edge::Right] {
+                let side = Side::from(edge);
+                let along = screen.anchor(side, None);
+                let (x, y) = screen
+                    .landing(side, along, EDGE_MARGIN)
+                    .expect("has an edge");
+                assert!(!crossed(&screen, edge, x, y), "{edge:?} landing bounces");
+            }
+        }
     }
 
     #[test]
-    fn each_edge_triggers_at_and_only_at_its_own_boundary_with_negative_origins() {
-        // A virtual desktop that extends into negative territory on both
-        // axes at once, so this cannot pass by accident from an
-        // implementation that only special-cases one negative origin.
-        let bounds = cursor::Bounds {
-            min_x: -500.0,
-            min_y: -300.0,
-            max_x: 1420.0,
-            max_y: 780.0,
-        };
-
-        assert!(crossed(Edge::Top, 0.0, bounds.min_y, bounds));
-        assert!(!crossed(Edge::Top, 0.0, bounds.min_y + 5.0, bounds));
-
-        assert!(crossed(Edge::Bottom, 0.0, bounds.max_y - 1.0, bounds));
-        assert!(!crossed(Edge::Bottom, 0.0, bounds.max_y - 6.0, bounds));
-
-        assert!(crossed(Edge::Left, bounds.min_x, 0.0, bounds));
-        assert!(!crossed(Edge::Left, bounds.min_x + 5.0, 0.0, bounds));
-
-        assert!(crossed(Edge::Right, bounds.max_x - 1.0, 0.0, bounds));
-        assert!(!crossed(Edge::Right, bounds.max_x - 6.0, 0.0, bounds));
-    }
-
-    // `nudge_inward` is what keeps a restored cursor from sitting exactly
-    // on the boundary `crossed` treats as a crossing, which would bounce
-    // focus straight back to the peer on the next reported motion. Pure,
-    // so it gets the same direct coverage as `crossed`.
-    #[test]
-    fn nudge_inward_moves_away_from_each_edge_past_its_own_boundary() {
-        let (_, y) = nudge_inward(Edge::Top, 960.0, 0.0, SINGLE_DISPLAY);
-        assert!(!crossed(Edge::Top, 960.0, y, SINGLE_DISPLAY));
-
-        let (_, y) = nudge_inward(Edge::Bottom, 960.0, SCREEN_H - 1.0, SINGLE_DISPLAY);
-        assert!(!crossed(Edge::Bottom, 960.0, y, SINGLE_DISPLAY));
-
-        let (x, _) = nudge_inward(Edge::Left, 0.0, 540.0, SINGLE_DISPLAY);
-        assert!(!crossed(Edge::Left, x, 540.0, SINGLE_DISPLAY));
-
-        let (x, _) = nudge_inward(Edge::Right, SCREEN_W - 1.0, 540.0, SINGLE_DISPLAY);
-        assert!(!crossed(Edge::Right, x, 540.0, SINGLE_DISPLAY));
-    }
-
-    #[test]
-    fn nudge_inward_moves_away_from_the_true_edge_on_a_multi_display_union() {
-        // Same property as above, but against a bounds whose top edge is
-        // not at y = 0, so this would fail if `nudge_inward` were still
-        // implicitly assuming a zero origin.
-        let (_, y) = nudge_inward(Edge::Top, 500.0, ABOVE_MAIN.min_y, ABOVE_MAIN);
-        assert!(!crossed(Edge::Top, 500.0, y, ABOVE_MAIN));
-    }
-
-    #[test]
-    fn nudge_inward_clamps_on_a_screen_smaller_than_the_margin() {
-        // A screen thinner than `EDGE_MARGIN` must still yield an
-        // in-bounds point rather than overshooting past the opposite
-        // edge.
-        let tiny = cursor::Bounds {
-            min_x: 0.0,
-            min_y: 0.0,
-            max_x: 3.0,
-            max_y: 3.0,
-        };
-        let (x, _) = nudge_inward(Edge::Left, 0.0, 5.0, tiny);
-        assert!((tiny.min_x..=tiny.max_x).contains(&x));
-
-        let (_, y) = nudge_inward(Edge::Top, 5.0, 0.0, tiny);
-        assert!((tiny.min_y..=tiny.max_y).contains(&y));
+    fn a_landing_on_a_display_smaller_than_the_margin_is_still_on_it() {
+        let tiny = Screen::new(vec![Rect::new(0.0, 0.0, 3.0, 3.0)], 0);
+        for edge in [Edge::Top, Edge::Left] {
+            let side = Side::from(edge);
+            let (x, y) = tiny.landing(side, 0.0, EDGE_MARGIN).expect("has an edge");
+            assert!((0.0..3.0).contains(&x) && (0.0..3.0).contains(&y));
+        }
     }
 
     // `should_begin_crossing` is the pure decision behind CRITICAL 1: an

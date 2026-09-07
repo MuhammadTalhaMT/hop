@@ -17,6 +17,8 @@
 //! logic with no `windows-sys` calls, so it is built and tested on every
 //! host.
 
+use hop_core::{Screen, Side};
+
 /// The edge of the Windows virtual screen whose crossing hands focus back
 /// to the server. This is the mirror image of the server's own
 /// configured `[layout]` edge (see `hop_platform::macos::Edge` and
@@ -30,6 +32,17 @@ pub enum ReturnEdge {
     Bottom,
     Left,
     Right,
+}
+
+impl From<ReturnEdge> for Side {
+    fn from(edge: ReturnEdge) -> Self {
+        match edge {
+            ReturnEdge::Top => Side::Top,
+            ReturnEdge::Bottom => Side::Bottom,
+            ReturnEdge::Left => Side::Left,
+            ReturnEdge::Right => Side::Right,
+        }
+    }
 }
 
 impl ReturnEdge {
@@ -48,64 +61,54 @@ impl ReturnEdge {
     }
 }
 
-/// Where the real cursor is, and how big the Windows virtual screen is,
-/// both in the same coordinate space `GetCursorPos` and
-/// `GetSystemMetrics(SM_XVIRTUALSCREEN, ...)` report. A trait rather than
-/// a pair of free functions so the decision below can be unit tested
-/// against a fake without a live Windows desktop; `crate::windows::inject`
-/// holds the only real implementation.
+/// Where the real cursor is, and what monitors this PC has. A trait
+/// rather than a pair of free functions so the decision below can be unit
+/// tested against a fake without a live Windows desktop;
+/// `crate::windows::inject` holds the only real implementation.
 pub trait CursorSource {
     /// The cursor's current position, or `None` if the platform call
     /// failed. `None` must never be treated as "at the edge": a query
     /// failure is not evidence the user's hand is on the boundary.
     fn cursor_position(&self) -> Option<(i32, i32)>;
 
-    /// The virtual screen's bounds as `(left, top, width, height)`,
-    /// covering every monitor rather than just the primary one, so a
-    /// multi-monitor PC is handled correctly.
-    fn virtual_screen(&self) -> (i32, i32, i32, i32);
+    /// This PC's monitors, each as its own rectangle.
+    ///
+    /// Per monitor, not as one union rectangle. The union's bottom row
+    /// lies below the shorter of two monitors of different heights, so a
+    /// cursor pressed against that monitor's bottom never reached the
+    /// union's bottom, the release never fired, and focus was stranded on
+    /// the PC with only the panic hotkey to get it back.
+    fn screen(&self) -> Screen;
 }
 
-/// Whether cursor position `(x, y)` has reached `edge` of a virtual
-/// screen with origin `(left, top)` and size `(width, height)`. Pure and
-/// side effect free: the same shape as `hop_platform::macos::capture`'s
-/// `crossed`, just on the returning side of the handoff.
-fn reached_edge(
+/// Whether the cursor `source` reports has reached an outward-facing part
+/// of `edge`, and if so how far along it is, in pixels relative to this
+/// machine's anchor (see [`Screen::anchor`]).
+///
+/// `None` whenever the cursor position cannot be read at all, matching
+/// `cursor_position`'s doc comment above, and `None` on a seam between
+/// two of this PC's own monitors, which is a cursor moving between
+/// monitors rather than leaving the machine.
+pub fn return_crossing<C: CursorSource>(
     edge: ReturnEdge,
-    x: i32,
-    y: i32,
-    left: i32,
-    top: i32,
-    width: i32,
-    height: i32,
-) -> bool {
-    match edge {
-        ReturnEdge::Top => y <= top,
-        ReturnEdge::Bottom => y >= top + height - 1,
-        ReturnEdge::Left => x <= left,
-        ReturnEdge::Right => x >= left + width - 1,
-    }
-}
-
-/// Whether the cursor `source` reports has reached `edge`, and therefore
-/// whether `Message::Release` should be sent. `false` whenever the
-/// cursor position cannot be read at all, matching `cursor_position`'s
-/// doc comment above.
-pub fn should_release<C: CursorSource>(edge: ReturnEdge, source: &C) -> bool {
-    let Some((x, y)) = source.cursor_position() else {
-        return false;
-    };
-    let (left, top, width, height) = source.virtual_screen();
-    reached_edge(edge, x, y, left, top, width, height)
+    anchor_override: Option<f32>,
+    source: &C,
+) -> Option<f32> {
+    let (x, y) = source.cursor_position()?;
+    let screen = source.screen();
+    let side = Side::from(edge);
+    let along = screen.at_outer_edge(side, f64::from(x), f64::from(y))?;
+    Some((along - screen.anchor(side, anchor_override)) as f32)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hop_core::Rect;
 
     struct FakeSource {
         position: Option<(i32, i32)>,
-        virtual_screen: (i32, i32, i32, i32),
+        screen: Screen,
     }
 
     impl CursorSource for FakeSource {
@@ -113,12 +116,18 @@ mod tests {
             self.position
         }
 
-        fn virtual_screen(&self) -> (i32, i32, i32, i32) {
-            self.virtual_screen
+        fn screen(&self) -> Screen {
+            self.screen.clone()
         }
     }
 
-    const SCREEN: (i32, i32, i32, i32) = (0, 0, 1920, 1080);
+    fn one_monitor() -> Screen {
+        Screen::new(vec![Rect::new(0.0, 0.0, 1920.0, 1080.0)], 0)
+    }
+
+    fn released(edge: ReturnEdge, source: &FakeSource) -> bool {
+        return_crossing(edge, None, source).is_some()
+    }
 
     #[test]
     fn parses_the_four_edge_names() {
@@ -143,18 +152,69 @@ mod tests {
     fn cursor_at_the_return_edge_says_release() {
         let source = FakeSource {
             position: Some((960, 1079)),
-            virtual_screen: SCREEN,
+            screen: one_monitor(),
         };
-        assert!(should_release(ReturnEdge::Bottom, &source));
+        // The anchor of a single monitor is its centre, so a release from
+        // the centre travels as zero.
+        assert_eq!(
+            return_crossing(ReturnEdge::Bottom, None, &source),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn the_release_carries_where_along_the_edge_the_cursor_left() {
+        let source = FakeSource {
+            position: Some((1400, 1079)),
+            screen: one_monitor(),
+        };
+        assert_eq!(
+            return_crossing(ReturnEdge::Bottom, None, &source),
+            Some(440.0)
+        );
     }
 
     #[test]
     fn cursor_elsewhere_says_no_release() {
         let source = FakeSource {
             position: Some((960, 500)),
-            virtual_screen: SCREEN,
+            screen: one_monitor(),
         };
-        assert!(!should_release(ReturnEdge::Bottom, &source));
+        assert!(!released(ReturnEdge::Bottom, &source));
+    }
+
+    // The stranded-focus case: two monitors top-aligned but different
+    // heights. The shorter one's bottom row is 360 pixels above the
+    // union's bottom row, so union-based detection never fired there.
+    #[test]
+    fn the_bottom_of_a_shorter_monitor_still_releases() {
+        let source = FakeSource {
+            position: Some((3000, 1079)),
+            screen: Screen::new(
+                vec![
+                    Rect::new(0.0, 0.0, 2560.0, 1440.0),
+                    Rect::new(2560.0, 0.0, 4480.0, 1080.0),
+                ],
+                0,
+            ),
+        };
+        assert!(released(ReturnEdge::Bottom, &source));
+    }
+
+    // Moving between this PC's own monitors must never hand focus back.
+    #[test]
+    fn a_seam_between_two_monitors_never_releases() {
+        let source = FakeSource {
+            position: Some((960, 1079)),
+            screen: Screen::new(
+                vec![
+                    Rect::new(0.0, 0.0, 1920.0, 1080.0),
+                    Rect::new(0.0, 1080.0, 1920.0, 2160.0),
+                ],
+                0,
+            ),
+        };
+        assert!(!released(ReturnEdge::Bottom, &source));
     }
 
     #[test]
@@ -164,34 +224,39 @@ mod tests {
         // early just because the cursor happens to be in a corner.
         let source = FakeSource {
             position: Some((1919, 1079)),
-            virtual_screen: SCREEN,
+            screen: one_monitor(),
         };
-        assert!(should_release(ReturnEdge::Bottom, &source));
-        assert!(should_release(ReturnEdge::Right, &source));
-        assert!(!should_release(ReturnEdge::Top, &source));
-        assert!(!should_release(ReturnEdge::Left, &source));
+        assert!(released(ReturnEdge::Bottom, &source));
+        assert!(released(ReturnEdge::Right, &source));
+        assert!(!released(ReturnEdge::Top, &source));
+        assert!(!released(ReturnEdge::Left, &source));
     }
 
     #[test]
     fn a_failed_position_read_never_triggers_a_release() {
         let source = FakeSource {
             position: None,
-            virtual_screen: SCREEN,
+            screen: one_monitor(),
         };
-        assert!(!should_release(ReturnEdge::Bottom, &source));
+        assert!(!released(ReturnEdge::Bottom, &source));
     }
 
     #[test]
-    fn a_secondary_monitor_to_the_left_is_handled_via_virtual_screen_origin() {
-        // SM_XVIRTUALSCREEN/SM_YVIRTUALSCREEN can be negative when a
-        // monitor extends left or above the primary display, so the
-        // origin is not always (0, 0). A cursor at that origin's left
-        // edge must still read as reached.
+    fn a_secondary_monitor_to_the_left_puts_the_desktop_at_a_negative_origin() {
+        // A monitor extending left of or above the primary gives negative
+        // coordinates. A cursor at that monitor's left edge must still
+        // read as reached.
         let source = FakeSource {
             position: Some((-1920, 500)),
-            virtual_screen: (-1920, 0, 3840, 1080),
+            screen: Screen::new(
+                vec![
+                    Rect::new(-1920.0, 0.0, 0.0, 1080.0),
+                    Rect::new(0.0, 0.0, 1920.0, 1080.0),
+                ],
+                1,
+            ),
         };
-        assert!(should_release(ReturnEdge::Left, &source));
-        assert!(!should_release(ReturnEdge::Right, &source));
+        assert!(released(ReturnEdge::Left, &source));
+        assert!(!released(ReturnEdge::Right, &source));
     }
 }

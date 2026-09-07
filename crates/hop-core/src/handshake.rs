@@ -121,7 +121,7 @@ fn message_kind(message: &Message) -> &'static str {
         Message::Key { .. } => "Key",
         Message::ReleaseAllKeys => "ReleaseAllKeys",
         Message::Heartbeat => "Heartbeat",
-        Message::Release => "Release",
+        Message::Release { .. } => "Release",
         // Names the kind only. The text it carries is the user's
         // clipboard, so it must never reach a log.
         Message::ClipboardText(_) => "ClipboardText",

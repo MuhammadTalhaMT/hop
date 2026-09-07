@@ -79,9 +79,10 @@ key_file = "%APPDATA%\\hop\\key"
 [input]
 return_edge = "bottom"             # mirrors the server's top edge
 mouse_scale = 1.0                  # lower this if the PC feels too fast
+# anchor = 0.5                     # only if the cursor lands off-centre
 ```
 
-Two settings deserve attention:
+Three settings deserve attention:
 
 `panic_hotkey` is required on the server and is the emergency escape. If
 input ever gets stuck on the peer, pressing it returns control to the Mac
@@ -100,6 +101,26 @@ edge: `top` pairs with `bottom`, `left` with `right`. The two files live
 on different machines so the pairing cannot be validated at load time.
 Get it backwards and the cursor crosses to the PC with no automatic way
 back, leaving only the panic hotkey.
+
+It is also the edge focus ARRIVES on, not the opposite one. The PC sits
+on one side of the Mac, so leaving the Mac's top arrives at the PC's
+bottom, and leaving the PC's bottom is how you go home: one edge, both
+directions.
+
+`anchor` says where along that edge the Mac sits, as a fraction from 0.0
+(the left end) to 1.0 (the right end). It is the one thing about your
+desk that neither machine can work out for itself. Leave it unset and hop
+assumes the Mac is centred under the PC's primary monitor, which is right
+for most desks. If the cursor arrives on the wrong monitor, set it: about
+0.5 if the laptop sits under the seam between two monitors, 0.75 if it
+sits under the right-hand one. Everything else is read from the two
+operating systems.
+
+The two desktops are placed side by side at one-to-one scale, the way
+your OS already arranges your own monitors, so a hand moving diagonally
+keeps its angle across the boundary and a crossing lands where the motion
+was heading. Crossing further along than the other machine's edge reaches
+lands at its nearest corner.
 
 On macOS, whatever runs `hop` needs Accessibility permission (System
 Settings, Privacy and Security, Accessibility). Without it the event tap

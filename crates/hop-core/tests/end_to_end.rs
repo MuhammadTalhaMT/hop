@@ -55,7 +55,7 @@ async fn captured_input_arrives_injected_on_the_far_side() {
     // dropping or mis-mapping any one of them (for example Scroll arriving
     // as Mouse) is caught by the exact-variant assertion below.
     let mut capturer = FakeCapturer::new(vec![
-        InputEvent::EdgeCrossed,
+        InputEvent::EdgeCrossed { along: 0.0 },
         InputEvent::Mouse { dx: 5, dy: -2 },
         InputEvent::Scroll { dx: 1, dy: -3 },
         InputEvent::Button {
@@ -76,11 +76,13 @@ async fn captured_input_arrives_injected_on_the_far_side() {
     let mut injector = FakeInjector::new();
     let mut held = HeldKeys::new();
 
-    pump_server(&mut server_side, &mut capturer, &mut control, &remap, None)
+    pump_server(&mut server_side, &mut capturer, &mut control, &remap)
         .await
         .expect("server pump");
 
-    for _ in 0..5 {
+    // Six messages, not five: the crossing itself sends an Enter that
+    // carries where along the edge the cursor left.
+    for _ in 0..6 {
         pump_client_or_timeout(&mut client_side, &mut injector, &mut held)
             .await
             .expect("client pump");
@@ -89,6 +91,7 @@ async fn captured_input_arrives_injected_on_the_far_side() {
     assert_eq!(
         injector.injected(),
         vec![
+            InputEvent::Enter { along: 0.0 },
             InputEvent::Mouse { dx: 5, dy: -2 },
             InputEvent::Scroll { dx: 1, dy: -3 },
             InputEvent::Button {
@@ -124,7 +127,7 @@ async fn input_before_the_edge_is_not_forwarded() {
     let mut injector = FakeInjector::new();
     let mut held = HeldKeys::new();
 
-    pump_server(&mut server_side, &mut capturer, &mut control, &remap, None)
+    pump_server(&mut server_side, &mut capturer, &mut control, &remap)
         .await
         .expect("server pump");
     server_side.send(&Message::Heartbeat).await.unwrap();
@@ -162,7 +165,7 @@ async fn local_pointer_and_click_activity_does_not_cross_the_wire() {
     let mut injector = FakeInjector::new();
     let mut held = HeldKeys::new();
 
-    pump_server(&mut server_side, &mut capturer, &mut control, &remap, None)
+    pump_server(&mut server_side, &mut capturer, &mut control, &remap)
         .await
         .expect("server pump");
     // Give the client something to receive so a missing focus gate (which
@@ -194,7 +197,7 @@ async fn explicit_release_clears_keys_held_on_the_peer() {
     let (mut client_side, _b_writer) = split(b, key(), session(), client_dir());
 
     let mut capturer = FakeCapturer::new(vec![
-        InputEvent::EdgeCrossed,
+        InputEvent::EdgeCrossed { along: 0.0 },
         InputEvent::Key {
             usage: Usage::LEFT_GUI,
             pressed: true,
@@ -205,20 +208,26 @@ async fn explicit_release_clears_keys_held_on_the_peer() {
     let mut injector = FakeInjector::new();
     let mut held = HeldKeys::new();
 
-    pump_server(&mut server_side, &mut capturer, &mut control, &remap, None)
+    pump_server(&mut server_side, &mut capturer, &mut control, &remap)
         .await
         .expect("server pump");
 
-    pump_client_or_timeout(&mut client_side, &mut injector, &mut held)
-        .await
-        .expect("client pump");
+    // The crossing's Enter arrives first, then the key.
+    for _ in 0..2 {
+        pump_client_or_timeout(&mut client_side, &mut injector, &mut held)
+            .await
+            .expect("client pump");
+    }
 
     assert_eq!(
         injector.injected(),
-        vec![InputEvent::Key {
-            usage: Usage::LEFT_GUI,
-            pressed: true
-        }]
+        vec![
+            InputEvent::Enter { along: 0.0 },
+            InputEvent::Key {
+                usage: Usage::LEFT_GUI,
+                pressed: true
+            }
+        ]
     );
     assert_eq!(
         held.held(),
@@ -241,6 +250,7 @@ async fn explicit_release_clears_keys_held_on_the_peer() {
     assert_eq!(
         injector.injected(),
         vec![
+            InputEvent::Enter { along: 0.0 },
             InputEvent::Key {
                 usage: Usage::LEFT_GUI,
                 pressed: true
@@ -276,7 +286,7 @@ async fn a_peer_with_the_wrong_key_gets_nothing() {
     );
 
     let mut capturer = FakeCapturer::new(vec![
-        InputEvent::EdgeCrossed,
+        InputEvent::EdgeCrossed { along: 0.0 },
         InputEvent::Key {
             usage: Usage::C,
             pressed: true,
@@ -285,7 +295,7 @@ async fn a_peer_with_the_wrong_key_gets_nothing() {
     let mut control = Control::new();
     let remap = RemapTable::new();
 
-    pump_server(&mut server_side, &mut capturer, &mut control, &remap, None)
+    pump_server(&mut server_side, &mut capturer, &mut control, &remap)
         .await
         .expect("server pump");
 

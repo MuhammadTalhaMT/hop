@@ -8,10 +8,14 @@
 //! tests without needing a live desktop session; only `send_inputs` reaches
 //! across the FFI boundary.
 
-use hop_core::{DeviceError, Injector, InputEvent};
+use hop_core::{DeviceError, Injector, InputEvent, Rect, Screen, Side};
 use hop_proto::{Button, Usage};
 use std::time::{Duration, Instant};
-use windows_sys::Win32::Foundation::{GetLastError, POINT};
+use windows_sys::core::BOOL;
+use windows_sys::Win32::Foundation::{GetLastError, LPARAM, POINT, RECT};
+use windows_sys::Win32::Graphics::Gdi::{
+    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
+};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
     KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
@@ -20,12 +24,12 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_WHEEL, MOUSEINPUT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN, WHEEL_DELTA,
+    GetCursorPos, GetSystemMetrics, MONITORINFOF_PRIMARY, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WHEEL_DELTA,
 };
 
 use crate::windows::keymap::usage_to_scancode;
-use crate::windows::return_edge::{should_release, CursorSource, ReturnEdge};
+use crate::windows::return_edge::{return_crossing, CursorSource, ReturnEdge};
 
 /// Builds the `INPUT` for a key down or up, or `None` if `usage` has no
 /// scancode mapping. `KEYEVENTF_SCANCODE` is always set so the PC's own
@@ -96,32 +100,18 @@ fn mouse_move_input(dx: i32, dy: i32) -> INPUT {
     mouse_input(dx, dy, 0, MOUSEEVENTF_MOVE)
 }
 
-/// Where the cursor should appear when focus arrives, given how far along
-/// the peer's edge it left.
+/// How far inside the desktop, in pixels, an arriving cursor is placed
+/// away from the edge it came through.
 ///
-/// The entry edge is the OPPOSITE of this machine's return edge: if the
-/// cursor leaves here through the bottom, it must arrive at the top.
-/// `fraction` runs 0.0 to 1.0 along that edge, so the same relative point
-/// is used on machines of different resolutions.
-fn entry_point(
-    return_edge: Option<ReturnEdge>,
-    fraction: f32,
-    screen: (i32, i32, i32, i32),
-) -> (i32, i32) {
-    let (left, top, width, height) = screen;
-    let f = fraction.clamp(0.0, 1.0) as f64;
-    let along_x = left + ((width - 1).max(0) as f64 * f).round() as i32;
-    let along_y = top + ((height - 1).max(0) as f64 * f).round() as i32;
-    match return_edge {
-        // Leaves through the bottom, so arrives at the top.
-        Some(ReturnEdge::Bottom) | None => (along_x, top),
-        Some(ReturnEdge::Top) => (along_x, top + (height - 1).max(0)),
-        Some(ReturnEdge::Right) => (left, along_y),
-        Some(ReturnEdge::Left) => (left + (width - 1).max(0), along_y),
-    }
-}
+/// Entry and return happen on the SAME edge of this machine, because the
+/// peer is on one side of it: with the PC above the Mac, leaving the
+/// Mac's top arrives at the PC's bottom, and leaving the PC's bottom is
+/// how you go home. An arriving cursor is therefore standing on the
+/// return edge, and without this nudge the very next motion event would
+/// hand focus straight back.
+const ENTRY_MARGIN: f64 = 12.0;
 
-/// Builds the `INPUT` for moving the cursor to an absolute position.
+/// Builds the `INPUT` for moving the cursor to an absolute position./// Builds the `INPUT` for moving the cursor to an absolute position.
 ///
 /// Absolute movement is what makes pointer speed match the Mac. A
 /// relative `MOUSEEVENTF_MOVE` is put through Windows pointer
@@ -215,11 +205,32 @@ fn send_inputs(inputs: &[INPUT]) -> Result<(), DeviceError> {
     Ok(())
 }
 
-/// Reads the real cursor position and the Windows virtual screen bounds
-/// via the Win32 API. The only real `CursorSource`; the trait exists
-/// separately (see `crate::windows::return_edge`) so the decision that
-/// consumes it is testable without a live Windows desktop.
+/// Reads the real cursor position and this PC's monitors via the Win32
+/// API. The only real `CursorSource`; the trait exists separately (see
+/// `crate::windows::return_edge`) so the decision that consumes it is
+/// testable without a live Windows desktop.
 struct WindowsCursorSource;
+
+impl WindowsCursorSource {
+    /// The whole virtual desktop as `(left, top, width, height)`.
+    ///
+    /// This is the coordinate SPACE `MOUSEEVENTF_VIRTUALDESK` normalises
+    /// against, which is the only thing it is still used for. It is not
+    /// the model of where the monitors are: that is `screen()` below.
+    fn virtual_screen(&self) -> (i32, i32, i32, i32) {
+        // SAFETY: `GetSystemMetrics` takes a plain integer index and
+        // returns a plain integer; it has no pointer arguments and is
+        // documented as safe to call at any time.
+        unsafe {
+            (
+                GetSystemMetrics(SM_XVIRTUALSCREEN),
+                GetSystemMetrics(SM_YVIRTUALSCREEN),
+                GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                GetSystemMetrics(SM_CYVIRTUALSCREEN),
+            )
+        }
+    }
+}
 
 impl CursorSource for WindowsCursorSource {
     fn cursor_position(&self) -> Option<(i32, i32)> {
@@ -237,19 +248,86 @@ impl CursorSource for WindowsCursorSource {
         Some((point.x, point.y))
     }
 
-    fn virtual_screen(&self) -> (i32, i32, i32, i32) {
-        // SAFETY: `GetSystemMetrics` takes a plain integer index and
-        // returns a plain integer; it has no pointer arguments and is
-        // documented as safe to call at any time.
-        unsafe {
-            (
-                GetSystemMetrics(SM_XVIRTUALSCREEN),
-                GetSystemMetrics(SM_YVIRTUALSCREEN),
-                GetSystemMetrics(SM_CXVIRTUALSCREEN),
-                GetSystemMetrics(SM_CYVIRTUALSCREEN),
-            )
-        }
+    fn screen(&self) -> Screen {
+        read_screen()
     }
+}
+
+/// Collects one monitor's rectangle during `EnumDisplayMonitors`.
+///
+/// # Safety
+///
+/// Called only by `EnumDisplayMonitors`, which passes back the `LPARAM`
+/// given to it verbatim; `read_screen` below always passes a pointer to a
+/// live `Vec` that outlives the enumeration, and the enumeration is
+/// synchronous, so the pointer is valid for the whole call.
+unsafe extern "system" fn collect_monitor(
+    monitor: HMONITOR,
+    _dc: HDC,
+    _clip: *mut RECT,
+    data: LPARAM,
+) -> BOOL {
+    let monitors = unsafe { &mut *(data as *mut Vec<(Rect, bool)>) };
+    let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    // SAFETY: `info` is a fully initialised MONITORINFO with cbSize set,
+    // which is the entire contract; `monitor` is the handle the
+    // enumeration just handed us and is valid for the duration of this
+    // callback.
+    if unsafe { GetMonitorInfoW(monitor, &mut info) } != 0 {
+        let r = info.rcMonitor;
+        monitors.push((
+            Rect::new(
+                f64::from(r.left),
+                f64::from(r.top),
+                f64::from(r.right),
+                f64::from(r.bottom),
+            ),
+            info.dwFlags & MONITORINFOF_PRIMARY != 0,
+        ));
+    }
+    // Keep enumerating; returning 0 would stop at the first monitor.
+    1
+}
+
+/// This PC's monitors, each as its own rectangle, with the primary one
+/// marked.
+///
+/// Falls back to a single monitor covering the whole virtual screen if
+/// the enumeration fails or reports nothing. That is exactly the model
+/// hop used before, so a failure degrades to the previous behaviour
+/// rather than to no return edge at all, which would strand focus here.
+fn read_screen() -> Screen {
+    let mut monitors: Vec<(Rect, bool)> = Vec::new();
+    // SAFETY: a null HDC and null clip rectangle mean "every monitor on
+    // the whole desktop", which is what the documentation specifies for
+    // this call. `collect_monitor`'s own safety comment covers the
+    // pointer handed through `LPARAM`; it points at `monitors`, which
+    // lives until after this synchronous call returns.
+    unsafe {
+        EnumDisplayMonitors(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            Some(collect_monitor),
+            &mut monitors as *mut Vec<(Rect, bool)> as LPARAM,
+        );
+    }
+
+    if monitors.is_empty() {
+        let (left, top, width, height) = WindowsCursorSource.virtual_screen();
+        return Screen::single(Rect::from_origin_size(
+            f64::from(left),
+            f64::from(top),
+            f64::from(width),
+            f64::from(height),
+        ));
+    }
+
+    let primary = monitors.iter().position(|(_, p)| *p).unwrap_or(0);
+    Screen::new(
+        monitors.into_iter().map(|(rect, _)| rect).collect(),
+        primary,
+    )
 }
 
 /// How long `WindowsInjector` ignores its own return-edge check after it
@@ -272,7 +350,7 @@ impl CursorSource for WindowsCursorSource {
 const RELEASE_SUPPRESS_WINDOW: Duration = Duration::from_millis(500);
 
 /// Replays events on the local PC via `SendInput`.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct WindowsInjector {
     /// The edge of this PC's virtual screen whose crossing hands focus
     /// back to the server; `None` leaves the automatic return path
@@ -288,6 +366,18 @@ pub struct WindowsInjector {
     /// here than it did on the Mac. Scaling below 1.0 cancels the second
     /// helping.
     mouse_scale: f64,
+    /// Where along the return edge the peer's machine sits, as a fraction
+    /// of that edge, or `None` for "centred under the primary monitor".
+    /// See `hop_core::Screen::anchor`: this is the one quantity neither
+    /// OS can report, so it is the one thing worth configuring.
+    anchor: Option<f32>,
+    /// This PC's monitors, as of the last time they were read.
+    ///
+    /// Cached because it is consulted after every injected motion, and
+    /// refreshed on every crossing and whenever the cursor turns up
+    /// somewhere no cached monitor covers, which is what Windows does
+    /// when a monitor goes away underneath it.
+    screen: Screen,
     /// Sub-pixel remainder carried between events.
     ///
     /// Without it, scaling truncates every delta towards zero, so slow
@@ -309,15 +399,25 @@ pub(crate) fn scale_delta(dx: i32, dy: i32, scale: f64, remainder: &mut (f64, f6
 }
 
 impl WindowsInjector {
-    pub fn new(return_edge: Option<ReturnEdge>, mouse_scale: f64) -> Self {
+    pub fn new(return_edge: Option<ReturnEdge>, mouse_scale: f64, anchor: Option<f32>) -> Self {
         let injector = Self {
             return_edge,
             suppress_release_until: None,
             mouse_scale,
+            anchor,
+            screen: read_screen(),
             scale_remainder: (0.0, 0.0),
         };
         injector.release_all_modifiers();
         injector
+    }
+
+    /// Re-reads the monitor list. Called on every crossing, and whenever
+    /// the cursor is found outside every cached monitor, so unplugging or
+    /// rearranging a monitor mid-session recovers by itself instead of
+    /// needing hop restarted.
+    fn refresh_screen(&mut self) {
+        self.screen = read_screen();
     }
 
     /// Send a key-up for every modifier, unconditionally.
@@ -365,7 +465,7 @@ impl Injector for WindowsInjector {
         match *event {
             // Capture-side signal that a peer's edge was crossed; never
             // itself replayed as input.
-            InputEvent::EdgeCrossed => Ok(()),
+            InputEvent::EdgeCrossed { .. } => Ok(()),
             InputEvent::Mouse { dx, dy } => {
                 let (dx, dy) = scale_delta(dx, dy, self.mouse_scale, &mut self.scale_remainder);
                 if dx == 0 && dy == 0 {
@@ -377,23 +477,60 @@ impl Injector for WindowsInjector {
                 // Windows pointer acceleration never applies a second
                 // curve on top of the one macOS already applied. That is
                 // what makes pointer speed match between the machines.
-                let screen = WindowsCursorSource.virtual_screen();
+                let virtual_screen = WindowsCursorSource.virtual_screen();
                 let Some((cx, cy)) = WindowsCursorSource.cursor_position() else {
                     return send_inputs(&[mouse_move_input(dx, dy)]);
                 };
-                let (left, top, width, height) = screen;
-                let x = (cx + dx).clamp(left, left + width - 1);
-                let y = (cy + dy).clamp(top, top + height - 1);
-                send_inputs(&[mouse_move_absolute_input(x, y, screen)])
+                // Windows has moved the cursor somewhere no monitor hop
+                // knows about, which is what happens when a monitor is
+                // unplugged. Re-read rather than reasoning about a
+                // desktop that no longer exists.
+                if !self
+                    .screen
+                    .monitors()
+                    .iter()
+                    .any(|m| m.contains(f64::from(cx), f64::from(cy)))
+                {
+                    self.refresh_screen();
+                }
+                // Clamp onto the monitors themselves, not onto the
+                // virtual screen rectangle. That rectangle includes dead
+                // zones belonging to no monitor (below the shorter of two
+                // side-by-side monitors, say), and leaving the cursor
+                // there relied on Windows to silently fix it up.
+                let (x, y) = self
+                    .screen
+                    .clamp_to_monitors(f64::from(cx + dx), f64::from(cy + dy));
+                send_inputs(&[mouse_move_absolute_input(
+                    x.round() as i32,
+                    y.round() as i32,
+                    virtual_screen,
+                )])
             }
-            InputEvent::Enter { fraction } => {
-                // Place the cursor at the same relative point on this
-                // machine's entry edge that it left the peer's edge from,
-                // so the movement reads as one continuous motion instead
-                // of the pointer jumping to wherever it was left.
-                let screen = WindowsCursorSource.virtual_screen();
-                let (x, y) = entry_point(self.return_edge, fraction, screen);
-                send_inputs(&[mouse_move_absolute_input(x, y, screen)])
+            InputEvent::Enter { along } => {
+                // Arrive on the SAME edge that hands focus back, because
+                // the peer is on one side of this machine: with the PC
+                // above the Mac, leaving the Mac's top arrives at the
+                // PC's bottom. Arriving on the opposite edge, which this
+                // used to do, pinned the cursor to the top of the
+                // monitors on every crossing.
+                //
+                // `along` is relative to the PEER's anchor, so adding
+                // this machine's anchor gives the matching point here at
+                // one-to-one scale. Nothing is stretched, and a position
+                // past the end of this machine's edge clamps to the
+                // nearest corner.
+                self.refresh_screen();
+                let side = Side::from(self.return_edge.unwrap_or(ReturnEdge::Bottom));
+                let target = f64::from(along) + self.screen.anchor(side, self.anchor);
+                let Some((x, y)) = self.screen.landing(side, target, ENTRY_MARGIN) else {
+                    return Ok(());
+                };
+                send_inputs(&[mouse_move_absolute_input(
+                    x.round() as i32,
+                    y.round() as i32,
+                    WindowsCursorSource.virtual_screen(),
+                )])
             }
             InputEvent::Button { button, pressed } => send_inputs(&[button_input(button, pressed)]),
             InputEvent::Scroll { dx, dy } => send_inputs(&scroll_inputs(dx, dy)),
@@ -412,22 +549,17 @@ impl Injector for WindowsInjector {
         }
     }
 
-    fn reached_return_edge(&mut self) -> bool {
-        let Some(edge) = self.return_edge else {
-            return false;
-        };
+    fn return_crossing(&mut self) -> Option<f32> {
+        let edge = self.return_edge?;
         if let Some(until) = self.suppress_release_until {
             if Instant::now() < until {
-                return false;
+                return None;
             }
             self.suppress_release_until = None;
         }
-        if should_release(edge, &WindowsCursorSource) {
-            self.suppress_release_until = Some(Instant::now() + RELEASE_SUPPRESS_WINDOW);
-            true
-        } else {
-            false
-        }
+        let along = return_crossing(edge, self.anchor, &WindowsCursorSource)?;
+        self.suppress_release_until = Some(Instant::now() + RELEASE_SUPPRESS_WINDOW);
+        Some(along)
     }
 }
 
@@ -589,6 +721,41 @@ mod tests {
         let up = mouse_input_flags(button_input(Button::Left, false));
         assert_eq!(down, MOUSEEVENTF_LEFTDOWN);
         assert_eq!(up, MOUSEEVENTF_LEFTUP);
+    }
+
+    // The entry edge IS the return edge, and a landing must never sit
+    // on it. An earlier version arrived on the opposite edge, so with the
+    // PC above the Mac every crossing pinned the cursor to the top of the
+    // monitors; there was no test here, which is how it shipped.
+    //
+    // The geometry itself is covered exhaustively in hop-core, on every
+    // host. This pins the wiring: that `Side::from(ReturnEdge)` is the
+    // right way round and the margin is applied inward.
+    #[test]
+    fn focus_arrives_on_the_return_edge_and_not_on_the_opposite_one() {
+        let screen = Screen::new(
+            vec![
+                Rect::new(0.0, 0.0, 1920.0, 1080.0),
+                Rect::new(1920.0, 0.0, 3840.0, 1080.0),
+            ],
+            0,
+        );
+        let side = Side::from(ReturnEdge::Bottom);
+        let along = screen.anchor(side, None);
+        let (x, y) = screen
+            .landing(side, along, ENTRY_MARGIN)
+            .expect("has an edge");
+
+        assert_eq!((x, y), (960.0, 1080.0 - 1.0 - ENTRY_MARGIN));
+        assert!(
+            screen.monitors()[0].contains(x, y),
+            "landed off the primary"
+        );
+        assert_eq!(
+            screen.at_outer_edge(side, x, y),
+            None,
+            "an arriving cursor sitting on the return edge would bounce"
+        );
     }
 
     /// SAFETY: test-only read of the union arm the function under test just

@@ -20,12 +20,20 @@ pub enum InputEvent {
         usage: Usage,
         pressed: bool,
     },
-    /// The cursor reached the edge that hands control to the peer.
-    EdgeCrossed,
-    /// Focus has arrived from the peer, entering `fraction` of the way
-    /// along this machine's entry edge.
+    /// The cursor reached the edge that hands control to the peer,
+    /// `along` units from this machine's anchor on that edge.
+    ///
+    /// The position rides in the event rather than in a side channel the
+    /// connection loop reads separately. It used to be an atomic the
+    /// capture thread wrote and the loop read on waking, which raced: the
+    /// loop could read the PREVIOUS crossing's position and send that.
+    EdgeCrossed {
+        along: f32,
+    },
+    /// Focus has arrived from the peer, entering `along` units from the
+    /// PEER's anchor on its own edge. See `hop_proto::Message::Enter`.
     Enter {
-        fraction: f32,
+        along: f32,
     },
 }
 
@@ -48,9 +56,10 @@ pub trait Injector {
 
     /// Called after a `Mouse` motion event has just been injected, so an
     /// injector that can see where the real cursor actually landed gets a
-    /// chance to say focus should return to the peer. The default answer
-    /// is `false`: only a platform that tracks a real, visible cursor
-    /// (Windows, via `GetCursorPos`) can ever say otherwise.
+    /// chance to say focus should return to the peer, and where along the
+    /// return edge it left. The default answer is `None`: only a platform
+    /// that tracks a real, visible cursor (Windows, via `GetCursorPos`)
+    /// can ever say otherwise.
     ///
     /// This is CRITICAL 2's fix from the whole-branch review:
     /// `Message::Release` was defined and handled by the server, but
@@ -58,12 +67,13 @@ pub trait Injector {
     /// panic hotkey or a dead link. Living here, rather than in
     /// `hop-core`'s connection loop, is what keeps that loop platform
     /// agnostic: it just asks after every motion inject and sends
-    /// `Message::Release` when told to (see `crate::supervisor`), and the
+    /// `Message::Release` when given a position (see `crate::supervisor`),
+    /// and the
     /// answer to "has the cursor reached the return edge" stays entirely
     /// on the Windows client where the knowledge of the real cursor
     /// position actually lives.
-    fn reached_return_edge(&mut self) -> bool {
-        false
+    fn return_crossing(&mut self) -> Option<f32> {
+        None
     }
 }
 
@@ -130,13 +140,13 @@ mod tests {
     #[test]
     fn fake_capturer_yields_events_then_stops() {
         let mut c = FakeCapturer::new(vec![
-            InputEvent::EdgeCrossed,
+            InputEvent::EdgeCrossed { along: 0.0 },
             InputEvent::Key {
                 usage: Usage::C,
                 pressed: true,
             },
         ]);
-        assert_eq!(c.poll(), Some(InputEvent::EdgeCrossed));
+        assert_eq!(c.poll(), Some(InputEvent::EdgeCrossed { along: 0.0 }));
         assert_eq!(
             c.poll(),
             Some(InputEvent::Key {

@@ -303,8 +303,11 @@ async fn run_client(config: Config, key: SharedKey) -> Result<(), RunError> {
             field: "input.return_edge",
         })?;
 
-    let mut injector =
-        hop_platform::windows::WindowsInjector::new(Some(return_edge), config.input.mouse_scale);
+    let mut injector = hop_platform::windows::WindowsInjector::new(
+        Some(return_edge),
+        config.input.mouse_scale,
+        config.input.anchor,
+    );
     let mut supervisor = hop_core::ClientSupervisor::new(server.clone(), key, id);
 
     tracing::info!(
@@ -477,14 +480,12 @@ async fn drain_and_forward<W, C>(
     remap: &hop_core::RemapTable,
     remote_flag: &Arc<AtomicBool>,
     triggered: &Arc<AtomicBool>,
-    entry_fraction: Option<f32>,
 ) -> Result<(), ()>
 where
     W: tokio::io::AsyncWrite + Unpin,
     C: Capturer,
 {
-    if let Err(error) = hop_core::pump_server(writer, watched, control, remap, entry_fraction).await
-    {
+    if let Err(error) = hop_core::pump_server(writer, watched, control, remap).await {
         tracing::warn!(%error, "failed to forward input; disconnecting");
         return Err(());
     }
@@ -607,13 +608,25 @@ async fn handle_client(
                     Some(Ok(message)) => {
                         liveness.record_activity(Instant::now());
                         match message {
-                            hop_proto::Message::Release => {
+                            hop_proto::Message::Release { along } => {
                                 if control.on_release_requested() == Action::ReleaseAll
                                     && send_release_all(&mut writer).await.is_err()
                                 {
                                     tracing::warn!("failed to send release-all; disconnecting");
                                     break 'connection;
                                 }
+                                // Put the cursor back where the hand came
+                                // through on the peer's edge, not where it
+                                // left however long ago, and do it now
+                                // rather than waiting for the tap callback
+                                // to notice on its next event.
+                                //
+                                // BEFORE clearing the remote flag: the tap
+                                // callback restores the cursor itself the
+                                // first time it sees focus is local, and
+                                // it only knows the departure point, so
+                                // clearing the flag first races it.
+                                watched.inner.return_focus(Some(along));
                                 remote_flag.store(control.focus() == hop_core::Focus::Remote, Ordering::Relaxed);
                             }
                             hop_proto::Message::ClipboardText(text) => {
@@ -672,7 +685,6 @@ async fn handle_client(
                 }
             }
             _ = notify.notified() => {
-                let entry = Some(watched.inner.last_crossing_fraction());
                 if drain_and_forward(
                     &mut writer,
                     &mut watched,
@@ -680,7 +692,6 @@ async fn handle_client(
                     &remap,
                     &remote_flag,
                     &triggered,
-                    entry,
                 )
                 .await
                 .is_err()
@@ -702,7 +713,6 @@ async fn handle_client(
                     break 'connection;
                 }
 
-                let entry = Some(watched.inner.last_crossing_fraction());
                 if drain_and_forward(
                     &mut writer,
                     &mut watched,
@@ -710,7 +720,6 @@ async fn handle_client(
                     &remap,
                     &remote_flag,
                     &triggered,
-                    entry,
                 )
                 .await
                 .is_err()

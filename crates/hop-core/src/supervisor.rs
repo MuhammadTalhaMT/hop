@@ -103,11 +103,11 @@ impl Default for ReconnectPolicy {
 /// here, in the task that owns `injector`, `held`, and `writer`.
 ///
 /// The return-edge check (CRITICAL 2) only ever runs after a `Mouse`
-/// event actually injects: `Injector::reached_return_edge` is asked
-/// nowhere else, since only motion can move the real cursor onto the
-/// edge that hands focus back. See that method's doc comment for why
-/// this function, not the injector itself, is what turns a `true` answer
-/// into a sent `Message::Release`: only this function has the writer.
+/// event actually injects: `Injector::return_crossing` is asked nowhere
+/// else, since only motion can move the real cursor onto the edge that
+/// hands focus back. See that method's doc comment for why this function,
+/// not the injector itself, is what turns an answer into a sent
+/// `Message::Release`: only this function has the writer.
 #[allow(clippy::too_many_arguments)]
 async fn apply_message<I: Injector, C: Clipboard, W: AsyncWrite + Unpin>(
     message: Message,
@@ -190,13 +190,19 @@ async fn apply_message<I: Injector, C: Clipboard, W: AsyncWrite + Unpin>(
             if let Some(event) = message_to_event(&other) {
                 let is_motion = matches!(event, InputEvent::Mouse { .. });
                 match injector.inject(&event) {
-                    Ok(()) if is_motion && injector.reached_return_edge() => {
-                        tracing::info!(
-                            "cursor reached the return edge; asking the server to take focus back"
-                        );
-                        writer.send(&Message::Release).await?;
+                    Ok(()) => {
+                        // The position travels with the release so the
+                        // server's cursor reappears under where the hand
+                        // left, rather than back where it crossed from
+                        // however long ago.
+                        if let Some(along) = is_motion.then(|| injector.return_crossing()).flatten()
+                        {
+                            tracing::info!(
+                                "cursor reached the return edge; asking the server to take focus back"
+                            );
+                            writer.send(&Message::Release { along }).await?;
+                        }
                     }
-                    Ok(()) => {}
                     Err(error) => {
                         tracing::warn!(?event, %error, "injector rejected event");
                     }
@@ -503,13 +509,13 @@ mod tests {
     use tokio::io::duplex;
     use tokio::net::TcpListener;
 
-    /// An `Injector` wrapping `FakeInjector`, with `reached_return_edge`'s
+    /// An `Injector` wrapping `FakeInjector`, with `return_crossing`'s
     /// answer controlled by the test rather than by a real cursor. Lets
     /// CRITICAL 2's wiring (`apply_message` sending `Message::Release`
     /// when told to) be exercised with no Windows API involved.
     struct ReturnEdgeInjector {
         inner: FakeInjector,
-        reached: bool,
+        reached: Option<f32>,
     }
 
     impl Injector for ReturnEdgeInjector {
@@ -517,7 +523,7 @@ mod tests {
             self.inner.inject(event)
         }
 
-        fn reached_return_edge(&mut self) -> bool {
+        fn return_crossing(&mut self) -> Option<f32> {
             self.reached
         }
     }
@@ -597,7 +603,7 @@ mod tests {
 
         let mut injector = ReturnEdgeInjector {
             inner: FakeInjector::new(),
-            reached: true,
+            reached: Some(42.0),
         };
         let mut held = HeldKeys::new();
         let mut clipboard_sync = ClipboardSync::new();
@@ -621,7 +627,7 @@ mod tests {
             .await
             .expect("recv must not hang")
             .expect("a Release frame must arrive");
-        assert_eq!(received, Message::Release);
+        assert_eq!(received, Message::Release { along: 42.0 });
     }
 
     #[tokio::test]
@@ -639,7 +645,7 @@ mod tests {
 
         let mut injector = ReturnEdgeInjector {
             inner: FakeInjector::new(),
-            reached: false,
+            reached: None,
         };
         let mut held = HeldKeys::new();
         let mut clipboard_sync = ClipboardSync::new();
@@ -669,7 +675,7 @@ mod tests {
     #[tokio::test]
     async fn only_motion_events_are_checked_against_the_return_edge() {
         // A key press must never trigger a release just because the
-        // injector's `reached_return_edge` happens to answer true: only
+        // injector's `return_crossing` happens to answer with a position: only
         // motion can actually move the cursor onto the edge, so only
         // motion is allowed to ask.
         let (client_io, server_io) = duplex(4096);
@@ -685,7 +691,7 @@ mod tests {
 
         let mut injector = ReturnEdgeInjector {
             inner: FakeInjector::new(),
-            reached: true,
+            reached: Some(42.0),
         };
         let mut held = HeldKeys::new();
         let mut clipboard_sync = ClipboardSync::new();

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped only for incompatible wire changes. Peers exchange this in the
 /// handshake and refuse to proceed if they disagree.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Button {
@@ -40,19 +40,27 @@ pub enum Message {
     /// holding a modifier down forever.
     ReleaseAllKeys,
     Heartbeat,
-    /// The client is handing control back to the server.
-    Release,
-    /// Focus has just crossed onto the peer, entering at `fraction` along
-    /// the entry edge, where 0.0 is the left or top end and 1.0 the right
-    /// or bottom end.
+    /// The client is handing control back to the server, leaving at
+    /// `along` on its return edge. Same units and meaning as `Enter`.
+    Release {
+        along: f32,
+    },
+    /// Focus has just crossed onto the peer, entering at `along` on the
+    /// entry edge.
     ///
-    /// A fraction rather than a pixel coordinate because the two machines
-    /// have different resolutions: what matters is that the cursor appears
-    /// at the same relative point it left from, so the motion looks
-    /// continuous rather than jumping to wherever the pointer happened to
-    /// be left last time.
+    /// `along` is in the SENDER's logical units (macOS points, Windows
+    /// pixels), measured relative to that machine's anchor: the point on
+    /// its edge that hop treats as the same physical place as the peer's
+    /// anchor (see `hop_core::Screen::anchor`). Signed, and free to fall
+    /// outside the receiver's own edge, in which case the receiver clamps
+    /// to the nearest corner.
+    ///
+    /// Not a fraction of the edge. A fraction stretches motion by the
+    /// ratio of the two edge widths, so a hand moving diagonally changes
+    /// direction at the boundary, and it makes the middle of one machine
+    /// map to the seam between two of the other's monitors.
     Enter {
-        fraction: f32,
+        along: f32,
     },
     /// The sender's clipboard now holds this text. Sent when either side
     /// notices its own clipboard changed, so a copy on one machine can be
@@ -151,13 +159,13 @@ pub fn encode(message: &Message) -> Result<Vec<u8>, CodecError> {
         Message::Key { usage, pressed } => encode_raw(TAG_KEY, &(*usage, *pressed)),
         Message::ReleaseAllKeys => encode_raw(TAG_RELEASE_ALL_KEYS, &()),
         Message::Heartbeat => encode_raw(TAG_HEARTBEAT, &()),
-        Message::Release => encode_raw(TAG_RELEASE, &()),
+        Message::Release { along } => encode_raw(TAG_RELEASE, along),
         Message::ClipboardText(text) => encode_raw(TAG_CLIPBOARD_TEXT, text),
         Message::FileOffer { name, size } => encode_raw(TAG_FILE_OFFER, &(name.clone(), *size)),
         Message::FileChunk(bytes) => encode_raw(TAG_FILE_CHUNK, bytes),
         Message::FileEnd => encode_raw(TAG_FILE_END, &()),
         Message::FileAbort => encode_raw(TAG_FILE_ABORT, &()),
-        Message::Enter { fraction } => encode_raw(TAG_ENTER, fraction),
+        Message::Enter { along } => encode_raw(TAG_ENTER, along),
         Message::Unknown => Err(CodecError::UnknownNotEncodable),
     }
 }
@@ -192,7 +200,10 @@ pub fn decode(bytes: &[u8]) -> Result<Message, CodecError> {
         }
         TAG_RELEASE_ALL_KEYS => Message::ReleaseAllKeys,
         TAG_HEARTBEAT => Message::Heartbeat,
-        TAG_RELEASE => Message::Release,
+        TAG_RELEASE => {
+            let along: f32 = postcard::from_bytes(&frame.body)?;
+            Message::Release { along }
+        }
         TAG_CLIPBOARD_TEXT => {
             let text: String = postcard::from_bytes(&frame.body)?;
             Message::ClipboardText(text)
@@ -208,8 +219,8 @@ pub fn decode(bytes: &[u8]) -> Result<Message, CodecError> {
         TAG_FILE_END => Message::FileEnd,
         TAG_FILE_ABORT => Message::FileAbort,
         TAG_ENTER => {
-            let fraction: f32 = postcard::from_bytes(&frame.body)?;
-            Message::Enter { fraction }
+            let along: f32 = postcard::from_bytes(&frame.body)?;
+            Message::Enter { along }
         }
         _ => Message::Unknown,
     };
@@ -268,7 +279,8 @@ mod tests {
             },
             Message::ReleaseAllKeys,
             Message::Heartbeat,
-            Message::Release,
+            Message::Release { along: -204.5 },
+            Message::Enter { along: 1337.25 },
         ];
         for original in cases {
             let bytes = encode(&original).expect("encode");

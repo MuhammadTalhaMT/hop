@@ -129,13 +129,28 @@ pub struct InputConfig {
     /// whole-branch review that added it), short of the panic hotkey,
     /// which lives only on the server.
     ///
-    /// Must be the opposite edge from the server's `[layout]` entry for
-    /// this peer: a server `top = "pc"` pairs with a client
-    /// `return_edge = "bottom"`, and `left` pairs with `right`. The two
-    /// settings live in separate config files on separate machines, so
-    /// this pairing cannot be checked at load time; get it backwards and
-    /// focus crosses over but has no automatic way back.
+    /// Must be the mirror of the server's `[layout]` entry for this peer:
+    /// a server `top = "pc"` pairs with a client `return_edge = "bottom"`,
+    /// and `left` pairs with `right`. The two settings live in separate
+    /// config files on separate machines, so this pairing cannot be
+    /// checked at load time; get it backwards and focus crosses over but
+    /// has no automatic way back.
+    ///
+    /// This is also the edge focus ARRIVES on, not the opposite one: the
+    /// peer is on one side of this machine, so the edge you enter through
+    /// and the edge you leave through are the same edge.
     pub return_edge: Option<String>,
+    /// Client only: where along `return_edge` the server's machine sits,
+    /// as a fraction from 0.0 (the left or top end) to 1.0 (the right or
+    /// bottom end).
+    ///
+    /// This is the one thing about the two desktops' arrangement that
+    /// neither OS can report: how far along the shared edge the two
+    /// machines line up. Unset means "centred under the primary monitor",
+    /// which is right for the common desk. Set it to about 0.5 if the
+    /// laptop sits under the seam between two monitors, or 0.75 if it
+    /// sits under the right-hand one.
+    pub anchor: Option<f32>,
     /// Client only: multiplier applied to incoming mouse movement.
     ///
     /// macOS has already applied its own pointer acceleration to the
@@ -152,6 +167,7 @@ impl Default for InputConfig {
         Self {
             panic_hotkey: None,
             return_edge: None,
+            anchor: None,
             // 1.0 means "leave movement exactly as the peer sent it",
             // which is the right default: a scale is a correction for a
             // mismatch, not something every setup needs.
@@ -329,6 +345,7 @@ struct RawInput {
     mouse_scale: Option<f64>,
     panic_hotkey: Option<String>,
     return_edge: Option<String>,
+    anchor: Option<f32>,
 }
 
 impl Config {
@@ -411,9 +428,23 @@ impl Config {
                         value: mouse_scale.to_string(),
                     });
                 }
+                // A fraction outside 0.0 to 1.0 does not name a point on
+                // the edge at all. Refused rather than clamped, for the
+                // same reason as `mouse_scale`: it is a typo, and
+                // silently obeying half of it makes the cursor land
+                // somewhere the user cannot explain.
+                if let Some(anchor) = raw_input.anchor {
+                    if !(anchor.is_finite() && (0.0..=1.0).contains(&anchor)) {
+                        return Err(ConfigError::InvalidValue {
+                            field: "input.anchor".to_string(),
+                            value: anchor.to_string(),
+                        });
+                    }
+                }
                 InputConfig {
                     panic_hotkey: raw_input.panic_hotkey,
                     return_edge: raw_input.return_edge,
+                    anchor: raw_input.anchor,
                     mouse_scale,
                 }
             }
@@ -798,6 +829,46 @@ return_edge = "bottom"
         let config = Config::load(&path).expect("valid client config should load");
         fs::remove_file(&path).ok();
         assert_eq!(config.input.mouse_scale, 1.0);
+    }
+
+    #[test]
+    fn the_anchor_defaults_to_centred_under_the_primary_monitor() {
+        // Unset means hop picks the centre of the primary monitor's
+        // outward edge, which is right for the common desk.
+        let path = write_config(CLIENT_CONFIG);
+        let config = Config::load(&path).expect("valid client config should load");
+        fs::remove_file(&path).ok();
+        assert_eq!(config.input.anchor, None);
+    }
+
+    #[test]
+    fn an_anchor_inside_the_edge_is_accepted() {
+        for good in ["0.0", "0.25", "1.0"] {
+            let toml = CLIENT_CONFIG.replace(
+                "return_edge = \"bottom\"",
+                &format!("return_edge = \"bottom\"\nanchor = {good}"),
+            );
+            let path = write_config(&toml);
+            let config = Config::load(&path).expect("anchor inside the edge should load");
+            fs::remove_file(&path).ok();
+            assert_eq!(config.input.anchor, Some(good.parse::<f32>().unwrap()));
+        }
+    }
+
+    #[test]
+    fn an_anchor_outside_the_edge_is_refused() {
+        // A fraction outside 0.0 to 1.0 names no point on the edge.
+        // Refused rather than clamped, so the typo is visible.
+        for bad in ["1.5", "-0.1"] {
+            let toml = CLIENT_CONFIG.replace(
+                "return_edge = \"bottom\"",
+                &format!("return_edge = \"bottom\"\nanchor = {bad}"),
+            );
+            let path = write_config(&toml);
+            let result = Config::load(&path);
+            fs::remove_file(&path).ok();
+            assert!(result.is_err(), "anchor = {bad} should be refused");
+        }
     }
 
     #[test]
