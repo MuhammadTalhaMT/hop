@@ -181,8 +181,8 @@ version. Discovery is a plain list of candidates:
 ```
 $ hop discover
   #  NAME              ADDRESS              ROLE     VERSION
-  1  talhas-mac        192.168.18.90:24810  server   1
-  2  desktop-pc        192.168.18.9:24810   client   1
+  1  talhas-mac        192.168.1.42:24810  server   1
+  2  desktop-pc        192.168.1.43:24810   client   1
 
 $ hop pair 2
 Paired with desktop-pc. Wrote peer to ~/.config/hop/config.toml

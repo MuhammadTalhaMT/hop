@@ -71,7 +71,7 @@ Client, on the PC, at `%APPDATA%\hop\config.toml`:
 ```toml
 role = "client"
 id = "pc"
-server = "192.168.18.90:24810"     # the Mac's address and port
+server = "192.168.1.42:24810"     # the Mac's address and port
 
 [security]
 key_file = "%APPDATA%\\hop\\key"

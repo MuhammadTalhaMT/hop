@@ -903,7 +903,7 @@ mod tests {
             None => String::new(),
         };
         let text = format!(
-            "role = \"client\"\nid = \"pc\"\nserver = \"192.168.18.90:24810\"\n\n[security]\nkey_file = \"/tmp/hop-key\"\n\n[input]\nreturn_edge = \"bottom\"\n{hotkey_line}"
+            "role = \"client\"\nid = \"pc\"\nserver = \"192.168.1.42:24810\"\n\n[security]\nkey_file = \"/tmp/hop-key\"\n\n[input]\nreturn_edge = \"bottom\"\n{hotkey_line}"
         );
         let path = temp_path("hotkey-config.toml");
         fs::write(&path, text).unwrap();

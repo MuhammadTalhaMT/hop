@@ -3,3 +3,6 @@
 .DS_Store
 /.superpowers
 /.claude/worktrees
+
+# Your own codesigning identity; never committed.
+.signing-identity

@@ -9,7 +9,15 @@ source "$HOME/.cargo/env"
 # is what lets macOS recognise each rebuild as the SAME program. Ad-hoc
 # signatures are keyed on the binary's contents, so every build looked like
 # a brand new app and Accessibility permission had to be granted again.
-IDENTITY="${HOP_SIGN_IDENTITY:-85A0610DC10063F62081B4BF147C105DB36A7D4F}"
+# Your own Apple Development certificate, as a SHA-1 fingerprint. Find
+# yours with:
+#   security find-identity -v -p codesigning
+# Put it in .signing-identity next to this script (untracked), or set
+# HOP_SIGN_IDENTITY in your shell.
+if [ -z "$HOP_SIGN_IDENTITY" ] && [ -f .signing-identity ]; then
+  HOP_SIGN_IDENTITY=$(tr -d '[:space:]' < .signing-identity)
+fi
+IDENTITY="${HOP_SIGN_IDENTITY:?no signing identity: put one in .signing-identity or set HOP_SIGN_IDENTITY (see: security find-identity -v -p codesigning)}"
 
 echo "building..."
 cargo build --release -p hop

@@ -38,7 +38,7 @@
 //! ```toml
 //! role = "client"
 //! id = "pc"
-//! server = "192.168.18.90:24810"   # host:port; discovery by name is not
+//! server = "192.168.1.42:24810"   # host:port; discovery by name is not
 //!                                   # implemented yet, so a bare name
 //!                                   # like "talhas-mac" is rejected
 //!
@@ -774,7 +774,7 @@ panic_hotkey = "LeftCtrl+LeftAlt+Escape"
     const CLIENT_CONFIG: &str = r#"
 role = "client"
 id = "pc"
-server = "192.168.18.90:24810"
+server = "192.168.1.42:24810"
 
 [discovery]
 enabled = true
@@ -895,7 +895,7 @@ return_edge = "bottom"
 
         assert_eq!(config.role, Role::Client);
         assert_eq!(config.id.as_deref(), Some("pc"));
-        assert_eq!(config.server.as_deref(), Some("192.168.18.90:24810"));
+        assert_eq!(config.server.as_deref(), Some("192.168.1.42:24810"));
         assert!(config.discovery.enabled);
         // `%VAR%` expansion is deliberately a no-op off Windows, so the same
         // config yields a literal path there and a real one on Windows.
@@ -1170,7 +1170,7 @@ key_file = "~/.config/hop/key"
         let path = write_config(
             r#"
 role = "client"
-server = "192.168.18.90:24810"
+server = "192.168.1.42:24810"
 
 [security]
 key_file = "%APPDATA%\\hop\\key"
@@ -1212,7 +1212,7 @@ key_file = "%APPDATA%\\hop\\key"
             r#"
 role = "client"
 id = "pc"
-server = "192.168.18.90:24810"
+server = "192.168.1.42:24810"
 
 [security]
 key_file = "%APPDATA%\\hop\\key"
@@ -1233,7 +1233,7 @@ key_file = "%APPDATA%\\hop\\key"
             r#"
 role = "client"
 id = "pc"
-server = "192.168.18.90:24810"
+server = "192.168.1.42:24810"
 
 [security]
 key_file = "%APPDATA%\\hop\\key"
@@ -1437,7 +1437,7 @@ return_edge = "bottom"
         let path = write_config(CLIENT_CONFIG);
         let config = Config::load(&path).expect("a host:port server address should be accepted");
         fs::remove_file(&path).ok();
-        assert_eq!(config.server.as_deref(), Some("192.168.18.90:24810"));
+        assert_eq!(config.server.as_deref(), Some("192.168.1.42:24810"));
     }
 
     #[test]
@@ -1467,7 +1467,7 @@ return_edge = "bottom"
             r#"
 role = "client"
 id = "pc"
-server = "192.168.18.90:notaport"
+server = "192.168.1.42:notaport"
 
 [security]
 key_file = "%APPDATA%\\hop\\key"
