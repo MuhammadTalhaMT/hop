@@ -565,23 +565,41 @@ mod tests {
     // "connected" or showing nothing at all.
     #[tokio::test]
     async fn a_peer_that_is_not_listening_reports_connecting_then_disconnected() {
-        // Port 1 on loopback: nothing listens there, and connecting to it
-        // fails immediately rather than hanging.
+        // Port 1 on loopback: nothing listens there. How fast the refusal
+        // comes back differs by platform, so this waits for the event
+        // rather than assuming a duration: a fixed window passed on macOS
+        // and failed on Windows.
         let mut supervisor =
             ClientSupervisor::new("127.0.0.1:1", SharedKey::from_bytes([7u8; 32]), "pc");
-        let mut injector = FakeInjector::new();
-        let mut clipboard = crate::clipboard::FakeClipboard::new();
-        let mut observer = RecordingObserver::default();
+        let observer = RecordingObserver::default();
+        let seen_by_test = Arc::clone(&observer.0);
 
-        // `run_observed` never returns by design, so it is raced against a
-        // deadline and judged on what it reported before the deadline.
-        let _ = tokio::time::timeout(
-            Duration::from_millis(400),
-            supervisor.run_observed(&mut injector, &mut clipboard, &mut observer),
-        )
-        .await;
+        // `run_observed` never returns by design, so it runs in a task
+        // that is aborted once it has reported what this test is about.
+        let engine = tokio::spawn(async move {
+            let mut injector = FakeInjector::new();
+            let mut clipboard = crate::clipboard::FakeClipboard::new();
+            let mut observer = observer;
+            supervisor
+                .run_observed(&mut injector, &mut clipboard, &mut observer)
+                .await
+        });
 
-        let seen = observer.0.lock().expect("observer lock").clone();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let refused = seen_by_test
+                .lock()
+                .expect("observer lock")
+                .iter()
+                .any(|s| matches!(s, crate::LinkState::Disconnected { .. }));
+            if refused || std::time::Instant::now() > deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        engine.abort();
+
+        let seen = seen_by_test.lock().expect("observer lock").clone();
         assert!(
             matches!(seen.first(), Some(crate::LinkState::Connecting)),
             "the first thing shown must be that hop is trying: {seen:?}"
