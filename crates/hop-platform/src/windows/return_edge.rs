@@ -70,15 +70,6 @@ pub trait CursorSource {
     /// failed. `None` must never be treated as "at the edge": a query
     /// failure is not evidence the user's hand is on the boundary.
     fn cursor_position(&self) -> Option<(i32, i32)>;
-
-    /// This PC's monitors, each as its own rectangle.
-    ///
-    /// Per monitor, not as one union rectangle. The union's bottom row
-    /// lies below the shorter of two monitors of different heights, so a
-    /// cursor pressed against that monitor's bottom never reached the
-    /// union's bottom, the release never fired, and focus was stranded on
-    /// the PC with only the panic hotkey to get it back.
-    fn screen(&self) -> Screen;
 }
 
 /// Whether the cursor `source` reports has reached an outward-facing part
@@ -89,13 +80,13 @@ pub trait CursorSource {
 /// `cursor_position`'s doc comment above, and `None` on a seam between
 /// two of this PC's own monitors, which is a cursor moving between
 /// monitors rather than leaving the machine.
-pub fn return_crossing<C: CursorSource>(
+pub fn return_crossing(
     edge: ReturnEdge,
     anchor_override: Option<f32>,
-    source: &C,
+    screen: &Screen,
+    position: Option<(i32, i32)>,
 ) -> Option<f32> {
-    let (x, y) = source.cursor_position()?;
-    let screen = source.screen();
+    let (x, y) = position?;
     let side = Side::from(edge);
     let along = screen.at_outer_edge(side, f64::from(x), f64::from(y))?;
     Some((along - screen.anchor(side, anchor_override)) as f32)
@@ -111,22 +102,12 @@ mod tests {
         screen: Screen,
     }
 
-    impl CursorSource for FakeSource {
-        fn cursor_position(&self) -> Option<(i32, i32)> {
-            self.position
-        }
-
-        fn screen(&self) -> Screen {
-            self.screen.clone()
-        }
-    }
-
     fn one_monitor() -> Screen {
         Screen::new(vec![Rect::new(0.0, 0.0, 1920.0, 1080.0)], 0)
     }
 
     fn released(edge: ReturnEdge, source: &FakeSource) -> bool {
-        return_crossing(edge, None, source).is_some()
+        return_crossing(edge, None, &source.screen, source.position).is_some()
     }
 
     #[test]
@@ -157,7 +138,7 @@ mod tests {
         // The anchor of a single monitor is its centre, so a release from
         // the centre travels as zero.
         assert_eq!(
-            return_crossing(ReturnEdge::Bottom, None, &source),
+            return_crossing(ReturnEdge::Bottom, None, &source.screen, source.position),
             Some(0.0)
         );
     }
@@ -169,7 +150,7 @@ mod tests {
             screen: one_monitor(),
         };
         assert_eq!(
-            return_crossing(ReturnEdge::Bottom, None, &source),
+            return_crossing(ReturnEdge::Bottom, None, &source.screen, source.position),
             Some(440.0)
         );
     }

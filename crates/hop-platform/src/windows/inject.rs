@@ -248,10 +248,6 @@ impl CursorSource for WindowsCursorSource {
         }
         Some((point.x, point.y))
     }
-
-    fn screen(&self) -> Screen {
-        read_screen()
-    }
 }
 
 /// Collects one monitor's rectangle during `EnumDisplayMonitors`.
@@ -504,9 +500,14 @@ impl Injector for WindowsInjector {
                 // zones belonging to no monitor (below the shorter of two
                 // side-by-side monitors, say), and leaving the cursor
                 // there relied on Windows to silently fix it up.
-                let (x, y) = self
-                    .screen
-                    .clamp_to_monitors(f64::from(cx + dx), f64::from(cy + dy));
+                //
+                // The move is passed whole, not just its destination, so
+                // pushing against a seam crosses onto the monitor beyond
+                // it rather than freezing the axis being pushed.
+                let (x, y) = self.screen.clamp_movement(
+                    (f64::from(cx), f64::from(cy)),
+                    (f64::from(cx + dx), f64::from(cy + dy)),
+                );
                 send_inputs(&[mouse_move_absolute_input(
                     x.round() as i32,
                     y.round() as i32,
@@ -570,7 +571,17 @@ impl Injector for WindowsInjector {
             }
             self.suppress_release_until = None;
         }
-        let along = return_crossing(edge, self.anchor, &WindowsCursorSource)?;
+        // The cached monitor list, not a fresh enumeration. This runs
+        // after every injected motion event, and reading the whole
+        // desktop layout from the OS at mouse-move rates is a cost paid
+        // hundreds of times a second for an answer that changes when
+        // somebody unplugs a monitor.
+        let along = return_crossing(
+            edge,
+            self.anchor,
+            &self.screen,
+            WindowsCursorSource.cursor_position(),
+        )?;
         self.suppress_release_until = Some(Instant::now() + RELEASE_SUPPRESS_WINDOW);
 
         // Hide the pointer: the user is about to be looking at the Mac,

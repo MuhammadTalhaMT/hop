@@ -330,6 +330,61 @@ impl Screen {
         Some(m.nearest(point.0, point.1))
     }
 
+    /// Where the cursor should end up when it tries to move from `from`
+    /// to `to`.
+    ///
+    /// The interesting case is a target on no monitor at all, which
+    /// happens constantly on a desktop whose monitors are not the same
+    /// height: push right near the bottom of a tall monitor and the
+    /// short one beside it has no pixels at that height.
+    ///
+    /// Nearest-point clamping answers that by freezing the axis being
+    /// pushed, which is the worst possible answer here. hop's user is
+    /// driving from another machine and cannot see where the cursor
+    /// actually is, so an invisible band in which rightward movement
+    /// simply stops reads as the tool being broken. Worse, hop puts them
+    /// in that band: a crossing lands the cursor a few pixels above the
+    /// PRIMARY monitor's bottom edge, which on a taller primary is
+    /// exactly a height its neighbour does not have.
+    ///
+    /// So when the target leaves the current monitor through an edge
+    /// another monitor sits against, the cursor crosses onto that
+    /// monitor and its position on the other axis is clamped to fit.
+    /// The user pushed right, so they go right; the vertical jump is the
+    /// unavoidable consequence of monitors that do not line up, and it
+    /// is visible and obvious rather than silent.
+    ///
+    /// Movement off an edge with nothing beyond it still stops dead,
+    /// which is what the outside of a desktop should do.
+    pub fn clamp_movement(&self, from: (f64, f64), to: (f64, f64)) -> (f64, f64) {
+        if self.monitors.iter().any(|m| m.contains(to.0, to.1)) {
+            return to;
+        }
+        let Some(index) = self.monitor_at(from.0, from.1) else {
+            return self.clamp_to_monitors(to.0, to.1);
+        };
+        let current = self.monitors[index];
+
+        for side in exit_sides(current, from, to) {
+            // The neighbour nearest to where the cursor was heading, so
+            // a stack of monitors beyond this edge picks the sensible one.
+            let neighbour = self
+                .monitors
+                .iter()
+                .enumerate()
+                .filter(|(i, n)| *i != index && beyond(current, **n, side))
+                .min_by(|(_, a), (_, b)| {
+                    squared_distance(a.nearest(to.0, to.1), to)
+                        .partial_cmp(&squared_distance(b.nearest(to.0, to.1), to))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            if let Some((_, neighbour)) = neighbour {
+                return neighbour.nearest(to.0, to.1);
+            }
+        }
+        self.clamp_to_monitors(to.0, to.1)
+    }
+
     /// The nearest point on this machine's monitors to `(x, y)`.
     ///
     /// Replaces clamping to the union rectangle, which could leave the
@@ -433,6 +488,38 @@ fn distance_to(segment: &Segment, along: f64) -> f64 {
     } else {
         0.0
     }
+}
+
+/// Which edges of `current` the move from `from` to `to` leaves through,
+/// the axis with the larger movement first.
+///
+/// Ordered rather than a single answer because a diagonal move can leave
+/// through two edges at once, and the one the user is pushing hardest
+/// toward is the one to try first.
+fn exit_sides(current: Rect, from: (f64, f64), to: (f64, f64)) -> Vec<Side> {
+    let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+    let mut horizontal = None;
+    if dx > 0.0 && to.0 >= current.max_x - 1.0 {
+        horizontal = Some(Side::Right);
+    } else if dx < 0.0 && to.0 <= current.min_x {
+        horizontal = Some(Side::Left);
+    }
+    let mut vertical = None;
+    if dy > 0.0 && to.1 >= current.max_y - 1.0 {
+        vertical = Some(Side::Bottom);
+    } else if dy < 0.0 && to.1 <= current.min_y {
+        vertical = Some(Side::Top);
+    }
+
+    let mut sides = Vec::new();
+    if dx.abs() >= dy.abs() {
+        sides.extend(horizontal);
+        sides.extend(vertical);
+    } else {
+        sides.extend(vertical);
+        sides.extend(horizontal);
+    }
+    sides
 }
 
 fn squared_distance(a: (f64, f64), b: (f64, f64)) -> f64 {
@@ -723,6 +810,85 @@ mod tests {
     #[test]
     fn a_screen_with_no_monitors_has_no_resting_point() {
         assert_eq!(Screen::new(Vec::new(), 0).resting_point(), None);
+    }
+
+    /// The desk that produced the bug: a taller primary with a shorter
+    /// monitor beside it, top aligned, which is what two mismatched
+    /// monitors look like out of the box.
+    fn mismatched() -> Screen {
+        Screen::new(
+            vec![
+                Rect::new(0.0, 0.0, 2560.0, 1440.0),
+                Rect::new(2560.0, 0.0, 4480.0, 1080.0),
+            ],
+            0,
+        )
+    }
+
+    // The reported bug: pushing right near the bottom of the taller
+    // monitor froze the cursor's x completely, however hard the user
+    // pushed. hop lands the cursor at exactly that height on every
+    // crossing, so this was not an edge case, it was the normal case.
+    #[test]
+    fn pushing_right_below_a_shorter_neighbour_still_crosses_onto_it() {
+        let screen = mismatched();
+        let from = (2559.0, 1427.0);
+        for step in 1..=40 {
+            let to = (2559.0 + f64::from(step), 1427.0);
+            let (x, y) = screen.clamp_movement(from, to);
+            assert!(
+                x >= 2560.0,
+                "pushing right by {step} left x at {x}, still on the first monitor"
+            );
+            assert!(
+                screen.monitors()[1].contains(x, y),
+                "({x}, {y}) is not on the monitor the user was pushing toward"
+            );
+        }
+    }
+
+    #[test]
+    fn crossing_a_seam_at_a_height_both_monitors_share_changes_nothing_else() {
+        let screen = mismatched();
+        assert_eq!(
+            screen.clamp_movement((2559.0, 500.0), (2560.0, 500.0)),
+            (2560.0, 500.0),
+            "a target that is already on a monitor must be left alone"
+        );
+    }
+
+    // The other half of the rule: an edge with nothing beyond it is the
+    // outside of the desktop and movement there stops dead.
+    #[test]
+    fn pushing_off_the_outside_of_the_desktop_still_stops() {
+        let screen = mismatched();
+        // Right, off the far monitor.
+        let (x, _) = screen.clamp_movement((4479.0, 500.0), (4500.0, 500.0));
+        assert_eq!(x, 4479.0);
+        // Down, off the bottom of the shorter monitor. Nothing sits
+        // below it, so this must not teleport sideways onto the taller
+        // one just because that monitor has pixels at this height.
+        let (x, y) = screen.clamp_movement((3000.0, 1079.0), (3000.0, 1200.0));
+        assert_eq!((x, y), (3000.0, 1079.0));
+    }
+
+    #[test]
+    fn a_diagonal_push_favours_the_axis_it_is_moving_furthest_along() {
+        let screen = mismatched();
+        // Mostly rightward, slightly down, from the tall monitor's lower
+        // half: the user means "go right".
+        let (x, y) = screen.clamp_movement((2559.0, 1427.0), (2579.0, 1429.0));
+        assert!(screen.monitors()[1].contains(x, y), "({x}, {y})");
+        assert!(x >= 2560.0);
+    }
+
+    #[test]
+    fn movement_within_one_monitor_is_never_touched() {
+        let screen = pc();
+        assert_eq!(
+            screen.clamp_movement((100.0, 100.0), (140.0, 130.0)),
+            (140.0, 130.0)
+        );
     }
 
     #[test]
