@@ -110,7 +110,17 @@ pub struct DiscoveryConfig {
 /// `[security]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecurityConfig {
+    /// The key's location, with `~` and `%VAR%` already expanded. This is
+    /// the path hop actually reads.
     pub key_file: PathBuf,
+    /// The same setting exactly as written in the file, unexpanded.
+    ///
+    /// Kept because expansion is one way: `%APPDATA%\\hop\\key` becomes an
+    /// absolute path on load, and anything writing the file back out
+    /// (hop's own settings window) would otherwise replace the variable
+    /// with one machine's expansion of it, quietly making the config
+    /// specific to that user account.
+    pub key_file_raw: String,
 }
 
 /// `[input]`.
@@ -413,6 +423,7 @@ impl Config {
                 })?;
         let security = SecurityConfig {
             key_file: expand_config_path(&key_file_raw, "security.key_file")?,
+            key_file_raw,
         };
 
         let input = match raw.input {

@@ -54,7 +54,10 @@ impl Settings {
         Self {
             server: config.server.clone().unwrap_or_default(),
             id: config.id.clone().unwrap_or_else(|| "pc".into()),
-            key_file: config.security.key_file.display().to_string(),
+            // The raw setting, not the expanded path: writing back one
+            // machine's expansion of %APPDATA% would tie the config to a
+            // single user account.
+            key_file: config.security.key_file_raw.clone(),
             return_edge: config
                 .input
                 .return_edge
@@ -281,6 +284,27 @@ mod tests {
         settings.mouse_scale = 1.0;
         assert!(settings.to_toml().contains("mouse_scale = 1.0"));
         assert_eq!(round_trip(&settings).mouse_scale, 1.0);
+    }
+
+    // Expansion is one way. `~` and `%APPDATA%` become an absolute path
+    // when the config is loaded, so a save that wrote the loaded value
+    // back would replace the variable with one machine's expansion of it
+    // and quietly tie the config to a single user account.
+    //
+    // This shipped, and only Windows CI caught it, because `%APPDATA%`
+    // does not expand on macOS and the round trip looked clean here. The
+    // `~` case below is the same bug in a form this Mac can fail on.
+    #[test]
+    fn a_path_variable_is_written_back_as_a_variable_not_as_its_expansion() {
+        for raw in ["~/.config/hop/key", "%APPDATA%\\hop\\key"] {
+            let mut settings = sample();
+            settings.key_file = raw.into();
+            assert_eq!(
+                round_trip(&settings).key_file,
+                raw,
+                "{raw} must survive a save unexpanded"
+            );
+        }
     }
 
     #[test]
