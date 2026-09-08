@@ -1192,7 +1192,7 @@ checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
 name = "hop"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "base64",
  "clap",
@@ -1214,7 +1214,7 @@ dependencies = [
 
 [[package]]
 name = "hop-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "getrandom 0.4.3",
  "hop-proto",
@@ -1226,7 +1226,7 @@ dependencies = [
 
 [[package]]
 name = "hop-platform"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "core-foundation 0.10.1",
  "core-graphics 0.25.0",
@@ -1240,7 +1240,7 @@ dependencies = [
 
 [[package]]
 name = "hop-proto"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "chacha20poly1305",
  "getrandom 0.4.3",
