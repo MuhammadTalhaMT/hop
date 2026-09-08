@@ -20,6 +20,9 @@ pub use liveness::Liveness;
 pub mod backoff;
 pub use backoff::Backoff;
 
+pub mod link;
+pub use link::{IgnoreLink, LinkObserver, LinkState};
+
 pub mod warp;
 pub use warp::WarpDebt;
 

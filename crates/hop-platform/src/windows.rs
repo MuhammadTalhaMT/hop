@@ -38,3 +38,7 @@ pub mod console;
 // to what macos::cursor already does in the other direction.
 #[cfg(target_os = "windows")]
 pub mod cursor;
+
+// Starting hop when Windows starts.
+#[cfg(target_os = "windows")]
+pub mod autostart;

@@ -20,6 +20,9 @@ mod update;
 #[cfg(target_os = "windows")]
 mod tray;
 
+#[cfg(target_os = "windows")]
+mod gui;
+
 #[cfg(target_os = "macos")]
 mod menubar;
 
@@ -81,9 +84,19 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
-    /// Show a notification area icon for starting and stopping hop
-    /// (Windows only). This is what running hop without a console looks
-    /// like, and it is what double clicking hop.exe does.
+    /// Open hop's window (Windows only), showing whether the link is up,
+    /// what went wrong when it is not, and the settings, without opening
+    /// a text editor on a TOML file. This is what double clicking
+    /// hop.exe does.
+    #[cfg(target_os = "windows")]
+    Gui {
+        /// Path to the TOML config file. Defaults to
+        /// %APPDATA%\hop\config.toml.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Show only a notification area icon for starting and stopping hop
+    /// (Windows only), with no window.
     #[cfg(target_os = "windows")]
     Tray {
         /// Path to the TOML config file hop will be started with.
@@ -95,14 +108,13 @@ enum Command {
 
 /// Where hop looks for its config when nobody says.
 ///
-/// Only used by the tray, and only because the tray is the one entry
-/// point that can be reached with no arguments at all, by double
+/// Only used by the window and the tray, and only because those are the
+/// entry points that can be reached with no arguments at all, by double
 /// clicking. Every other command still requires --config, so nothing
 /// silently reads a file the user did not name.
 #[cfg(target_os = "windows")]
 fn default_config_path() -> PathBuf {
-    let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(base).join("hop").join("config.toml")
+    hop::settings::default_config_path()
 }
 
 fn init_logging() {
@@ -132,10 +144,10 @@ async fn main() -> ExitCode {
     let command = match cli.command {
         Some(command) => command,
         // No subcommand at all. On Windows that means hop was double
-        // clicked, so show the tray rather than a usage error nobody can
-        // see; anywhere else, print the usage as normal.
+        // clicked, so show the window rather than a usage error nobody
+        // can see; anywhere else, print the usage as normal.
         #[cfg(target_os = "windows")]
-        None => Command::Tray { config: None },
+        None => Command::Gui { config: None },
         #[cfg(not(target_os = "windows"))]
         None => {
             use clap::CommandFactory;
@@ -177,6 +189,10 @@ async fn main() -> ExitCode {
         }
         #[cfg(target_os = "macos")]
         Command::Menubar { config } => menubar::run(config),
+        #[cfg(target_os = "windows")]
+        Command::Gui { config } => {
+            gui::run(config.unwrap_or_else(default_config_path)).map_err(run::RunError::Tray)
+        }
         #[cfg(target_os = "windows")]
         Command::Tray { config } => {
             tray::run(config.unwrap_or_else(default_config_path)).map_err(run::RunError::Tray)

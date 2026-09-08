@@ -32,3 +32,7 @@ base64 = "0.23.1"
 # toolchain to cross-compile, and this project's Windows gate runs from
 # the Mac.
 serde_json = "1.0.151"
+# hop's own window. Pure Rust with the glow backend, which matters: this
+# project's Windows checks run by cross-compiling from a Mac, and a
+# toolkit that compiles C does not survive that (see the updater's HTTP).
+eframe = { version = "0.33", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }

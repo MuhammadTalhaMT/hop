@@ -333,8 +333,11 @@ async fn run_client(config: Config, key: SharedKey) -> Result<(), RunError> {
     // whatever is held rather than leaving a modifier down on this
     // machine with no key-up ever sent. `run` never returns, so the
     // select resolves only on the signal.
+    let mut status = StatusPrinter;
     tokio::select! {
-        _ = supervisor.run(&mut injector, &mut clipboard) => unreachable!("run never returns"),
+        _ = supervisor.run_observed(&mut injector, &mut clipboard, &mut status) => {
+            unreachable!("run never returns")
+        }
         result = tokio::signal::ctrl_c() => {
             match result {
                 Ok(()) => tracing::info!("interrupted; releasing any held keys before exiting"),
@@ -345,6 +348,25 @@ async fn run_client(config: Config, key: SharedKey) -> Result<(), RunError> {
             hop_platform::windows::cursor::restore();
             Ok(())
         }
+    }
+}
+
+/// Prints every link transition on its own line, prefixed so that
+/// anything watching hop reads a state instead of parsing prose.
+///
+/// hop's window is the only reader today. The marker exists so that the
+/// window is not pattern matching on log messages written for a human,
+/// which would break silently the first time one of them was reworded.
+#[cfg(target_os = "windows")]
+struct StatusPrinter;
+
+#[cfg(target_os = "windows")]
+impl hop_core::LinkObserver for StatusPrinter {
+    fn link_changed(&mut self, state: hop_core::LinkState) {
+        // Deliberately eprintln rather than tracing: this is a machine
+        // readable line on a known stream, not a log record, and it must
+        // not be filtered out by whatever RUST_LOG happens to say.
+        eprintln!("hop-status: {}", state.summary());
     }
 }
 

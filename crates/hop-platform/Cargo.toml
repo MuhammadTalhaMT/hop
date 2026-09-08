@@ -32,4 +32,5 @@ windows-sys = { workspace = true, features = [
     "Win32_Networking_WinHttp",
     "Win32_System_LibraryLoader",
     "Win32_System_Console",
+    "Win32_System_Registry",
 ] }

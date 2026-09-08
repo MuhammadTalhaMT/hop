@@ -153,9 +153,22 @@ now happens without you watching.
 
 ## Running it
 
-On the PC, double click `hop.exe`. A hop icon appears in the
-notification area by the clock, with Start, Stop and Quit, and hop starts
-straight away. There is no console window at any point. It reads
+On the PC, double click `hop.exe`. hop's window opens and the engine
+starts straight away. There is no console window at any point.
+
+The window shows whether the link is actually up, and what went wrong
+when it is not, which is the thing a status icon alone cannot tell you.
+It also holds the settings, so the PC's `config.toml` never needs opening
+in a text editor: the Mac's address, this machine's id, the key file, the
+edge facing the Mac, pointer speed, and the anchor. Saving restarts hop,
+because settings are read once at startup.
+
+There is a "Start hop when Windows starts" checkbox. It writes a per user
+entry, so it needs no administrator rights and affects only you. Nothing
+starts with Windows until you tick it.
+
+`hop tray` gives the notification area icon on its own, with no window,
+for leaving it running in the background. Both read
 `%APPDATA%\hop\config.toml` unless you pass `--config`.
 
 On the Mac, put it in the menu bar:

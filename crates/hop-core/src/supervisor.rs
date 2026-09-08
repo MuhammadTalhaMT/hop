@@ -260,12 +260,28 @@ impl ClientSupervisor {
         injector: &mut I,
         clipboard: &mut C,
     ) -> ! {
+        self.run_observed(injector, clipboard, &mut crate::IgnoreLink)
+            .await
+    }
+
+    /// `run`, reporting every link transition to `observer`.
+    ///
+    /// Exists so hop's own window can show a status light without
+    /// scraping log lines written for a human. `run` is this with the
+    /// observer thrown away, which is what a terminal wants.
+    pub async fn run_observed<I: Injector, C: Clipboard, O: crate::LinkObserver>(
+        &mut self,
+        injector: &mut I,
+        clipboard: &mut C,
+        observer: &mut O,
+    ) -> ! {
         let mut policy = ReconnectPolicy::new();
         let mut held = HeldKeys::new();
         let mut clipboard_sync = ClipboardSync::new();
 
         loop {
             tracing::info!(addr = %self.addr, "connecting");
+            observer.link_changed(crate::LinkState::Connecting);
             match TcpStream::connect(&self.addr).await {
                 Ok(stream) => {
                     // Same reasoning as the server side (see run.rs): Nagle
@@ -283,11 +299,18 @@ impl ClientSupervisor {
                         clipboard,
                         &mut clipboard_sync,
                         &mut policy,
+                        observer,
                     )
                     .await;
+                    observer.link_changed(crate::LinkState::Disconnected {
+                        reason: "the connection ended".into(),
+                    });
                 }
                 Err(error) => {
                     tracing::warn!(%error, addr = %self.addr, "connect failed");
+                    observer.link_changed(crate::LinkState::Disconnected {
+                        reason: error.to_string(),
+                    });
                 }
             }
 
@@ -306,7 +329,8 @@ impl ClientSupervisor {
     /// Run a single connection attempt to completion: handshake, pump
     /// input, and return once the link is gone for any reason. Never
     /// itself sleeps or retries; that is `run`'s job.
-    async fn run_connection<I: Injector, C: Clipboard>(
+    #[allow(clippy::too_many_arguments)]
+    async fn run_connection<I: Injector, C: Clipboard, O: crate::LinkObserver>(
         &self,
         stream: TcpStream,
         injector: &mut I,
@@ -314,6 +338,7 @@ impl ClientSupervisor {
         clipboard: &mut C,
         clipboard_sync: &mut ClipboardSync,
         policy: &mut ReconnectPolicy,
+        observer: &mut O,
     ) {
         // Received files land here before being put on the clipboard, so
         // the user pastes them wherever they want and the OS does the
@@ -330,6 +355,9 @@ impl ClientSupervisor {
                     // doc comment), never the message itself, so this can
                     // never write a keystroke to the log.
                     tracing::warn!(%error, "handshake failed");
+                    observer.link_changed(crate::LinkState::Disconnected {
+                        reason: format!("handshake failed: {error}"),
+                    });
                     return;
                 }
             };
@@ -337,6 +365,13 @@ impl ClientSupervisor {
             ?session,
             "handshake complete; moved onto the derived session"
         );
+        // Only now. A TCP connection proves nothing: a peer holding the
+        // wrong key connects perfectly well and then fails the handshake,
+        // and reporting that as connected would put a green light on the
+        // one failure the user most needs to see.
+        observer.link_changed(crate::LinkState::Connected {
+            peer: self.addr.clone(),
+        });
 
         // The handshake alone does not prove the peer holds the key for
         // THIS session: both Handshake messages necessarily travel under
@@ -513,6 +548,54 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio::io::duplex;
     use tokio::net::TcpListener;
+
+    /// Records every link transition, so the sequence a status display
+    /// would show is asserted directly rather than inferred from logs.
+    #[derive(Default, Clone)]
+    struct RecordingObserver(Arc<Mutex<Vec<crate::LinkState>>>);
+
+    impl crate::LinkObserver for RecordingObserver {
+        fn link_changed(&mut self, state: crate::LinkState) {
+            self.0.lock().expect("observer lock").push(state);
+        }
+    }
+
+    // A peer that is switched off is the normal overnight case, and the
+    // status display has to say so rather than sitting on a stale
+    // "connected" or showing nothing at all.
+    #[tokio::test]
+    async fn a_peer_that_is_not_listening_reports_connecting_then_disconnected() {
+        // Port 1 on loopback: nothing listens there, and connecting to it
+        // fails immediately rather than hanging.
+        let mut supervisor =
+            ClientSupervisor::new("127.0.0.1:1", SharedKey::from_bytes([7u8; 32]), "pc");
+        let mut injector = FakeInjector::new();
+        let mut clipboard = crate::clipboard::FakeClipboard::new();
+        let mut observer = RecordingObserver::default();
+
+        // `run_observed` never returns by design, so it is raced against a
+        // deadline and judged on what it reported before the deadline.
+        let _ = tokio::time::timeout(
+            Duration::from_millis(400),
+            supervisor.run_observed(&mut injector, &mut clipboard, &mut observer),
+        )
+        .await;
+
+        let seen = observer.0.lock().expect("observer lock").clone();
+        assert!(
+            matches!(seen.first(), Some(crate::LinkState::Connecting)),
+            "the first thing shown must be that hop is trying: {seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .any(|s| matches!(s, crate::LinkState::Disconnected { .. })),
+            "a refused connection must be reported, not swallowed: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|s| s.is_connected()),
+            "nothing was ever connected: {seen:?}"
+        );
+    }
 
     /// An `Injector` that records whether `focus_returned` was called,
     /// so the disconnect path's obligation to undo what the platform
